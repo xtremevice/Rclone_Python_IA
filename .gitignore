@@ -1,0 +1,34 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# Virtual environments
+venv/
+env/
+.venv/
+.env/
+
+# PyInstaller build artifacts
+build/
+dist/
+dist_linux/
+dist_mac/
+*.spec.bak
+
+# Application config (user data, not source)
+*.conf
+*.json
+!package.json
+
+# OS files
+.DS_Store
+Thumbs.db
+*.swp
+
+# IDE
+.vscode/
+.idea/
+*.iml
