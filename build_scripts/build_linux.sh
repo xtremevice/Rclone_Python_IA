@@ -1,104 +1,99 @@
 #!/usr/bin/env bash
-# build_linux.sh
-# ---------------
-# Builds the Rclone Manager Linux AppImage.
+# Script de construcción para Linux
+# Genera un archivo AppImage de la aplicación
 #
-# Prerequisites (install once):
-#   pip install pyinstaller
-#   wget -O appimagetool "https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage"
-#   chmod +x appimagetool && sudo mv appimagetool /usr/local/bin/appimagetool
-#
-# Usage:
-#   chmod +x build_scripts/build_linux.sh
-#   ./build_scripts/build_linux.sh
+# Requisitos:
+#   - Python 3.8+
+#   - pip
+#   - appimagetool (descargado automáticamente si no está instalado)
+#   - fuse (necesario para AppImage): sudo apt install fuse libfuse2
 
-set -euo pipefail
+set -e
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ROOT_DIR="$(dirname "$SCRIPT_DIR")"
-DIST_DIR="$ROOT_DIR/dist"
-APP_NAME="RcloneManager"
+echo "================================================"
+echo "  Rclone Python IA - Build para Linux (AppImage)"
+echo "================================================"
 
-echo "=== Rclone Manager – Linux AppImage Builder ==="
-echo "Project root: $ROOT_DIR"
+# Verificar Python
+if ! command -v python3 &> /dev/null; then
+    echo "ERROR: Python3 no encontrado. Instale Python 3.8+"
+    exit 1
+fi
 
-# ---- Step 1: Generate icon ----
-echo ""
-echo "[1/4] Generating application icon..."
-cd "$ROOT_DIR"
-python3 assets/generate_icon.py
+python3 --version
 
-# ---- Step 2: Build binary with PyInstaller ----
-echo ""
-echo "[2/4] Building executable with PyInstaller..."
+# Instalar dependencias de Python
+echo "Instalando dependencias de Python..."
+pip3 install -r requirements.txt
+
+# Construir con PyInstaller primero (genera el directorio dist/)
+echo "Construyendo con PyInstaller..."
 pyinstaller \
-    --onefile \
-    --noconsole \
-    --name "$APP_NAME" \
-    --add-data "assets:assets" \
-    --hidden-import "pystray._xorg" \
-    --hidden-import "PIL._imaging" \
-    --hidden-import "PIL.ImageFont" \
-    --hidden-import "PIL.ImageDraw" \
-    --hidden-import "psutil" \
-    --hidden-import "tkinter" \
-    --hidden-import "tkinter.ttk" \
-    --hidden-import "tkinter.filedialog" \
-    --hidden-import "tkinter.messagebox" \
-    "$ROOT_DIR/main.py"
+    --onedir \
+    --windowed \
+    --name "RclonePythonIA" \
+    --add-data "resources:resources" \
+    --hidden-import "PyQt5.sip" \
+    --hidden-import "PyQt5.QtCore" \
+    --hidden-import "PyQt5.QtWidgets" \
+    --hidden-import "PyQt5.QtGui" \
+    main.py
 
-echo "[2/4] PyInstaller build complete."
+echo "Preparando estructura de AppImage..."
 
-# ---- Step 3: Create AppDir structure ----
-echo ""
-echo "[3/4] Creating AppDir structure..."
-APPDIR="$DIST_DIR/${APP_NAME}.AppDir"
+# Crear estructura de directorios del AppImage
+APPDIR="AppDir"
 rm -rf "$APPDIR"
 mkdir -p "$APPDIR/usr/bin"
 mkdir -p "$APPDIR/usr/share/applications"
 mkdir -p "$APPDIR/usr/share/icons/hicolor/256x256/apps"
 
-# Copy the PyInstaller binary
-cp "$DIST_DIR/$APP_NAME" "$APPDIR/usr/bin/$APP_NAME"
-chmod +x "$APPDIR/usr/bin/$APP_NAME"
+# Copiar binarios de PyInstaller al AppDir
+cp -r dist/RclonePythonIA/* "$APPDIR/usr/bin/"
 
-# Copy icon
-cp "$ROOT_DIR/assets/icon.png" "$APPDIR/usr/share/icons/hicolor/256x256/apps/rclone-manager.png"
-cp "$ROOT_DIR/assets/icon.png" "$APPDIR/rclone-manager.png"
-
-# Desktop entry file
-cat > "$APPDIR/usr/share/applications/rclone-manager.desktop" <<EOF
+# Crear archivo .desktop
+cat > "$APPDIR/usr/share/applications/rclone-python-ia.desktop" << EOF
 [Desktop Entry]
-Name=Rclone Manager
-Comment=Multi-platform rclone sync manager
-Exec=RcloneManager
-Icon=rclone-manager
+Name=Rclone Python IA
+Comment=Sincronizador de archivos multiplataforma
+Exec=RclonePythonIA
+Icon=rclone-python-ia
 Type=Application
-Categories=Utility;Network;FileTransfer;
+Categories=Utility;FileTools;
 Terminal=false
 EOF
 
-# AppStream metadata symlinks required by AppImageKit
-cp "$APPDIR/usr/share/applications/rclone-manager.desktop" "$APPDIR/rclone-manager.desktop"
+# Copiar ícono (usar SVG o crear uno básico si no existe)
+if [ -f "resources/icon.png" ]; then
+    cp resources/icon.png "$APPDIR/usr/share/icons/hicolor/256x256/apps/rclone-python-ia.png"
+else
+    echo "Advertencia: No se encontró resources/icon.png, el AppImage no tendrá ícono."
+fi
 
 # AppRun script
-cat > "$APPDIR/AppRun" <<'EOF'
+cat > "$APPDIR/AppRun" << 'EOF'
 #!/bin/bash
-SELF="$(readlink -f "$0")"
-HERE="$(dirname "$SELF")"
-exec "$HERE/usr/bin/RcloneManager" "$@"
+HERE="$(dirname "$(readlink -f "${0}")")"
+exec "$HERE/usr/bin/RclonePythonIA" "$@"
 EOF
 chmod +x "$APPDIR/AppRun"
 
-# ---- Step 4: Package as AppImage ----
-echo ""
-echo "[4/4] Packaging as AppImage..."
-if command -v appimagetool &>/dev/null; then
-    ARCH=x86_64 appimagetool "$APPDIR" "$DIST_DIR/${APP_NAME}-x86_64.AppImage"
-    echo ""
-    echo "=== Build complete ==="
-    echo "AppImage: $DIST_DIR/${APP_NAME}-x86_64.AppImage"
+# Descargar appimagetool si no está instalado
+if ! command -v appimagetool &> /dev/null; then
+    echo "Descargando appimagetool..."
+    wget -q "https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage" \
+        -O /tmp/appimagetool
+    chmod +x /tmp/appimagetool
+    APPIMAGETOOL="/tmp/appimagetool"
 else
-    echo "WARNING: appimagetool not found – AppDir created at $APPDIR"
-    echo "Install appimagetool and run: appimagetool $APPDIR $DIST_DIR/${APP_NAME}-x86_64.AppImage"
+    APPIMAGETOOL="appimagetool"
 fi
+
+# Generar el AppImage
+echo "Generando AppImage..."
+ARCH=x86_64 "$APPIMAGETOOL" "$APPDIR" "RclonePythonIA-x86_64.AppImage"
+
+echo ""
+echo "================================================"
+echo "  Build exitoso: RclonePythonIA-x86_64.AppImage"
+echo "================================================"

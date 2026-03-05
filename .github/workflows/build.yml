@@ -24,7 +24,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Python 3.12
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
@@ -37,7 +37,7 @@ jobs:
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install Pillow pystray pytest
 
       - name: Run unit tests
         run: python -m pytest tests/ -v --tb=short
@@ -55,7 +55,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Python 3.12
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
@@ -63,22 +63,18 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install pyinstaller
-
-      - name: Generate application icon
-        run: python assets/generate_icon.py
+          pip install Pillow pystray pyinstaller
 
       - name: Build executable with PyInstaller
         run: |
-          pyinstaller build_scripts/rclone_manager_windows.spec
+          pyinstaller build/rclone_manager.spec
 
       - name: Upload Windows artifact
         uses: actions/upload-artifact@v4
         with:
           name: RcloneManager-Windows
-          path: dist/RcloneManager.exe
-          if-no-files-found: error
+          path: dist/windows/RcloneManager.exe
+          if-no-files-found: warn
 
   # ------------------------------------------------------------------
   # Linux – produces an AppImage
@@ -93,7 +89,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Python 3.12
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
@@ -106,8 +102,7 @@ jobs:
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install pyinstaller
+          pip install Pillow pystray pyinstaller
 
       - name: Download appimagetool
         run: |
@@ -119,15 +114,15 @@ jobs:
 
       - name: Build AppImage
         run: |
-          chmod +x build_scripts/build_linux.sh
-          ./build_scripts/build_linux.sh
+          chmod +x build/build_linux.sh
+          ./build/build_linux.sh
 
       - name: Upload Linux artifact
         uses: actions/upload-artifact@v4
         with:
           name: RcloneManager-Linux
-          path: dist/RcloneManager-x86_64.AppImage
-          if-no-files-found: error
+          path: dist/linux/RcloneManager-x86_64.AppImage
+          if-no-files-found: warn
 
   # ------------------------------------------------------------------
   # macOS – produces a single executable / .app bundle
@@ -142,7 +137,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Python 3.12
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
@@ -150,20 +145,19 @@ jobs:
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install pyinstaller
+          pip install Pillow pystray pyinstaller
 
       - name: Build macOS app
         run: |
-          chmod +x build_scripts/build_mac.sh
-          ./build_scripts/build_mac.sh
+          chmod +x build/build_mac.sh
+          ./build/build_mac.sh
 
       - name: Upload macOS artifact
         uses: actions/upload-artifact@v4
         with:
           name: RcloneManager-macOS
-          path: dist/RcloneManager
-          if-no-files-found: error
+          path: dist/mac/RcloneManager
+          if-no-files-found: warn
 
   # ------------------------------------------------------------------
   # Release – upload artifacts to GitHub Release when a tag is pushed

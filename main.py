@@ -1,88 +1,67 @@
 """
-main.py
--------
-Entry point for Rclone Manager.
+Rclone Python IA – Multiplatform Rclone Manager
+Entry point for the application.
 
-Start-up logic:
-  • If no services are configured → open the new-service setup wizard first.
-  • If services exist → open the main window directly.
-  • After the wizard completes, proceed to the main window.
+Behaviour:
+  - If no services are configured → open the new-service wizard first.
+  - Otherwise → open the main window directly.
 """
 
 import sys
 import tkinter as tk
-from tkinter import messagebox
 
-from src.core.service_manager import ServiceManager
-from src.ui.utils import apply_theme
-
-
-def _show_rclone_missing_error(root: tk.Tk):
-    """Display an informative error when rclone is not installed and exit."""
-    messagebox.showerror(
-        "rclone no encontrado",
-        "rclone no está instalado o no se encuentra en el PATH del sistema.\n\n"
-        "Por favor instala rclone desde https://rclone.org/downloads/ y "
-        "asegúrate de que esté disponible en el PATH antes de ejecutar esta aplicación.",
-        master=root,
-    )
+from src.config.config_manager import ConfigManager
+from src.rclone.rclone_manager import RcloneManager
 
 
-def main():
-    """
-    Application entry point.
-    Creates the root Tk instance, decides which window to show first,
-    and starts the event loop.
-    """
-    # Create an invisible root window that will be hidden while we determine
-    # which real window to show first.
-    root = tk.Tk()
-    root.withdraw()   # Hide the root; we show either wizard or main window
+def main() -> None:
+    """Application entry point."""
+    # Initialise the config manager (loads or creates the JSON config file)
+    config = ConfigManager()
+    # Initialise the rclone manager (does not start any threads yet)
+    rclone = RcloneManager(config)
 
-    apply_theme(root)
-
-    # Instantiate the service manager (loads config from disk)
-    svc_manager = ServiceManager()
-
-    # Warn if rclone is not available (non-fatal - user can still manage config)
-    if not svc_manager.rclone.is_rclone_available():
-        _show_rclone_missing_error(root)
-
-    services = svc_manager.get_services()
+    services = config.get_services()
 
     if not services:
-        # --- No services configured: show the setup wizard first ---
-        from src.ui.setup_wizard import SetupWizard
-
-        def _on_wizard_complete(name, platform, local_path, remote_name, token):
-            """After the wizard finishes, launch the main window."""
-            svc_manager.add_service(name, platform, local_path, remote_name)
-            _open_main_window(root, svc_manager)
-
-        SetupWizard(root, on_complete=_on_wizard_complete)
+        # No services configured → run the setup wizard as the root window
+        _run_wizard_first(config, rclone)
     else:
-        # --- Services exist: open main window directly ---
-        _open_main_window(root, svc_manager)
+        # Services exist → open the main window directly
+        _run_main_window(config, rclone)
+
+
+def _run_wizard_first(config: ConfigManager, rclone: RcloneManager) -> None:
+    """
+    Run a minimal Tk root (hidden) that hosts the setup wizard.
+    After the wizard finishes, launch the main window.
+    """
+    root = tk.Tk()
+    root.withdraw()  # Hide the empty root window
+
+    from src.gui.setup_wizard import SetupWizard
+
+    def on_wizard_complete(service_name: str) -> None:
+        # Destroy the hidden root and open the main window
+        root.destroy()
+        _run_main_window(config, rclone)
+
+    SetupWizard(
+        parent=root,
+        config_manager=config,
+        rclone_manager=rclone,
+        on_complete=on_wizard_complete,
+    )
 
     root.mainloop()
 
 
-def _open_main_window(root: tk.Tk, svc_manager: ServiceManager):
-    """
-    Replace the hidden root window with the real MainWindow,
-    then start background sync schedulers for all services.
-    """
-    from src.ui.main_window import MainWindow
+def _run_main_window(config: ConfigManager, rclone: RcloneManager) -> None:
+    """Create and run the main application window."""
+    from src.gui.main_window import MainWindow
 
-    # Destroy the invisible root and use MainWindow as the new root widget
-    # (MainWindow extends tk.Tk, so we destroy the placeholder first)
-    root.destroy()
-
-    window = MainWindow(svc_manager)
-    # Start periodic sync for all configured services
-    svc_manager.start_all()
-    # Bind minimize event to tray (Linux/macOS: <Unmap>, Windows: handled differently)
-    window.bind("<Unmap>", window._on_iconify)
+    window = MainWindow(config_manager=config, rclone_manager=rclone)
+    window.run()
 
 
 if __name__ == "__main__":

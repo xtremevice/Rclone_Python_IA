@@ -1,1 +1,1 @@
-# Rclone Manager - Multi-platform rclone GUI application
+# Rclone Python IA - Multiplatform Rclone Manager

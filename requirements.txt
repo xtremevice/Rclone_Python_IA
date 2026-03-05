@@ -1,17 +1,17 @@
-# Rclone Manager – Python dependencies
+# Rclone Python IA – Python dependencies
 # Install with: pip install -r requirements.txt
 
-# System tray icon support (cross-platform)
+# System tray icon support (cross-platform, used by src/gui/tray_icon.py)
 pystray>=0.19.5
 
 # Image manipulation (icon generation, tray icon)
 Pillow>=10.0.0
 
-# Disk usage statistics
-psutil>=5.9.0
+# PyQt5 UI toolkit (used by core/, ui/, app/ modules)
+PyQt5>=5.15.0
+PyQt5-sip>=12.8.0
 
 # Build tool (produces single-file executables)
-# Install separately: pip install pyinstaller
 # pyinstaller>=6.0.0
 
 # Test runner

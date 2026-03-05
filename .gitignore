@@ -1,44 +1,62 @@
-# Python
+# Python bytecode
 __pycache__/
 *.py[cod]
+*.pyo
+*.pyd
+.Python
 *$py.class
 *.so
-*.egg
-*.egg-info/
-dist/
-build/
-.eggs/
-.pytest_cache/
-.coverage
-htmlcov/
 
-# PyInstaller output
-*.spec
-!build_scripts/*.spec
-dist/
-build/
-
-# Virtual environment
+# Virtual environments
 venv/
-.venv/
 env/
+.venv/
+.env/
+ENV/
+env.bak/
+venv.bak/
 
-# IDE files
-.vscode/
-.idea/
-*.swp
-*.swo
+# PyInstaller build artifacts
+build/
+dist/
+dist_linux/
+dist_mac/
+*.spec.bak
+*.manifest
+AppDir/
 
-# App data (user config – should not be committed)
-~/.rclone_manager/
+# Application binaries
+*.AppImage
+RclonePythonIA.exe
+RcloneManager.exe
+
+# Application config (user data, not source)
+config.json
+*.conf
 
 # OS files
 .DS_Store
+.DS_Store?
+._*
+.Spotlight-V5
+.Trashes
+ehthumbs.db
 Thumbs.db
+*.swp
+*.swo
+*~
 
-# Temporary files
-*.tmp
-*.bak
+# IDE
+.vscode/
+.idea/
+*.iml
 
-# Screenshots (kept in assets/ but not generated ones in root)
+# Test / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+*.egg-info/
+*.egg
+
+# Screenshots generated during development (keep the ones in assets/)
 screenshot_*.png
