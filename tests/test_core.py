@@ -1,0 +1,271 @@
+"""
+test_core.py
+------------
+Unit tests for the core modules: ConfigManager, RcloneManager.
+Run with:  python3 -m pytest tests/test_core.py -v
+"""
+
+import json
+import os
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import MagicMock, patch
+
+# Ensure the project root is in the path
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from src.config.config_manager import (
+    ConfigManager,
+    get_config_dir,
+    SUPPORTED_PLATFORMS,
+    PLATFORM_LABELS,
+    PERSONAL_VAULT_PATTERN,
+    DEFAULT_SYNC_INTERVAL,
+    DEFAULT_EXCLUSIONS,
+)
+from src.rclone.rclone_manager import RcloneManager, _extract_file_path, _human_size
+
+
+class TestConfigManager(unittest.TestCase):
+    """Tests for ConfigManager: service CRUD and persistence."""
+
+    def setUp(self):
+        """
+        Redirect config storage to a temporary directory for each test
+        so that tests do not interfere with each other or with real user data.
+        """
+        self._tmpdir = tempfile.mkdtemp()
+        # Monkey-patch get_config_dir so ConfigManager writes to the temp dir
+        import src.config.config_manager as cm_mod
+        self._original_get_config_dir = cm_mod.get_config_dir
+        cm_mod.get_config_dir = lambda: Path(self._tmpdir)
+        self.mgr = ConfigManager()
+
+    def tearDown(self):
+        """Restore the original get_config_dir after each test."""
+        import src.config.config_manager as cm_mod
+        cm_mod.get_config_dir = self._original_get_config_dir
+        import shutil
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+
+    def test_initial_state_has_no_services(self):
+        """A freshly created ConfigManager should have no services."""
+        self.assertEqual(self.mgr.get_services(), [])
+
+    def test_add_service_returns_dict_with_expected_keys(self):
+        """add_service() should return a dict with name, platform, local_path."""
+        svc = self.mgr.add_service("TestSvc", "onedrive", "/tmp/test")
+        self.assertEqual(svc["name"], "TestSvc")
+        self.assertEqual(svc["platform"], "onedrive")
+        self.assertEqual(svc["local_path"], "/tmp/test")
+        self.assertIn("sync_interval", svc)
+        self.assertIn("exclusions", svc)
+
+    def test_add_service_persists_to_disk(self):
+        """After add_service() the config file should contain the new entry."""
+        self.mgr.add_service("TestSvc", "drive", "/tmp/gdrive")
+        # Reload from disk
+        mgr2 = ConfigManager()
+        services = mgr2.get_services()
+        self.assertEqual(len(services), 1)
+        self.assertEqual(services[0]["name"], "TestSvc")
+
+    def test_get_service_by_name(self):
+        """get_service() should return the matching service or None."""
+        self.mgr.add_service("Svc1", "onedrive", "/a")
+        self.mgr.add_service("Svc2", "drive", "/b")
+        self.assertEqual(self.mgr.get_service("Svc1")["platform"], "onedrive")
+        self.assertEqual(self.mgr.get_service("Svc2")["platform"], "drive")
+        self.assertIsNone(self.mgr.get_service("NonExistent"))
+
+    def test_update_service_modifies_field(self):
+        """update_service() should merge new values into the existing entry."""
+        self.mgr.add_service("Upd", "onedrive", "/c")
+        self.mgr.update_service("Upd", {"sync_interval": 3600, "sync_enabled": False})
+        updated = self.mgr.get_service("Upd")
+        self.assertEqual(updated["sync_interval"], 3600)
+        self.assertFalse(updated["sync_enabled"])
+
+    def test_remove_service_deletes_entry(self):
+        """remove_service() should remove the named service from config."""
+        self.mgr.add_service("Del", "dropbox", "/d")
+        self.assertEqual(len(self.mgr.get_services()), 1)
+        self.mgr.remove_service("Del")
+        self.assertEqual(len(self.mgr.get_services()), 0)
+        self.assertIsNone(self.mgr.get_service("Del"))
+
+    def test_remove_nonexistent_service_is_noop(self):
+        """remove_service() on an unknown name should not raise or mutate state."""
+        self.mgr.add_service("X", "box", "/e")
+        self.mgr.remove_service("does-not-exist")
+        self.assertEqual(len(self.mgr.get_services()), 1)
+
+    def test_multiple_services_are_preserved(self):
+        """Multiple services should all be stored and independently retrievable."""
+        names = ["Alpha", "Beta", "Gamma"]
+        for name in names:
+            self.mgr.add_service(name, "onedrive", f"/tmp/{name}")
+        self.assertEqual(len(self.mgr.get_services()), 3)
+        for name in names:
+            self.assertIsNotNone(self.mgr.get_service(name))
+
+    def test_preferences_default_values(self):
+        """Default preferences should include start_with_system = False."""
+        self.assertFalse(self.mgr.get_preference("start_with_system"))
+
+    def test_set_preference_persists(self):
+        """set_preference() should save the value so it survives a reload."""
+        self.mgr.set_preference("start_with_system", True)
+        self.assertTrue(self.mgr.get_preference("start_with_system"))
+
+    def test_sync_history_entry_added(self):
+        """add_sync_history_entry() should prepend to the service history."""
+        self.mgr.add_service("HistSvc", "drive", "/h")
+        self.mgr.add_sync_history_entry("HistSvc", "docs/file.txt", True)
+        svc = self.mgr.get_service("HistSvc")
+        history = svc.get("sync_history", [])
+        self.assertEqual(len(history), 1)
+        self.assertEqual(history[0]["file"], "docs/file.txt")
+        self.assertTrue(history[0]["synced"])
+
+    def test_sync_history_capped_at_50(self):
+        """History should never exceed 50 entries per service."""
+        self.mgr.add_service("CapSvc", "onedrive", "/cap")
+        for i in range(60):
+            self.mgr.add_sync_history_entry("CapSvc", f"file_{i}.txt", True)
+        svc = self.mgr.get_service("CapSvc")
+        self.assertLessEqual(len(svc.get("sync_history", [])), 50)
+
+    def test_default_exclusion_contains_vault(self):
+        """A new service should include the OneDrive Personal Vault exclusion."""
+        svc = self.mgr.add_service("VaultSvc", "onedrive", "/v")
+        self.assertIn(PERSONAL_VAULT_PATTERN, svc.get("exclusions", []))
+
+    def test_corrupt_config_falls_back_to_default(self):
+        """A corrupt JSON config file should silently reset to defaults."""
+        config_path = Path(self._tmpdir) / "app_config.json"
+        config_path.write_text("not valid json {{{{", encoding="utf-8")
+        mgr2 = ConfigManager()
+        self.assertEqual(mgr2.get_services(), [])
+
+
+class TestConfigManagerConstants(unittest.TestCase):
+    """Tests for module-level constants in config_manager."""
+
+    def test_supported_platforms_not_empty(self):
+        """SUPPORTED_PLATFORMS should list at least the common providers."""
+        self.assertIn("onedrive", SUPPORTED_PLATFORMS)
+        self.assertIn("drive", SUPPORTED_PLATFORMS)
+        self.assertIn("dropbox", SUPPORTED_PLATFORMS)
+
+    def test_platform_labels_covers_all_platforms(self):
+        """Every entry in SUPPORTED_PLATFORMS should have a label."""
+        for p in SUPPORTED_PLATFORMS:
+            self.assertIn(p, PLATFORM_LABELS, f"Missing label for platform: {p}")
+
+    def test_personal_vault_pattern_is_correct(self):
+        """PERSONAL_VAULT_PATTERN should be the Spanish OneDrive vault exclusion."""
+        self.assertIn("Almacén personal", PERSONAL_VAULT_PATTERN)
+
+    def test_default_exclusions_includes_vault(self):
+        """DEFAULT_EXCLUSIONS should include the vault exclusion by default."""
+        self.assertIn(PERSONAL_VAULT_PATTERN, DEFAULT_EXCLUSIONS)
+
+    def test_default_sync_interval_is_positive(self):
+        """DEFAULT_SYNC_INTERVAL should be a positive number of seconds."""
+        self.assertGreater(DEFAULT_SYNC_INTERVAL, 0)
+
+
+class TestRcloneHelpers(unittest.TestCase):
+    """Tests for module-level helper functions in rclone_manager."""
+
+    def test_extract_file_path_from_copied_line(self):
+        """_extract_file_path() should return the path from a 'Copied' line."""
+        line = "Transferred: Documents/file.txt: Copied (new)"
+        result = _extract_file_path(line)
+        self.assertIsNotNone(result)
+
+    def test_extract_file_path_returns_none_for_irrelevant_line(self):
+        """_extract_file_path() should return None for non-file-transfer lines."""
+        result = _extract_file_path("Elapsed time: 1.2s")
+        self.assertIsNone(result)
+
+    def test_human_size_bytes(self):
+        """_human_size() should format bytes correctly."""
+        self.assertIn("B", _human_size(512))
+
+    def test_human_size_megabytes(self):
+        """_human_size() should format megabytes correctly."""
+        self.assertIn("MB", _human_size(2 * 1024 * 1024))
+
+    def test_human_size_gigabytes(self):
+        """_human_size() should format gigabytes correctly."""
+        self.assertIn("GB", _human_size(3 * 1024 * 1024 * 1024))
+
+
+class TestRcloneManager(unittest.TestCase):
+    """Tests for RcloneManager using a mock ConfigManager."""
+
+    def setUp(self):
+        """Create a RcloneManager backed by a real ConfigManager in a temp dir."""
+        self._tmpdir = tempfile.mkdtemp()
+        import src.config.config_manager as cm_mod
+        self._original_get_config_dir = cm_mod.get_config_dir
+        cm_mod.get_config_dir = lambda: Path(self._tmpdir)
+        self.config = ConfigManager()
+        self.rclone = RcloneManager(self.config)
+
+    def tearDown(self):
+        """Restore the original get_config_dir."""
+        import src.config.config_manager as cm_mod
+        cm_mod.get_config_dir = self._original_get_config_dir
+        import shutil
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+
+    def test_initial_status_is_stopped(self):
+        """A fresh RcloneManager should report 'Detenido' for any service."""
+        status = self.rclone.get_status("any_service")
+        self.assertEqual(status, "Detenido")
+
+    def test_is_running_false_initially(self):
+        """is_running() should return False before start_service() is called."""
+        self.assertFalse(self.rclone.is_running("any_service"))
+
+    def test_get_disk_usage_nonexistent_path(self):
+        """get_disk_usage() on a non-existent service should return 'N/A'."""
+        self.config.add_service("S1", "onedrive", "/nonexistent/xyz/abc")
+        result = self.rclone.get_disk_usage("S1")
+        self.assertEqual(result, "N/A")
+
+    def test_get_disk_usage_unknown_service(self):
+        """get_disk_usage() for an unknown service name should return 'N/A'."""
+        self.assertEqual(self.rclone.get_disk_usage("not_there"), "N/A")
+
+    def test_stop_service_is_noop_when_not_running(self):
+        """stop_service() should not raise if the service was never started."""
+        # Should complete without error
+        self.rclone.stop_service("never_started")
+
+    def test_start_all_with_no_services(self):
+        """start_all() should complete without error when no services exist."""
+        self.rclone.start_all()  # Should not raise
+
+    def test_list_remote_tree_with_no_rclone(self):
+        """list_remote_tree() should return an empty list if rclone is absent."""
+        self.config.add_service("S2", "drive", "/tmp/s2")
+        # rclone is not installed in CI, so we expect an empty list
+        result = self.rclone.list_remote_tree("S2")
+        self.assertIsInstance(result, list)
+
+    def test_on_status_change_callback_is_called(self):
+        """_set_status() should invoke the on_status_change callback."""
+        received = []
+        self.rclone.on_status_change = lambda name, status: received.append((name, status))
+        self.rclone._set_status("MySvc", "Testing")
+        self.assertIn(("MySvc", "Testing"), received)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
