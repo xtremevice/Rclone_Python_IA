@@ -158,6 +158,8 @@ class ConfigManager:
             # rclone VFS cache settings
             "vfs_cache_mode": "on_demand",
             "vfs_cache_max_size": "10G",
+            # Custom cache directory (empty = rclone default)
+            "vfs_cache_dir": "",
             # Recent file sync history (list of dicts)
             "sync_history": [],
         }

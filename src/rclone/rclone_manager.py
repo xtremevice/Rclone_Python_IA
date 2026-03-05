@@ -41,6 +41,8 @@ class RcloneManager:
         self.on_status_change: Optional[Callable[[str, str], None]] = None
         # Optional callback(service_name, file_path, synced) for history updates
         self.on_file_synced: Optional[Callable[[str, str, bool], None]] = None
+        # Optional callback(service_name, error_message) called on sync errors
+        self.on_error: Optional[Callable[[str, str], None]] = None
 
     # ------------------------------------------------------------------
     # Public API
@@ -250,6 +252,7 @@ class RcloneManager:
                 self._set_status(service_name, "Actualizado")
             else:
                 self._set_status(service_name, "Error en sincronización")
+                self._emit_error(service_name, "Fallo en el ciclo de sincronización")
 
             # Wait for the configured interval (or stop early if signalled)
             interval = svc.get("sync_interval", 900)
@@ -288,17 +291,32 @@ class RcloneManager:
             "-P",
         ]
 
+        # VFS cache options
+        vfs_cache_mode = svc.get("vfs_cache_mode", "on_demand")
+        vfs_cache_max_size = svc.get("vfs_cache_max_size", "10G")
+        vfs_cache_dir = svc.get("vfs_cache_dir", "").strip()
+
+        vfs_args = [
+            "--vfs-cache-mode", vfs_cache_mode,
+            "--vfs-cache-max-size", vfs_cache_max_size,
+        ]
+        if vfs_cache_dir:
+            vfs_args += ["--cache-dir", vfs_cache_dir]
+
         base = _rclone_base_args(self._config)
         Path(local).mkdir(parents=True, exist_ok=True)
 
         # First attempt: standard bisync
-        cmd = base + ["bisync", remote, local] + perf_args + exclude_args
+        cmd = base + ["bisync", remote, local] + perf_args + vfs_args + exclude_args
         success = self._run_rclone(cmd, name, svc)
 
         # Second attempt: bisync --resync if first attempt failed
         if not success:
             cmd_resync = cmd + ["--resync"]
             success = self._run_rclone(cmd_resync, name, svc, is_retry=True)
+
+        if not success:
+            self._emit_error(name, f"La sincronización falló (remoto: {remote})")
 
         return success
 
@@ -337,7 +355,8 @@ class RcloneManager:
 
             proc.wait()
             return proc.returncode == 0
-        except (OSError, subprocess.SubprocessError):
+        except (OSError, subprocess.SubprocessError) as exc:
+            self._emit_error(service_name, f"Error al ejecutar rclone: {exc}")
             return False
 
     def _set_status(self, service_name: str, status: str) -> None:
@@ -346,6 +365,14 @@ class RcloneManager:
         if self.on_status_change:
             try:
                 self.on_status_change(service_name, status)
+            except Exception:
+                pass
+
+    def _emit_error(self, service_name: str, message: str) -> None:
+        """Fire the on_error callback if registered."""
+        if self.on_error:
+            try:
+                self.on_error(service_name, message)
             except Exception:
                 pass
 

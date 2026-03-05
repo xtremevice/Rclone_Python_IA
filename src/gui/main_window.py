@@ -23,6 +23,7 @@ from typing import Callable, Dict, List, Optional
 
 from src.config.config_manager import PLATFORM_LABELS, ConfigManager
 from src.gui.tray_icon import TrayIcon
+from src.gui.error_logger import ErrorLogger
 from src.rclone.rclone_manager import RcloneManager
 
 # Status string emitted by RcloneManager when no sync is running
@@ -57,6 +58,9 @@ class MainWindow:
         self._config = config_manager
         self._rclone = rclone_manager
 
+        # Application-wide error logger (loads previous session from disk)
+        self._error_logger = ErrorLogger()
+
         # Root Tk window
         self._root = tk.Tk()
         self._root.title("Rclone Manager")
@@ -79,6 +83,7 @@ class MainWindow:
         # Register rclone callbacks
         self._rclone.on_status_change = self._on_status_change
         self._rclone.on_file_synced = self._on_file_synced
+        self._rclone.on_error = self._on_rclone_error
 
         # Per-service Listbox widgets: service_name → tk.Listbox
         self._file_lists: Dict[str, tk.Listbox] = {}
@@ -297,6 +302,7 @@ class MainWindow:
             service_name=service_name,
             on_saved=self._refresh_tabs,
             on_deleted=self._on_service_deleted,
+            error_logger=self._error_logger,
         )
 
     def _open_wizard(self) -> None:
@@ -341,8 +347,9 @@ class MainWindow:
         self._root.focus_force()
 
     def _quit(self) -> None:
-        """Stop all sync threads, remove tray icon, and destroy the window."""
+        """Stop all sync threads, save error log, remove tray icon, and destroy the window."""
         self._rclone.stop_all()
+        self._error_logger.save_to_file()
         self._tray.stop()
         self._root.destroy()
 
@@ -378,6 +385,13 @@ class MainWindow:
         Schedules a Listbox update on the main thread.
         """
         self._root.after(0, lambda: self._add_file_entry(service_name, file_path, synced))
+
+    def _on_rclone_error(self, service_name: str, message: str) -> None:
+        """
+        Invoked by RcloneManager when an error occurs.
+        Logs the error via ErrorLogger (thread-safe: no UI update needed).
+        """
+        self._error_logger.log(service_name, message)
 
     def _add_file_entry(self, service_name: str, file_path: str, synced: bool) -> None:
         """Insert a new file entry into the service's Listbox (max 50 items)."""

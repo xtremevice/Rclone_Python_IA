@@ -150,6 +150,12 @@ class TestConfigManager(unittest.TestCase):
         mgr2 = ConfigManager()
         self.assertEqual(mgr2.get_services(), [])
 
+    def test_service_has_vfs_cache_dir_field(self):
+        """New services should include the vfs_cache_dir field defaulting to empty."""
+        svc = self.mgr.add_service("VfsDirSvc", "onedrive", "/tmp/vfsdir")
+        self.assertIn("vfs_cache_dir", svc)
+        self.assertEqual(svc["vfs_cache_dir"], "")
+
 
 class TestConfigManagerConstants(unittest.TestCase):
     """Tests for module-level constants in config_manager."""
@@ -265,6 +271,125 @@ class TestRcloneManager(unittest.TestCase):
         self.rclone.on_status_change = lambda name, status: received.append((name, status))
         self.rclone._set_status("MySvc", "Testing")
         self.assertIn(("MySvc", "Testing"), received)
+
+    def test_on_error_callback_is_called(self):
+        """_emit_error() should invoke the on_error callback."""
+        errors = []
+        self.rclone.on_error = lambda name, msg: errors.append((name, msg))
+        self.rclone._emit_error("MySvc", "Test error message")
+        self.assertIn(("MySvc", "Test error message"), errors)
+
+    def test_vfs_args_included_in_bisync_command(self):
+        """_do_bisync() should include --vfs-cache-mode flag in the rclone command."""
+        self.config.add_service("VfsSvc", "onedrive", "/tmp/vfs_test")
+        self.config.update_service("VfsSvc", {
+            "vfs_cache_mode": "full",
+            "vfs_cache_max_size": "5G",
+            "vfs_cache_dir": "/tmp/cache_vfs",
+        })
+        captured_cmds = []
+
+        def fake_run_rclone(cmd, service_name, svc, is_retry=False):
+            captured_cmds.append(cmd)
+            return True
+
+        self.rclone._run_rclone = fake_run_rclone
+        svc = self.config.get_service("VfsSvc")
+        self.rclone._do_bisync(svc)
+
+        self.assertTrue(len(captured_cmds) > 0)
+        full_cmd = captured_cmds[0]
+        self.assertIn("--vfs-cache-mode", full_cmd)
+        self.assertIn("full", full_cmd)
+        self.assertIn("--vfs-cache-max-size", full_cmd)
+        self.assertIn("5G", full_cmd)
+        self.assertIn("--cache-dir", full_cmd)
+        self.assertIn("/tmp/cache_vfs", full_cmd)
+
+    def test_vfs_cache_dir_omitted_when_empty(self):
+        """_do_bisync() should NOT include --cache-dir when vfs_cache_dir is empty."""
+        self.config.add_service("VfsSvc2", "onedrive", "/tmp/vfs_test2")
+        self.config.update_service("VfsSvc2", {
+            "vfs_cache_mode": "writes",
+            "vfs_cache_dir": "",
+        })
+        captured_cmds = []
+
+        def fake_run_rclone(cmd, service_name, svc, is_retry=False):
+            captured_cmds.append(cmd)
+            return True
+
+        self.rclone._run_rclone = fake_run_rclone
+        svc = self.config.get_service("VfsSvc2")
+        self.rclone._do_bisync(svc)
+
+        self.assertTrue(len(captured_cmds) > 0)
+        self.assertNotIn("--cache-dir", captured_cmds[0])
+
+
+class TestErrorLogger(unittest.TestCase):
+    """Tests for the ErrorLogger class."""
+
+    def setUp(self):
+        self._tmpdir = tempfile.mkdtemp()
+        import src.config.config_manager as cm_mod
+        self._original_get_config_dir = cm_mod.get_config_dir
+        cm_mod.get_config_dir = lambda: Path(self._tmpdir)
+
+        import src.gui.error_logger as el_mod
+        self._original_log_path = el_mod._log_file_path
+        el_mod._log_file_path = lambda: os.path.join(self._tmpdir, "errors.txt")
+
+        from src.gui.error_logger import ErrorLogger
+        self.logger = ErrorLogger()
+
+    def tearDown(self):
+        import src.config.config_manager as cm_mod
+        cm_mod.get_config_dir = self._original_get_config_dir
+        import src.gui.error_logger as el_mod
+        el_mod._log_file_path = self._original_log_path
+        import shutil
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+
+    def test_initial_state_empty(self):
+        """A fresh ErrorLogger with no log file should have no entries."""
+        self.assertEqual(self.logger.get_all_entries(), [])
+
+    def test_log_adds_entry(self):
+        """log() should add a formatted entry."""
+        self.logger.log("TestSvc", "Something went wrong")
+        entries = self.logger.get_all_entries()
+        self.assertEqual(len(entries), 1)
+        self.assertIn("TestSvc", entries[0])
+        self.assertIn("Something went wrong", entries[0])
+
+    def test_newest_entry_is_first(self):
+        """Entries should be ordered newest-first."""
+        self.logger.log("Svc", "First error")
+        self.logger.log("Svc", "Second error")
+        entries = self.logger.get_all_entries()
+        self.assertIn("Second error", entries[0])
+        self.assertIn("First error", entries[1])
+
+    def test_save_and_reload(self):
+        """Entries saved to disk should be reloaded on next instantiation."""
+        self.logger.log("Svc", "Persistent error")
+        self.logger.save_to_file()
+
+        from src.gui.error_logger import ErrorLogger
+        logger2 = ErrorLogger()
+        text = logger2.get_all_text()
+        self.assertIn("Persistent error", text)
+
+    def test_get_all_text_empty_when_no_errors(self):
+        """get_all_text() should return an empty string when no errors exist."""
+        self.assertEqual(self.logger.get_all_text(), "")
+
+    def test_clear_removes_entries(self):
+        """clear() should remove all in-memory entries."""
+        self.logger.log("Svc", "Error 1")
+        self.logger.clear()
+        self.assertEqual(self.logger.get_all_entries(), [])
 
 
 if __name__ == "__main__":
