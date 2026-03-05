@@ -82,9 +82,21 @@ class ConfigWindow:
         # _toggle_tree_item (Panel 4) can mutate it even while Panel 3 is hidden.
         self._excl_items: List[Dict] = self._build_excl_items()
 
+        # Persist excluded-folder list across panel switches (initialised once
+        # here so _panel_tree never resets it on re-entry).
+        self._excluded_folders: List[str] = list(self._svc.get("excluded_folders", []))
+
+        # Remote tree cache – populated on first fetch; re-used when the user
+        # re-visits Panel 4 or when the config window is opened.
+        self._remote_tree_cache: List[Dict] = []
+
         self._build_layout()
         # Show the first panel by default
         self._show_panel(0)
+
+        # Kick off a background tree fetch immediately so the data is likely
+        # ready by the time the user navigates to Panel 4.
+        self._prefetch_tree()
 
     # ------------------------------------------------------------------
     # Layout construction
@@ -190,6 +202,11 @@ class ConfigWindow:
         p = self._make_panel("Configuración por defecto")
 
         tk.Label(p, text="Estas opciones se aplican al ejecutar bisync para este servicio.", wraplength=450, justify="left").pack(anchor="w", pady=(0, 10))
+
+        # Service name (editable; changing it renames the service)
+        tk.Label(p, text="Nombre del servicio:", anchor="w").pack(anchor="w")
+        self._service_name_var = tk.StringVar(value=self._service_name)
+        tk.Entry(p, textvariable=self._service_name_var, width=40).pack(anchor="w", pady=(2, 10))
 
         # Remote path (from root by default)
         tk.Label(p, text="Ruta remota base:", anchor="w").pack(anchor="w")
@@ -482,24 +499,77 @@ class ConfigWindow:
 
         self._tree.bind("<ButtonRelease-1>", self._toggle_tree_item)
 
-        # Track which folders are excluded
-        self._excluded_folders: List[str] = list(self._svc.get("excluded_folders", []))
-        self._tree_items: Dict[str, str] = {}  # item_id → folder path
+        # item_id → folder path mapping (rebuilt whenever the tree is populated)
+        self._tree_items: Dict[str, str] = {}
 
-        tk.Button(p, text="🔄 Cargar carpetas", command=self._load_tree).pack(anchor="w", pady=(8, 0))
+        btn_frame = tk.Frame(p)
+        btn_frame.pack(fill=tk.X, pady=(8, 0))
+
+        tk.Button(btn_frame, text="🔄 Actualizar carpetas", command=self._load_tree).pack(side=tk.LEFT)
+
+        # If we already have cached data, populate immediately without a new
+        # network request so the user's previous selections are preserved.
+        if self._remote_tree_cache:
+            self._populate_tree(self._remote_tree_cache)
+        else:
+            tk.Label(
+                btn_frame,
+                text="  Cargando…",
+                fg="gray",
+                font=("Segoe UI", 9, "italic"),
+            ).pack(side=tk.LEFT, padx=(6, 0))
+
+    def _prefetch_tree(self) -> None:
+        """Fetch the remote folder list silently in a background thread.
+
+        Result is stored in ``_remote_tree_cache``.  If Panel 4 happens to be
+        visible when the fetch completes, the tree is populated automatically.
+        """
+        def fetch() -> None:
+            items = self._rclone.list_remote_tree(self._service_name)
+            self._remote_tree_cache = items
+            # If Panel 4 is currently visible, populate the treeview.
+            try:
+                self._win.after(0, lambda: self._populate_tree_if_visible(items))
+            except tk.TclError:
+                pass  # Window was closed before fetch completed
+
+        threading.Thread(target=fetch, daemon=True).start()
+
+    def _populate_tree_if_visible(self, items: List[Dict]) -> None:
+        """Populate the treeview only if Panel 4 is currently rendered."""
+        if hasattr(self, "_tree"):
+            try:
+                if self._tree.winfo_exists():
+                    self._populate_tree(items)
+            except tk.TclError:
+                pass
 
     def _load_tree(self) -> None:
-        """Fetch the remote folder list in a background thread."""
-        self._tree.delete(*self._tree.get_children())
+        """Fetch the remote folder list in a background thread (user-triggered)."""
+        if hasattr(self, "_tree"):
+            self._tree.delete(*self._tree.get_children())
+        self._tree_items = {}
 
         def fetch() -> None:
             items = self._rclone.list_remote_tree(self._service_name)
-            self._win.after(0, lambda: self._populate_tree(items))
+            self._remote_tree_cache = items
+            try:
+                self._win.after(0, lambda: self._populate_tree(items))
+            except tk.TclError:
+                pass  # Window was closed before fetch completed
 
         threading.Thread(target=fetch, daemon=True).start()
 
     def _populate_tree(self, items: List[Dict]) -> None:
-        """Insert fetched items into the treeview."""
+        """Insert fetched items into the treeview, rebuilding the id→path map."""
+        if not hasattr(self, "_tree"):
+            return
+        try:
+            self._tree.delete(*self._tree.get_children())
+        except tk.TclError:
+            return
+        self._tree_items = {}
         for item in items:
             path = item.get("path", "")
             synced = path not in self._excluded_folders
@@ -711,7 +781,12 @@ class ConfigWindow:
         """Collect all panel data and persist it to the config."""
         updates: Dict = {}
 
-        # Panel 1 – defaults
+        # Panel 1 – defaults (service name + rclone options)
+        new_name = self._service_name_var.get().strip()
+        if new_name and new_name != self._service_name:
+            # Include the new name in the update dict; update_service() will
+            # overwrite the 'name' key while looking up by the old name.
+            updates["name"] = new_name
         if hasattr(self, "_remote_path_var"):
             updates["remote_path"] = self._remote_path_var.get()
         if hasattr(self, "_vfs_var"):
@@ -759,6 +834,12 @@ class ConfigWindow:
             self._win.after_cancel(self._disk_refresh_id)
 
         self._config.update_service(self._service_name, updates)
+
+        # If the name changed, update internal state and the window title so
+        # they stay consistent.  The main window rebuilds its tabs via on_saved.
+        if updates.get("name") and updates["name"] != self._service_name:
+            self._service_name = updates["name"]
+            self._win.title(f"Configuración – {self._service_name}")
 
         messagebox.showinfo("Guardado", "Los cambios han sido guardados correctamente.", parent=self._win)
 
