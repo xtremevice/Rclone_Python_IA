@@ -5,6 +5,9 @@
 # Requisitos:
 #   - Python 3.8+
 #   - pip
+#   - python3-tk    (tkinter – paquete del sistema, no se puede instalar con pip)
+#       Debian/Ubuntu:  sudo apt install python3-tk
+#       Fedora/RHEL:    sudo dnf install python3-tkinter
 #   - appimagetool (descargado automáticamente si no está instalado)
 #   - fuse (necesario para AppImage): sudo apt install fuse libfuse2
 
@@ -39,6 +42,15 @@ fi
 pip install --upgrade pip
 pip install -r requirements.txt
 pip install pyinstaller
+
+# Verificar que tkinter está disponible (paquete del sistema, no se puede instalar con pip).
+python -c "import tkinter" 2>/dev/null || {
+    echo "ERROR: tkinter no está disponible."
+    echo "  Instale el paquete del sistema requerido y vuelva a ejecutar este script:"
+    echo "    Debian/Ubuntu:  sudo apt install python3-tk"
+    echo "    Fedora/RHEL:    sudo dnf install python3-tkinter"
+    exit 1
+}
 
 # Construir con PyInstaller primero (genera el directorio dist/)
 echo "Construyendo con PyInstaller..."

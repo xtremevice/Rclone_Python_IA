@@ -4,8 +4,10 @@
 # Prerequisites:
 #   - Python 3.10+  (python3 on PATH)
 #   - pip
-#   - appimagetool  (https://github.com/AppImage/AppImageKit/releases)
-#   - appimagetool must be on PATH or set APPIMAGETOOL env variable
+#   - python3-tk    (tkinter – system package, not installable via pip)
+#       Debian/Ubuntu:  sudo apt install python3-tk
+#       Fedora/RHEL:    sudo dnf install python3-tkinter
+#   - appimagetool  (downloaded automatically if not on PATH)
 
 set -euo pipefail
 
@@ -30,6 +32,15 @@ fi
 pip install --upgrade pip
 pip install -r requirements.txt
 pip install pyinstaller
+
+# Verify tkinter is available (it is a system package – not installable via pip).
+python -c "import tkinter" 2>/dev/null || {
+    echo "ERROR: tkinter is not available."
+    echo "  Install the required system package and re-run this script:"
+    echo "    Debian/Ubuntu:  sudo apt install python3-tk"
+    echo "    Fedora/RHEL:    sudo dnf install python3-tkinter"
+    exit 1
+}
 
 echo "[2/5] Generating icon..."
 python3 assets/create_icon.py || true
