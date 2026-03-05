@@ -23,7 +23,21 @@ python3 --version
 
 # Instalar dependencias
 echo "Instalando dependencias..."
-pip3 install -r requirements.txt
+# Create a virtual environment to avoid the PEP 668
+# "externally-managed-environment" error on Python 3.12+ (Debian/Ubuntu).
+if [ -z "${VIRTUAL_ENV:-}" ]; then
+    python3 -m venv .venv || {
+        echo "ERROR: Failed to create virtual environment."
+        echo "  On Debian/Ubuntu, install the required package with:"
+        echo "    sudo apt install python3-venv"
+        exit 1
+    }
+    # shellcheck disable=SC1091
+    source .venv/bin/activate
+fi
+pip install --upgrade pip
+pip install -r requirements.txt
+pip install pyinstaller
 
 # Construir con PyInstaller - un solo archivo ejecutable para macOS
 echo "Construyendo ejecutable para macOS..."
