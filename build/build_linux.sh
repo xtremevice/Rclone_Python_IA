@@ -72,8 +72,24 @@ APPRUN
 chmod +x "$APPDIR/AppRun"
 
 echo "[5/5] Packaging AppImage..."
-APPIMAGETOOL="${APPIMAGETOOL:-appimagetool}"
-"$APPIMAGETOOL" "$APPDIR" "dist/linux/RcloneManager-x86_64.AppImage"
+# Locate or auto-download appimagetool.
+# appimagetool is itself an AppImage; set APPIMAGE_EXTRACT_AND_RUN=1 so it
+# runs without FUSE (required in most CI environments such as GitHub Actions).
+export APPIMAGE_EXTRACT_AND_RUN=1
+
+if [ -z "${APPIMAGETOOL:-}" ]; then
+    if command -v appimagetool &> /dev/null; then
+        APPIMAGETOOL="appimagetool"
+    else
+        echo "  appimagetool not found – downloading..."
+        APPIMAGETOOL="/tmp/appimagetool"
+        wget -q -O "$APPIMAGETOOL" \
+            "https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage"
+        chmod +x "$APPIMAGETOOL"
+    fi
+fi
+
+ARCH=x86_64 "$APPIMAGETOOL" "$APPDIR" "dist/linux/RcloneManager-x86_64.AppImage"
 
 echo ""
 echo "Build complete: dist/linux/RcloneManager-x86_64.AppImage"

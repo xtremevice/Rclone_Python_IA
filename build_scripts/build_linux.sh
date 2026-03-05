@@ -93,6 +93,10 @@ EOF
 chmod +x "$APPDIR/AppRun"
 
 # Descargar appimagetool si no está instalado
+# appimagetool is itself an AppImage; set APPIMAGE_EXTRACT_AND_RUN=1 so it
+# runs without FUSE (required in most CI environments such as GitHub Actions).
+export APPIMAGE_EXTRACT_AND_RUN=1
+
 if ! command -v appimagetool &> /dev/null; then
     echo "Descargando appimagetool..."
     wget -q "https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage" \
