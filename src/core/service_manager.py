@@ -109,7 +109,10 @@ class ServiceManager(QObject):
         # Convert minutes → milliseconds
         interval_ms = service.sync_interval * 60 * 1000
         timer.setInterval(interval_ms)
-        # Use a closure to capture the service ID
+        # Capture service_id in a local variable so that the lambda closure
+        # binds the *value* at this point in time rather than a late-bound
+        # reference to `service.id`, which could change if `service` is
+        # mutated after this method returns.
         service_id = service.id
         timer.timeout.connect(lambda: self._on_timer(service_id))
         self._timers[service.id] = timer

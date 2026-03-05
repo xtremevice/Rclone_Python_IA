@@ -272,16 +272,17 @@ class _FolderTreePanel(QWidget):
             if item.checkState(1) == Qt.Unchecked:
                 excluded.append(item.text(0))
         self.service.excluded_folders = excluded
-        # Rebuild exclude_rules from excluded_folders plus user-defined rules
-        base_rules = [
+        # Rebuild exclude_rules from excluded_folders plus any user-defined rules.
+        # Use exact suffix matching ("/{folder}/**") to avoid false positives
+        # when a folder name is a prefix of another rule.
+        folder_rules = {f"/{f}/**" for f in excluded}
+        # Keep existing rules that are NOT auto-generated folder-exclusion rules
+        # (i.e. rules that don't follow the "/<folder>/**" pattern we auto-create)
+        existing_non_folder_rules = [
             r for r in self.service.exclude_rules
-            if not any(r.startswith(f"/{f}/") for f in excluded)
+            if r not in {f"/{f}/**" for f in (self.service.excluded_folders or [])}
         ]
-        for folder in excluded:
-            rule = f"/{folder}/**"
-            if rule not in base_rules:
-                base_rules.append(rule)
-        self.service.exclude_rules = base_rules
+        self.service.exclude_rules = existing_non_folder_rules + sorted(folder_rules)
 
 
 class _SyncIntervalPanel(QWidget):
@@ -382,9 +383,9 @@ class _DiskSpacePanel(QWidget):
 
         layout.addStretch()
 
-        # Start auto-refresh timer (every 10 seconds while panel is visible)
+        # Start auto-refresh timer (every 30 seconds while panel is visible)
         self._refresh_timer = QTimer(self)
-        self._refresh_timer.setInterval(10_000)
+        self._refresh_timer.setInterval(30_000)
         self._refresh_timer.timeout.connect(self._update_usage)
         self._refresh_timer.start()
         self._update_usage()

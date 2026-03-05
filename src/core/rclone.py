@@ -228,6 +228,10 @@ class SyncWorker(QObject):
         ``progress`` signal.  Individual file transfers also trigger the
         ``file_synced`` signal.  When done, ``finished`` is emitted with a
         boolean success flag and a descriptive message.
+
+        An automatic one-time retry with ``--resync`` is performed when the
+        initial bisync exits with code 1 or 2 and ``use_resync`` was False.
+        The retry uses a loop (not recursion) to avoid stack overflow.
         """
         if not rclone_available():
             self.finished.emit(False, "rclone no está disponible.")
@@ -236,78 +240,94 @@ class SyncWorker(QObject):
         # Build the remote specifier
         remote_src = f"{self.remote_name}:{self.remote_path}"
 
-        # Core bisync arguments
-        cmd = _base_cmd() + [
-            "bisync",
-            remote_src,
-            self.local_path,
-            "--transfers", "16",
-            "--checkers", "32",
-            "--drive-chunk-size", "128M",
-            "--buffer-size", "64M",
-            "-P",
-            "--log-level", "INFO",
-        ]
+        # Maximum number of attempts: 1 normal + 1 resync retry
+        max_attempts = 2
+        for attempt in range(1, max_attempts + 1):
+            if self._cancelled:
+                self.finished.emit(False, "Sincronización cancelada por el usuario.")
+                return
 
-        # Add --resync flag when requested (required for first run or after errors)
-        if self.use_resync:
-            cmd.append("--resync")
+            # Core bisync arguments
+            cmd = _base_cmd() + [
+                "bisync",
+                remote_src,
+                self.local_path,
+                "--transfers", "16",
+                "--checkers", "32",
+                "--drive-chunk-size", "128M",
+                "--buffer-size", "64M",
+                "-P",
+                "--log-level", "INFO",
+            ]
 
-        # Add exclude rules
-        for rule in self.exclude_rules:
-            cmd += ["--exclude", rule]
+            # Add --resync flag when requested (or on retry attempt)
+            if self.use_resync:
+                cmd.append("--resync")
 
-        # VFS / on-demand download is handled at mount time, not bisync time,
-        # but we record the preference so the caller can act on it if needed.
+            # Add exclude rules
+            for rule in self.exclude_rules:
+                cmd += ["--exclude", rule]
 
-        self.progress.emit(f"Iniciando sincronización: {remote_src} → {self.local_path}")
-        self.progress.emit("Comando: " + " ".join(cmd))
+            # VFS / on-demand download is handled at mount time, not bisync
+            # time, but we record the preference so the caller can act on it.
 
-        try:
-            # Use Popen so we can stream output line by line
-            proc = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1,
-            )
+            if attempt == 1:
+                self.progress.emit(
+                    f"Iniciando sincronización: {remote_src} → {self.local_path}"
+                )
+            self.progress.emit("Comando: " + " ".join(cmd))
 
-            for line in proc.stdout:
-                if self._cancelled:
-                    proc.terminate()
-                    self.finished.emit(False, "Sincronización cancelada por el usuario.")
+            try:
+                # Use Popen so we can stream output line by line
+                proc = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    bufsize=1,
+                )
+
+                for line in proc.stdout:
+                    if self._cancelled:
+                        proc.terminate()
+                        self.finished.emit(
+                            False, "Sincronización cancelada por el usuario."
+                        )
+                        return
+
+                    line = line.rstrip()
+                    self.progress.emit(line)
+
+                    # Check for transferred-file lines in the output
+                    match = self._TRANSFER_RE.match(line)
+                    if match:
+                        filename = match.group(1).strip()
+                        self.file_synced.emit(filename, True)
+
+                proc.wait()
+
+                if proc.returncode == 0:
+                    self.finished.emit(True, "Sincronización completada correctamente.")
                     return
 
-                line = line.rstrip()
-                self.progress.emit(line)
-
-                # Check for transferred-file lines in the output
-                match = self._TRANSFER_RE.match(line)
-                if match:
-                    filename = match.group(1).strip()
-                    self.file_synced.emit(filename, True)
-
-            proc.wait()
-
-            if proc.returncode == 0:
-                self.finished.emit(True, "Sincronización completada correctamente.")
-            else:
-                # bisync returns non-zero on resync-needed errors; retry once
-                # with --resync if we were not already using it
-                if not self.use_resync and proc.returncode in (1, 2):
+                # bisync exits non-zero on resync-needed errors; retry once
+                # with --resync if we have not used it yet
+                if not self.use_resync and proc.returncode in (1, 2) and attempt < max_attempts:
                     self.progress.emit(
                         "⚠️ Error detectado. Reintentando con --resync …"
                     )
                     self.use_resync = True
-                    self.run()
+                    continue   # loop back for second attempt
                 else:
                     self.finished.emit(
                         False,
                         f"rclone terminó con código {proc.returncode}.",
                     )
-        except Exception as exc:
-            self.finished.emit(False, str(exc))
+                    return
+
+            except Exception as exc:
+                self.finished.emit(False, str(exc))
+                return
 
 
 # ---------------------------------------------------------------------------

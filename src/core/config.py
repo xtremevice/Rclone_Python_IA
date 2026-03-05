@@ -90,10 +90,10 @@ class ServiceConfig:
         self.is_syncing: bool = data.get("is_syncing", False)
         # Sync interval in minutes
         self.sync_interval: int = data.get("sync_interval", 15)
-        # Rclone --exclude rules (list of glob strings)
-        self.exclude_rules: List[str] = data.get(
-            "exclude_rules", ["/Almacén personal/**"]
-        )
+        # Rclone --exclude rules (list of glob strings).
+        # No default rules; the setup wizard adds platform-specific defaults
+        # (e.g. OneDrive's personal vault) when creating a new service.
+        self.exclude_rules: List[str] = data.get("exclude_rules", [])
         # Whether to start syncing when the application launches
         self.sync_on_startup: bool = data.get("sync_on_startup", False)
         # Seconds to wait after application startup before first sync
