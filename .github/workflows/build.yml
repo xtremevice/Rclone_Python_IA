@@ -108,11 +108,13 @@ jobs:
         run: |
           wget -q -O /usr/local/bin/appimagetool \
             "https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage"
-          # Verify the download is a valid ELF executable (basic integrity check)
-          file /usr/local/bin/appimagetool | grep -q "ELF" || { echo "Download appears invalid"; exit 1; }
           chmod +x /usr/local/bin/appimagetool
 
       - name: Build AppImage
+        env:
+          # appimagetool is itself an AppImage; this env var lets it run
+          # without FUSE (required on GitHub Actions runners).
+          APPIMAGE_EXTRACT_AND_RUN: "1"
         run: |
           chmod +x build/build_linux.sh
           ./build/build_linux.sh

@@ -4,8 +4,10 @@
 # Prerequisites:
 #   - Python 3.10+  (python3 on PATH)
 #   - pip
-#   - appimagetool  (https://github.com/AppImage/AppImageKit/releases)
-#   - appimagetool must be on PATH or set APPIMAGETOOL env variable
+#   - python3-tk    (tkinter – system package, not installable via pip)
+#       Debian/Ubuntu:  sudo apt install python3-tk
+#       Fedora/RHEL:    sudo dnf install python3-tkinter
+#   - appimagetool  (downloaded automatically if not on PATH)
 
 set -euo pipefail
 
@@ -15,7 +17,30 @@ ROOT="$(dirname "$SCRIPT_DIR")"
 cd "$ROOT"
 
 echo "[1/5] Installing Python dependencies..."
-pip3 install -r requirements.txt
+# Create a virtual environment to avoid the PEP 668
+# "externally-managed-environment" error on Python 3.12+ (Debian/Ubuntu).
+if [ -z "${VIRTUAL_ENV:-}" ]; then
+    python3 -m venv .venv || {
+        echo "ERROR: Failed to create virtual environment."
+        echo "  On Debian/Ubuntu, install the required package with:"
+        echo "    sudo apt install python3-venv"
+        exit 1
+    }
+    # shellcheck disable=SC1091
+    source .venv/bin/activate
+fi
+pip install --upgrade pip
+pip install -r requirements.txt
+pip install pyinstaller
+
+# Verify tkinter is available (it is a system package – not installable via pip).
+python -c "import tkinter" 2>/dev/null || {
+    echo "ERROR: tkinter is not available."
+    echo "  Install the required system package and re-run this script:"
+    echo "    Debian/Ubuntu:  sudo apt install python3-tk"
+    echo "    Fedora/RHEL:    sudo dnf install python3-tkinter"
+    exit 1
+}
 
 echo "[2/5] Generating icon..."
 python3 assets/create_icon.py || true
@@ -58,8 +83,24 @@ APPRUN
 chmod +x "$APPDIR/AppRun"
 
 echo "[5/5] Packaging AppImage..."
-APPIMAGETOOL="${APPIMAGETOOL:-appimagetool}"
-"$APPIMAGETOOL" "$APPDIR" "dist/linux/RcloneManager-x86_64.AppImage"
+# Locate or auto-download appimagetool.
+# appimagetool is itself an AppImage; set APPIMAGE_EXTRACT_AND_RUN=1 so it
+# runs without FUSE (required in most CI environments such as GitHub Actions).
+export APPIMAGE_EXTRACT_AND_RUN=1
+
+if [ -z "${APPIMAGETOOL:-}" ]; then
+    if command -v appimagetool &> /dev/null; then
+        APPIMAGETOOL="appimagetool"
+    else
+        echo "  appimagetool not found – downloading..."
+        APPIMAGETOOL="/tmp/appimagetool"
+        wget -q -O "$APPIMAGETOOL" \
+            "https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage"
+        chmod +x "$APPIMAGETOOL"
+    fi
+fi
+
+ARCH=x86_64 "$APPIMAGETOOL" "$APPDIR" "dist/linux/RcloneManager-x86_64.AppImage"
 
 echo ""
 echo "Build complete: dist/linux/RcloneManager-x86_64.AppImage"

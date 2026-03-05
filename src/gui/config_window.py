@@ -10,12 +10,13 @@ Shows a left-side menu with 7 sections and a corresponding right-side panel:
   6. Free disk space / delete service
   7. Service information
 
-Window size: 60 % of screen height × 70 % of screen width.
+Window size: 60 % of screen height × 35 % of screen width.
 """
 
+import os
 import threading
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 from typing import Callable, Dict, List, Optional
 
 from src.config.config_manager import (
@@ -75,11 +76,27 @@ class ConfigWindow:
         self._win = tk.Toplevel(parent)
         self._win.title(f"Configuración – {service_name}")
         self._win.resizable(False, False)
-        _center_window(self._win, height_pct=0.60, width_pct=0.70)
+        _center_window(self._win, height_pct=0.60, width_pct=0.35)
+
+        # Build exclusion checklist data before any panel is rendered so
+        # _toggle_tree_item (Panel 4) can mutate it even while Panel 3 is hidden.
+        self._excl_items: List[Dict] = self._build_excl_items()
+
+        # Persist excluded-folder list across panel switches (initialised once
+        # here so _panel_tree never resets it on re-entry).
+        self._excluded_folders: List[str] = list(self._svc.get("excluded_folders", []))
+
+        # Remote tree cache – populated on first fetch; re-used when the user
+        # re-visits Panel 4 or when the config window is opened.
+        self._remote_tree_cache: List[Dict] = []
 
         self._build_layout()
         # Show the first panel by default
         self._show_panel(0)
+
+        # Kick off a background tree fetch immediately so the data is likely
+        # ready by the time the user navigates to Panel 4.
+        self._prefetch_tree()
 
     # ------------------------------------------------------------------
     # Layout construction
@@ -186,6 +203,11 @@ class ConfigWindow:
 
         tk.Label(p, text="Estas opciones se aplican al ejecutar bisync para este servicio.", wraplength=450, justify="left").pack(anchor="w", pady=(0, 10))
 
+        # Service name (editable; changing it renames the service)
+        tk.Label(p, text="Nombre del servicio:", anchor="w").pack(anchor="w")
+        self._service_name_var = tk.StringVar(value=self._service_name)
+        tk.Entry(p, textvariable=self._service_name_var, width=40).pack(anchor="w", pady=(2, 10))
+
         # Remote path (from root by default)
         tk.Label(p, text="Ruta remota base:", anchor="w").pack(anchor="w")
         self._remote_path_var = tk.StringVar(value=self._svc.get("remote_path", "/"))
@@ -222,6 +244,7 @@ class ConfigWindow:
         self._local_path_var = tk.StringVar(value=self._svc.get("local_path", ""))
         tk.Entry(local_frame, textvariable=self._local_path_var, width=50).pack(side=tk.LEFT, fill=tk.X, expand=True)
         tk.Button(local_frame, text="…", command=self._browse_local).pack(side=tk.LEFT, padx=4)
+        tk.Button(local_frame, text="📁 Nueva", command=self._create_local_subfolder).pack(side=tk.LEFT, padx=(0, 4))
 
         # Remote path
         tk.Label(p, text="Ruta dentro del servicio remoto (ej. /MiCarpeta):", anchor="w").pack(anchor="w", pady=(10, 0))
@@ -230,46 +253,220 @@ class ConfigWindow:
 
     def _browse_local(self) -> None:
         """Open folder picker to change local sync directory."""
-        folder = filedialog.askdirectory(initialdir=self._local_path_var.get(), parent=self._win)
+        folder = filedialog.askdirectory(
+            initialdir=self._local_path_var.get(),
+            parent=self._win,
+        )
         if folder:
             self._local_path_var.set(folder)
 
+    def _create_local_subfolder(self) -> None:
+        """Create a new subfolder inside the current local path and update the entry."""
+        parent_path = self._local_path_var.get().strip() or os.path.expanduser("~")
+        name = simpledialog.askstring(
+            "Nueva carpeta",
+            "Nombre de la nueva carpeta:",
+            parent=self._win,
+        )
+        if not name:
+            return
+        new_path = os.path.join(parent_path, name)
+        try:
+            os.makedirs(new_path, exist_ok=True)
+            self._local_path_var.set(new_path)
+        except OSError as exc:
+            messagebox.showerror(
+                "Error al crear carpeta",
+                f"No se pudo crear la carpeta:\n{exc}",
+                parent=self._win,
+            )
+
     # ------------------------------------------------------------------
-    # Panel 3 – Exclusions
+    # Panel 3 – Exclusions (checklist)
     # ------------------------------------------------------------------
+
+    def _build_excl_items(self) -> List[Dict]:
+        """
+        Build the initial exclusion checklist from the saved service config.
+
+        The personal-vault pattern is always present as the first entry
+        (checked / unchecked according to the saved 'exclude_personal_vault'
+        flag), followed by any other saved patterns.
+        """
+        items: List[Dict] = []
+        existing: List[str] = list(self._svc.get("exclusions", []))
+
+        # Personal vault – always first, label as "recomendado"
+        # Prefer the authoritative pattern list when it exists; fall back to
+        # the legacy boolean flag for configs that predate the list approach.
+        if existing:
+            pv_enabled = PERSONAL_VAULT_PATTERN in existing
+        else:
+            pv_enabled = bool(self._svc.get("exclude_personal_vault", True))
+        items.append({
+            "pattern": PERSONAL_VAULT_PATTERN,
+            "var": tk.BooleanVar(value=pv_enabled),
+            "recommended": True,
+        })
+
+        # All other saved patterns
+        for pattern in existing:
+            if pattern != PERSONAL_VAULT_PATTERN:
+                items.append({
+                    "pattern": pattern,
+                    "var": tk.BooleanVar(value=True),
+                    "recommended": False,
+                })
+
+        return items
 
     def _panel_exclusions(self) -> None:
-        """Panel to add or remove exclusion glob patterns."""
+        """Panel to manage exclusion glob patterns as an interactive checklist."""
         p = self._make_panel("Excepciones")
 
-        tk.Label(p, text="Patrones de exclusión (un patrón por línea):", anchor="w").pack(anchor="w")
-        tk.Label(p, text="Ejemplo: /Almacén personal/**", fg="gray", font=("Segoe UI", 9)).pack(anchor="w", pady=(0, 5))
-
-        # Personal vault toggle
-        self._personal_vault_var = tk.BooleanVar(value=self._svc.get("exclude_personal_vault", True))
-        tk.Checkbutton(
+        tk.Label(
             p,
-            text='Excluir "Almacén personal" de OneDrive (recomendado)',
-            variable=self._personal_vault_var,
-        ).pack(anchor="w", pady=(0, 10))
+            text=(
+                "Activa o desactiva los patrones que deseas excluir de la sincronización. "
+                "Las carpetas desmarcadas en el árbol de carpetas se añaden aquí automáticamente."
+            ),
+            wraplength=400,
+            justify="left",
+        ).pack(anchor="w", pady=(0, 8))
 
-        # Text area for custom exclusions
-        text_frame = tk.Frame(p)
-        text_frame.pack(fill=tk.BOTH, expand=True)
+        # ── Scrollable checklist ──────────────────────────────────────
+        list_outer = tk.Frame(p, bd=1, relief=tk.SUNKEN)
+        list_outer.pack(fill=tk.BOTH, expand=True)
 
-        sb = tk.Scrollbar(text_frame)
+        sb = tk.Scrollbar(list_outer, orient=tk.VERTICAL)
         sb.pack(side=tk.RIGHT, fill=tk.Y)
 
-        self._excl_text = tk.Text(text_frame, yscrollcommand=sb.set, width=50, height=10, font=("Courier", 10))
-        self._excl_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        sb.config(command=self._excl_text.yview)
+        self._excl_canvas = tk.Canvas(
+            list_outer, yscrollcommand=sb.set, bg="white", highlightthickness=0
+        )
+        self._excl_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        sb.config(command=self._excl_canvas.yview)
 
-        # Pre-fill with existing exclusions (excluding the personal vault default)
-        existing = [
-            e for e in self._svc.get("exclusions", [])
-            if e != "/Almacén personal/**"
-        ]
-        self._excl_text.insert("1.0", "\n".join(existing))
+        self._excl_inner = tk.Frame(self._excl_canvas, bg="white")
+        self._excl_canvas_win_id = self._excl_canvas.create_window(
+            (0, 0), window=self._excl_inner, anchor="nw"
+        )
+
+        self._excl_inner.bind(
+            "<Configure>",
+            lambda e: self._excl_canvas.configure(
+                scrollregion=self._excl_canvas.bbox("all")
+            ),
+        )
+        self._excl_canvas.bind(
+            "<Configure>",
+            lambda e: self._excl_canvas.itemconfig(
+                self._excl_canvas_win_id, width=e.width
+            ),
+        )
+
+        self._render_excl_rows()
+
+        # ── Add button ────────────────────────────────────────────────
+        btn_frame = tk.Frame(p, bg="white")
+        btn_frame.pack(fill=tk.X, pady=(6, 0))
+
+        tk.Button(
+            btn_frame,
+            text="➕ Agregar patrón",
+            command=self._add_excl_pattern,
+            relief=tk.FLAT,
+            bg="#e0e0e0",
+            font=("Segoe UI", 9),
+        ).pack(side=tk.LEFT)
+
+    def _render_excl_rows(self) -> None:
+        """Repopulate the exclusion checklist inner frame from ``_excl_items``.
+
+        This method is safe to call at any time; it is a no-op when Panel 3
+        has not been rendered yet (``_excl_inner`` attribute absent) or has
+        already been destroyed (``TclError``).
+        """
+        # _excl_inner is only set when Panel 3 is rendered; guard against
+        # calls from _toggle_tree_item while a different panel is visible.
+        if not hasattr(self, "_excl_inner"):
+            return
+        try:
+            for w in self._excl_inner.winfo_children():
+                w.destroy()
+        except tk.TclError:
+            return
+
+        for item in self._excl_items:
+            row = tk.Frame(self._excl_inner, bg="white")
+            row.pack(fill=tk.X, padx=4, pady=1)
+
+            tk.Checkbutton(row, variable=item["var"], bg="white").pack(side=tk.LEFT)
+
+            tk.Label(
+                row,
+                text=item["pattern"],
+                bg="white",
+                anchor="w",
+                font=("Segoe UI", 9),
+            ).pack(side=tk.LEFT)
+
+            if item.get("recommended"):
+                tk.Label(
+                    row,
+                    text="(recomendado)",
+                    fg="gray",
+                    bg="white",
+                    font=("Segoe UI", 8, "italic"),
+                ).pack(side=tk.LEFT, padx=(4, 0))
+
+            # Capture pattern string, not a mutable index, so removal is safe
+            # even if the list is mutated between renders.
+            tk.Button(
+                row,
+                text="✕",
+                command=lambda pat=item["pattern"]: self._remove_excl_by_pattern(pat),
+                relief=tk.FLAT,
+                bg="white",
+                fg="#c50f1f",
+                font=("Segoe UI", 8),
+                cursor="hand2",
+            ).pack(side=tk.RIGHT)
+
+        try:
+            self._excl_inner.update_idletasks()
+            self._excl_canvas.configure(scrollregion=self._excl_canvas.bbox("all"))
+        except tk.TclError:
+            pass
+
+    def _add_excl_pattern(self) -> None:
+        """Ask the user for a new glob pattern and add it to the checklist."""
+        pattern = simpledialog.askstring(
+            "Agregar patrón",
+            "Ingresa el patrón de exclusión:\nEjemplo: /Documentos/**",
+            parent=self._win,
+        )
+        if not pattern or not pattern.strip():
+            return
+        pattern = pattern.strip()
+        if any(i["pattern"] == pattern for i in self._excl_items):
+            messagebox.showwarning(
+                "Duplicado",
+                f"El patrón '{pattern}' ya existe en la lista.",
+                parent=self._win,
+            )
+            return
+        self._excl_items.append({
+            "pattern": pattern,
+            "var": tk.BooleanVar(value=True),
+            "recommended": False,
+        })
+        self._render_excl_rows()
+
+    def _remove_excl_by_pattern(self, pattern: str) -> None:
+        """Remove the exclusion item matching *pattern* and refresh the list."""
+        self._excl_items = [i for i in self._excl_items if i["pattern"] != pattern]
+        self._render_excl_rows()
 
     # ------------------------------------------------------------------
     # Panel 4 – Folder tree
@@ -302,24 +499,77 @@ class ConfigWindow:
 
         self._tree.bind("<ButtonRelease-1>", self._toggle_tree_item)
 
-        # Track which folders are excluded
-        self._excluded_folders: List[str] = list(self._svc.get("excluded_folders", []))
-        self._tree_items: Dict[str, str] = {}  # item_id → folder path
+        # item_id → folder path mapping (rebuilt whenever the tree is populated)
+        self._tree_items: Dict[str, str] = {}
 
-        tk.Button(p, text="🔄 Cargar carpetas", command=self._load_tree).pack(anchor="w", pady=(8, 0))
+        btn_frame = tk.Frame(p)
+        btn_frame.pack(fill=tk.X, pady=(8, 0))
+
+        tk.Button(btn_frame, text="🔄 Actualizar carpetas", command=self._load_tree).pack(side=tk.LEFT)
+
+        # If we already have cached data, populate immediately without a new
+        # network request so the user's previous selections are preserved.
+        if self._remote_tree_cache:
+            self._populate_tree(self._remote_tree_cache)
+        else:
+            tk.Label(
+                btn_frame,
+                text="  Cargando…",
+                fg="gray",
+                font=("Segoe UI", 9, "italic"),
+            ).pack(side=tk.LEFT, padx=(6, 0))
+
+    def _prefetch_tree(self) -> None:
+        """Fetch the remote folder list silently in a background thread.
+
+        Result is stored in ``_remote_tree_cache``.  If Panel 4 happens to be
+        visible when the fetch completes, the tree is populated automatically.
+        """
+        def fetch() -> None:
+            items = self._rclone.list_remote_tree(self._service_name)
+            self._remote_tree_cache = items
+            # If Panel 4 is currently visible, populate the treeview.
+            try:
+                self._win.after(0, lambda: self._populate_tree_if_visible(items))
+            except tk.TclError:
+                pass  # Window was closed before fetch completed
+
+        threading.Thread(target=fetch, daemon=True).start()
+
+    def _populate_tree_if_visible(self, items: List[Dict]) -> None:
+        """Populate the treeview only if Panel 4 is currently rendered."""
+        if hasattr(self, "_tree"):
+            try:
+                if self._tree.winfo_exists():
+                    self._populate_tree(items)
+            except tk.TclError:
+                pass
 
     def _load_tree(self) -> None:
-        """Fetch the remote folder list in a background thread."""
-        self._tree.delete(*self._tree.get_children())
+        """Fetch the remote folder list in a background thread (user-triggered)."""
+        if hasattr(self, "_tree"):
+            self._tree.delete(*self._tree.get_children())
+        self._tree_items = {}
 
         def fetch() -> None:
             items = self._rclone.list_remote_tree(self._service_name)
-            self._win.after(0, lambda: self._populate_tree(items))
+            self._remote_tree_cache = items
+            try:
+                self._win.after(0, lambda: self._populate_tree(items))
+            except tk.TclError:
+                pass  # Window was closed before fetch completed
 
         threading.Thread(target=fetch, daemon=True).start()
 
     def _populate_tree(self, items: List[Dict]) -> None:
-        """Insert fetched items into the treeview."""
+        """Insert fetched items into the treeview, rebuilding the id→path map."""
+        if not hasattr(self, "_tree"):
+            return
+        try:
+            self._tree.delete(*self._tree.get_children())
+        except tk.TclError:
+            return
+        self._tree_items = {}
         for item in items:
             path = item.get("path", "")
             synced = path not in self._excluded_folders
@@ -339,12 +589,24 @@ class ConfigWindow:
         path = self._tree_items.get(item_id)
         if path is None:
             return
+        pattern = f"{path}/**"
         if path in self._excluded_folders:
+            # Re-including: remove from excluded folders and exclusions checklist
             self._excluded_folders.remove(path)
             self._tree.item(item_id, values=("✅ Sí",))
+            self._excl_items = [i for i in self._excl_items if i["pattern"] != pattern]
         else:
+            # Excluding: add to excluded folders and exclusions checklist
             self._excluded_folders.append(path)
             self._tree.item(item_id, values=("❌ No",))
+            if not any(i["pattern"] == pattern for i in self._excl_items):
+                self._excl_items.append({
+                    "pattern": pattern,
+                    "var": tk.BooleanVar(value=True),
+                    "recommended": False,
+                })
+        # Refresh the exclusions checklist if Panel 3 is currently visible
+        self._render_excl_rows()
 
     # ------------------------------------------------------------------
     # Panel 5 – Sync schedule
@@ -519,7 +781,12 @@ class ConfigWindow:
         """Collect all panel data and persist it to the config."""
         updates: Dict = {}
 
-        # Panel 1 – defaults
+        # Panel 1 – defaults (service name + rclone options)
+        new_name = self._service_name_var.get().strip()
+        if new_name and new_name != self._service_name:
+            # Include the new name in the update dict; update_service() will
+            # overwrite the 'name' key while looking up by the old name.
+            updates["name"] = new_name
         if hasattr(self, "_remote_path_var"):
             updates["remote_path"] = self._remote_path_var.get()
         if hasattr(self, "_vfs_var"):
@@ -535,22 +802,19 @@ class ConfigWindow:
         if hasattr(self, "_remote_dir_var"):
             updates["remote_path"] = self._remote_dir_var.get()
 
-        # Panel 3 – exclusions
-        if hasattr(self, "_personal_vault_var"):
-            updates["exclude_personal_vault"] = self._personal_vault_var.get()
-        if hasattr(self, "_excl_text"):
-            raw = self._excl_text.get("1.0", tk.END).strip()
-            # Collect non-empty custom patterns, excluding the personal vault
-            # pattern (it is managed separately via the checkbox above)
-            custom = [
-                line.strip()
-                for line in raw.splitlines()
-                if line.strip() and line.strip() != PERSONAL_VAULT_PATTERN
+        # Panel 3 – exclusions (checklist-based)
+        if hasattr(self, "_excl_items"):
+            enabled_patterns = [
+                item["pattern"]
+                for item in self._excl_items
+                if item["var"].get()
             ]
-            # Prepend the personal vault pattern if the checkbox is enabled
-            if updates.get("exclude_personal_vault", self._svc.get("exclude_personal_vault")):
-                custom = [PERSONAL_VAULT_PATTERN] + custom
-            updates["exclusions"] = custom
+            updates["exclusions"] = enabled_patterns
+            vault_item = next(
+                (i for i in self._excl_items if i["pattern"] == PERSONAL_VAULT_PATTERN),
+                None,
+            )
+            updates["exclude_personal_vault"] = vault_item is not None and vault_item["var"].get()
 
         # Panel 4 – tree
         if hasattr(self, "_excluded_folders"):
@@ -570,6 +834,12 @@ class ConfigWindow:
             self._win.after_cancel(self._disk_refresh_id)
 
         self._config.update_service(self._service_name, updates)
+
+        # If the name changed, update internal state and the window title so
+        # they stay consistent.  The main window rebuilds its tabs via on_saved.
+        if updates.get("name") and updates["name"] != self._service_name:
+            self._service_name = updates["name"]
+            self._win.title(f"Configuración – {self._service_name}")
 
         messagebox.showinfo("Guardado", "Los cambios han sido guardados correctamente.", parent=self._win)
 

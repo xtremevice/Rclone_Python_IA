@@ -5,6 +5,9 @@
 # Requisitos:
 #   - Python 3.8+
 #   - pip
+#   - python3-tk    (tkinter – paquete del sistema, no se puede instalar con pip)
+#       Debian/Ubuntu:  sudo apt install python3-tk
+#       Fedora/RHEL:    sudo dnf install python3-tkinter
 #   - appimagetool (descargado automáticamente si no está instalado)
 #   - fuse (necesario para AppImage): sudo apt install fuse libfuse2
 
@@ -24,7 +27,30 @@ python3 --version
 
 # Instalar dependencias de Python
 echo "Instalando dependencias de Python..."
-pip3 install -r requirements.txt
+# Create a virtual environment to avoid the PEP 668
+# "externally-managed-environment" error on Python 3.12+ (Debian/Ubuntu).
+if [ -z "${VIRTUAL_ENV:-}" ]; then
+    python3 -m venv .venv || {
+        echo "ERROR: Failed to create virtual environment."
+        echo "  On Debian/Ubuntu, install the required package with:"
+        echo "    sudo apt install python3-venv"
+        exit 1
+    }
+    # shellcheck disable=SC1091
+    source .venv/bin/activate
+fi
+pip install --upgrade pip
+pip install -r requirements.txt
+pip install pyinstaller
+
+# Verificar que tkinter está disponible (paquete del sistema, no se puede instalar con pip).
+python -c "import tkinter" 2>/dev/null || {
+    echo "ERROR: tkinter no está disponible."
+    echo "  Instale el paquete del sistema requerido y vuelva a ejecutar este script:"
+    echo "    Debian/Ubuntu:  sudo apt install python3-tk"
+    echo "    Fedora/RHEL:    sudo dnf install python3-tkinter"
+    exit 1
+}
 
 # Construir con PyInstaller primero (genera el directorio dist/)
 echo "Construyendo con PyInstaller..."
@@ -79,6 +105,10 @@ EOF
 chmod +x "$APPDIR/AppRun"
 
 # Descargar appimagetool si no está instalado
+# appimagetool is itself an AppImage; set APPIMAGE_EXTRACT_AND_RUN=1 so it
+# runs without FUSE (required in most CI environments such as GitHub Actions).
+export APPIMAGE_EXTRACT_AND_RUN=1
+
 if ! command -v appimagetool &> /dev/null; then
     echo "Descargando appimagetool..."
     wget -q "https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage" \
