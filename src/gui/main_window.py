@@ -25,6 +25,9 @@ from src.config.config_manager import PLATFORM_LABELS, ConfigManager
 from src.gui.tray_icon import TrayIcon
 from src.rclone.rclone_manager import RcloneManager
 
+# Status string emitted by RcloneManager when no sync is running
+_STATUS_STOPPED = "Detenido"
+
 
 def _center_window(window: tk.Wm, height_pct: float, width_pct: float) -> None:
     """Resize and center a Tk / Toplevel window on screen."""
@@ -81,6 +84,8 @@ class MainWindow:
         self._file_lists: Dict[str, tk.Listbox] = {}
         # Per-service status StringVars
         self._status_vars: Dict[str, tk.StringVar] = {}
+        # Per-service toggle-button StringVars (Detener / Sincronizar)
+        self._toggle_vars: Dict[str, tk.StringVar] = {}
         # Whether the tray icon has been started
         self._tray_started = False
 
@@ -158,6 +163,17 @@ class MainWindow:
         # Sync interval
         tk.Label(header, text=f"Sincroniza cada: {interval_label}", bg="#f0f4fa").grid(row=0, column=3, sticky="w")
 
+        # "Add new service" shortcut button (next to the interval label)
+        tk.Button(
+            header,
+            text="➕",
+            command=self._open_wizard,
+            relief=tk.FLAT,
+            bg="#f0f4fa",
+            font=("Segoe UI", 9),
+            cursor="hand2",
+        ).grid(row=0, column=4, sticky="w", padx=(8, 0))
+
         # ── File change list (60 % of window height) ──────────────────
         list_frame = tk.Frame(tab_frame)
         list_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
@@ -197,14 +213,15 @@ class MainWindow:
             font=("Segoe UI", 9),
         ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=2, pady=4)
 
-        # Button 2: Pause / Resume sync
-        pause_text = tk.StringVar(
-            value="⏸ Pausar sync" if self._rclone.is_running(name) else "▶ Reanudar sync"
+        # Button 2: Stop / Start sync (label reflects current running state)
+        toggle_text = tk.StringVar(
+            value="⏹ Detener" if self._rclone.is_running(name) else "▶ Sincronizar"
         )
+        self._toggle_vars[name] = toggle_text
         tk.Button(
             btn_frame,
-            textvariable=pause_text,
-            command=lambda n=name, tv=pause_text: self._toggle_sync(n, tv),
+            textvariable=toggle_text,
+            command=lambda n=name, tv=toggle_text: self._toggle_sync(n, tv),
             relief=tk.FLAT,
             bg="#e0e0e0",
             font=("Segoe UI", 9),
@@ -225,14 +242,28 @@ class MainWindow:
     # ------------------------------------------------------------------
 
     def _open_folder(self, service_name: str) -> None:
-        """Open the service's local folder in the system file manager."""
+        """Open the service's local sync folder in the system file manager."""
         svc = self._config.get_service(service_name)
         if svc is None:
             return
         path = svc.get("local_path", "")
-        if not path or not os.path.exists(path):
-            messagebox.showwarning("Carpeta no encontrada", f"La carpeta '{path}' no existe.", parent=self._root)
+        if not path:
+            messagebox.showwarning("Sin carpeta", "Este servicio no tiene carpeta local configurada.", parent=self._root)
             return
+        # Offer to create the folder if it doesn't exist yet
+        if not os.path.exists(path):
+            if messagebox.askyesno(
+                "Crear carpeta",
+                f"La carpeta '{path}' no existe.\n¿Deseas crearla ahora?",
+                parent=self._root,
+            ):
+                try:
+                    os.makedirs(path, exist_ok=True)
+                except OSError as exc:
+                    messagebox.showerror("Error", f"No se pudo crear la carpeta:\n{exc}", parent=self._root)
+                    return
+            else:
+                return
         system = platform.system()
         try:
             if system == "Windows":
@@ -245,15 +276,15 @@ class MainWindow:
             messagebox.showerror("Error", f"No se pudo abrir la carpeta:\n{exc}", parent=self._root)
 
     def _toggle_sync(self, service_name: str, text_var: tk.StringVar) -> None:
-        """Pause or resume synchronization for the given service."""
+        """Stop or start synchronization for the given service."""
         if self._rclone.is_running(service_name):
             self._rclone.stop_service(service_name)
-            text_var.set("▶ Reanudar sync")
+            text_var.set("▶ Sincronizar")
             self._config.update_service(service_name, {"sync_enabled": False})
         else:
             self._config.update_service(service_name, {"sync_enabled": True})
             self._rclone.start_service(service_name)
-            text_var.set("⏸ Pausar sync")
+            text_var.set("⏹ Detener")
 
     def _open_config(self, service_name: str) -> None:
         """Open the configuration window for the given service."""
@@ -327,10 +358,17 @@ class MainWindow:
         self._root.after(0, lambda: self._update_status(service_name, status))
 
     def _update_status(self, service_name: str, status: str) -> None:
-        """Update the status StringVar for the given service."""
+        """Update the status label and toggle button for the given service."""
         var = self._status_vars.get(service_name)
         if var:
             var.set(status)
+        # Keep the toggle button label accurate: "Detener" while active, "Sincronizar" when stopped
+        toggle_var = self._toggle_vars.get(service_name)
+        if toggle_var:
+            if status == _STATUS_STOPPED:
+                toggle_var.set("▶ Sincronizar")
+            else:
+                toggle_var.set("⏹ Detener")
         # Also update the tray tooltip with aggregated status
         self._tray.update_tooltip(f"Rclone Manager – {service_name}: {status}")
 
@@ -368,6 +406,7 @@ class MainWindow:
             w.destroy()
         self._file_lists.clear()
         self._status_vars.clear()
+        self._toggle_vars.clear()
         self._build_ui()
 
     def _on_service_added(self, service_name: str) -> None:

@@ -6,14 +6,14 @@ Presents three sequential windows:
   Step 2 – Choose the cloud platform.
   Step 3 – Authenticate and confirm.
 
-Window size: 70 % of screen height × 60 % of screen width.
+Window size: 70 % of screen height × 30 % of screen width.
 """
 
 import os
 import subprocess
 import threading
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 from typing import Callable, Optional
 
 from src.config.config_manager import PLATFORM_LABELS, SUPPORTED_PLATFORMS, ConfigManager
@@ -53,7 +53,7 @@ class SetupWizard:
 
         self._root.title("Agregar nuevo servicio")
         self._root.resizable(False, False)
-        _center_window(self._root, height_pct=0.70, width_pct=0.60)
+        _center_window(self._root, height_pct=0.70, width_pct=0.30)
 
         # Container that holds the content of each step
         self._frame = tk.Frame(self._root)
@@ -85,7 +85,7 @@ class SetupWizard:
             justify="left",
         ).pack(anchor="w", pady=(0, 15))
 
-        # Row with path entry and Browse button
+        # Row with path entry and Browse/New-folder buttons
         path_frame = tk.Frame(self._frame)
         path_frame.pack(fill=tk.X, pady=5)
 
@@ -98,6 +98,12 @@ class SetupWizard:
             text="Examinar…",
             command=self._browse_folder,
         ).pack(side=tk.LEFT, padx=(8, 0))
+
+        tk.Button(
+            path_frame,
+            text="📁 Nueva carpeta",
+            command=self._create_subfolder,
+        ).pack(side=tk.LEFT, padx=(4, 0))
 
         tk.Label(
             self._frame,
@@ -129,9 +135,31 @@ class SetupWizard:
         folder = filedialog.askdirectory(
             title="Seleccionar carpeta de sincronización",
             initialdir=self._path_var.get(),
+            parent=self._root,
         )
         if folder:
             self._path_var.set(folder)
+
+    def _create_subfolder(self) -> None:
+        """Create a new subfolder inside the current path and update the entry."""
+        parent_path = self._path_var.get().strip() or os.path.expanduser("~")
+        name = simpledialog.askstring(
+            "Nueva carpeta",
+            "Nombre de la nueva carpeta:",
+            parent=self._root,
+        )
+        if not name:
+            return
+        new_path = os.path.join(parent_path, name)
+        try:
+            os.makedirs(new_path, exist_ok=True)
+            self._path_var.set(new_path)
+        except OSError as exc:
+            messagebox.showerror(
+                "Error al crear carpeta",
+                f"No se pudo crear la carpeta:\n{exc}",
+                parent=self._root,
+            )
 
     def _validate_step1(self) -> None:
         """Validate step 1 inputs and advance to step 2."""
@@ -152,6 +180,25 @@ class SetupWizard:
                 parent=self._root,
             )
             return
+
+        # Create the folder if it doesn't exist yet
+        if not os.path.exists(path):
+            if messagebox.askyesno(
+                "Crear carpeta",
+                f"La carpeta '{path}' no existe.\n¿Deseas crearla ahora?",
+                parent=self._root,
+            ):
+                try:
+                    os.makedirs(path, exist_ok=True)
+                except OSError as exc:
+                    messagebox.showerror(
+                        "Error al crear carpeta",
+                        f"No se pudo crear la carpeta:\n{exc}",
+                        parent=self._root,
+                    )
+                    return
+            else:
+                return
 
         self._local_path = path
         self._service_name = name

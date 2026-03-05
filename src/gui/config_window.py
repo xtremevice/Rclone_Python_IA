@@ -10,12 +10,13 @@ Shows a left-side menu with 7 sections and a corresponding right-side panel:
   6. Free disk space / delete service
   7. Service information
 
-Window size: 60 % of screen height × 70 % of screen width.
+Window size: 60 % of screen height × 35 % of screen width.
 """
 
+import os
 import threading
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 from typing import Callable, Dict, List, Optional
 
 from src.config.config_manager import (
@@ -75,7 +76,7 @@ class ConfigWindow:
         self._win = tk.Toplevel(parent)
         self._win.title(f"Configuración – {service_name}")
         self._win.resizable(False, False)
-        _center_window(self._win, height_pct=0.60, width_pct=0.70)
+        _center_window(self._win, height_pct=0.60, width_pct=0.35)
 
         self._build_layout()
         # Show the first panel by default
@@ -222,6 +223,7 @@ class ConfigWindow:
         self._local_path_var = tk.StringVar(value=self._svc.get("local_path", ""))
         tk.Entry(local_frame, textvariable=self._local_path_var, width=50).pack(side=tk.LEFT, fill=tk.X, expand=True)
         tk.Button(local_frame, text="…", command=self._browse_local).pack(side=tk.LEFT, padx=4)
+        tk.Button(local_frame, text="📁 Nueva", command=self._create_local_subfolder).pack(side=tk.LEFT, padx=(0, 4))
 
         # Remote path
         tk.Label(p, text="Ruta dentro del servicio remoto (ej. /MiCarpeta):", anchor="w").pack(anchor="w", pady=(10, 0))
@@ -230,9 +232,33 @@ class ConfigWindow:
 
     def _browse_local(self) -> None:
         """Open folder picker to change local sync directory."""
-        folder = filedialog.askdirectory(initialdir=self._local_path_var.get(), parent=self._win)
+        folder = filedialog.askdirectory(
+            initialdir=self._local_path_var.get(),
+            parent=self._win,
+        )
         if folder:
             self._local_path_var.set(folder)
+
+    def _create_local_subfolder(self) -> None:
+        """Create a new subfolder inside the current local path and update the entry."""
+        parent_path = self._local_path_var.get().strip() or os.path.expanduser("~")
+        name = simpledialog.askstring(
+            "Nueva carpeta",
+            "Nombre de la nueva carpeta:",
+            parent=self._win,
+        )
+        if not name:
+            return
+        new_path = os.path.join(parent_path, name)
+        try:
+            os.makedirs(new_path, exist_ok=True)
+            self._local_path_var.set(new_path)
+        except OSError as exc:
+            messagebox.showerror(
+                "Error al crear carpeta",
+                f"No se pudo crear la carpeta:\n{exc}",
+                parent=self._win,
+            )
 
     # ------------------------------------------------------------------
     # Panel 3 – Exclusions
