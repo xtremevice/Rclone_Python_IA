@@ -289,7 +289,7 @@ class SetupWizard(tk.Toplevel):
 
         # Status label shown during auth
         self._auth_status_var = tk.StringVar(
-            value="Haz clic en 'Sincronizar Sesión' para autorizar el acceso."
+            value="Haz clic en 'Autorizar Acceso' para iniciar el flujo de autorización OAuth."
         )
         self._auth_status_lbl = ttk.Label(
             frame,
@@ -304,10 +304,10 @@ class SetupWizard(tk.Toplevel):
         self._auth_progress.pack(anchor="w", pady=(0, 16))
         self._auth_progress.pack_forget()  # Hide until needed
 
-        # Authorise button
+        # Authorise button – starts the OAuth flow (opens browser)
         self._auth_btn = ttk.Button(
             frame,
-            text="🔐 Sincronizar Sesión",
+            text="🔐 Autorizar Acceso",
             style="Primary.TButton",
             command=self._start_auth,
         )

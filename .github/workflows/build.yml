@@ -7,6 +7,10 @@ on:
   pull_request:
     branches: [ main, master ]
 
+# Central Python version used across all jobs
+env:
+  PYTHON_VERSION: "3.12"
+
 jobs:
   # ------------------------------------------------------------------
   # Tests – run the unit test suite on Linux
@@ -14,6 +18,8 @@ jobs:
   test:
     name: Run Tests (Linux)
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -21,7 +27,7 @@ jobs:
       - name: Set up Python 3.12
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: ${{ env.PYTHON_VERSION }}
 
       - name: Install system dependencies
         run: |
@@ -43,6 +49,8 @@ jobs:
     name: Build Windows .exe
     runs-on: windows-latest
     needs: test
+    permissions:
+      contents: read
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -50,7 +58,7 @@ jobs:
       - name: Set up Python 3.12
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: ${{ env.PYTHON_VERSION }}
 
       - name: Install dependencies
         run: |
@@ -79,6 +87,8 @@ jobs:
     name: Build Linux AppImage
     runs-on: ubuntu-latest
     needs: test
+    permissions:
+      contents: read
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -86,7 +96,7 @@ jobs:
       - name: Set up Python 3.12
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: ${{ env.PYTHON_VERSION }}
 
       - name: Install system dependencies (tkinter, FUSE for AppImage)
         run: |
@@ -103,6 +113,8 @@ jobs:
         run: |
           wget -q -O /usr/local/bin/appimagetool \
             "https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage"
+          # Verify the download is a valid ELF executable (basic integrity check)
+          file /usr/local/bin/appimagetool | grep -q "ELF" || { echo "Download appears invalid"; exit 1; }
           chmod +x /usr/local/bin/appimagetool
 
       - name: Build AppImage
@@ -124,6 +136,8 @@ jobs:
     name: Build macOS app
     runs-on: macos-latest
     needs: test
+    permissions:
+      contents: read
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -131,7 +145,7 @@ jobs:
       - name: Set up Python 3.12
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: ${{ env.PYTHON_VERSION }}
 
       - name: Install Python dependencies
         run: |

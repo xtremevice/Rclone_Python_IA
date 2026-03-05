@@ -58,7 +58,7 @@ class ServiceManager:
         if service_id not in self._state:
             self._state[service_id] = {
                 "status": SyncStatus.IDLE,
-                "last_lines": [],        # Last rclone output lines (for debug)
+                "last_lines": [],        # Last rclone output lines (for debugging)
                 "changed_files": [],     # Up to 50 recently synced file records
                 "stop_event": threading.Event(),
                 "timer_thread": None,

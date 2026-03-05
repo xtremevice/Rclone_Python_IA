@@ -36,7 +36,9 @@ DEFAULT_SYNC_FLAGS = [
     "--buffer-size", "64M",
 ]
 
-# Default exclusion rule for OneDrive Personal Vault
+# Default exclusion rule for OneDrive Personal Vault.
+# "Almacén personal" is the Spanish-localized name for the encrypted
+# OneDrive Personal Vault folder; syncing it causes errors with rclone.
 PERSONAL_VAULT_EXCLUDE = "/Almacén personal/**"
 
 
