@@ -22,7 +22,11 @@ except (ImportError, ValueError, Exception):
 
 def _create_icon_image(size: int = 64) -> "Image.Image":
     """
-    Generate a simple colored circle image to use as the tray icon.
+    Generate a Material Design-style sync icon for the system tray.
+
+    The icon uses:
+      - Material Blue 700 (#1976D2) circular background
+      - Two white opposing arc arrows (Material Design 'sync' icon style)
 
     Args:
         size: Edge length in pixels for the square image.
@@ -30,15 +34,46 @@ def _create_icon_image(size: int = 64) -> "Image.Image":
     Returns:
         A PIL Image object.
     """
+    import math
+
     image = Image.new("RGBA", (size, size), (0, 0, 0, 0))
     draw = ImageDraw.Draw(image)
-    # Draw a blue circle as the icon
-    draw.ellipse((4, 4, size - 4, size - 4), fill=(0, 120, 212, 255))
-    # Draw a small white arrow inside the circle to suggest sync
-    draw.polygon(
-        [(size // 3, size // 4), (2 * size // 3, size // 2), (size // 3, 3 * size // 4)],
-        fill=(255, 255, 255, 230),
-    )
+
+    # ── Background circle (Material Blue 700) ──────────────────────────
+    pad = max(1, size // 16)
+    draw.ellipse((pad, pad, size - pad, size - pad), fill=(25, 118, 210, 255))
+
+    white = (255, 255, 255, 255)
+    cx = size / 2
+    cy = size / 2
+    r = size * 0.30          # arc centre-line radius
+    stroke = max(2, int(size * 0.09))
+    bbox = [cx - r, cy - r, cx + r, cy + r]
+
+    # Top arc (30° → 190°, clockwise ~160°)
+    draw.arc(bbox, start=30, end=190, fill=white, width=stroke)
+    # Bottom arc (210° → 10°, clockwise ~160°, wraps around)
+    draw.arc(bbox, start=210, end=10, fill=white, width=stroke)
+
+    # Arrowheads at the arc tips
+    ah = int(stroke * 1.3)
+
+    def _arrowhead(angle_deg: float, tangent_deg: float) -> None:
+        a_rad = math.radians(angle_deg)
+        tip_x = cx + r * math.cos(a_rad)
+        tip_y = cy + r * math.sin(a_rad)
+        t_rad = math.radians(tangent_deg)
+        perp = math.radians(tangent_deg + 90)
+        pts = [
+            (tip_x + ah * math.cos(t_rad), tip_y + ah * math.sin(t_rad)),
+            (tip_x - ah * 0.6 * math.cos(perp), tip_y - ah * 0.6 * math.sin(perp)),
+            (tip_x + ah * 0.6 * math.cos(perp), tip_y + ah * 0.6 * math.sin(perp)),
+        ]
+        draw.polygon(pts, fill=white)
+
+    _arrowhead(190, 280)   # end of top arc
+    _arrowhead(10,  100)   # end of bottom arc
+
     return image
 
 
