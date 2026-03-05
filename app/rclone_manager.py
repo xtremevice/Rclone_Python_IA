@@ -366,10 +366,10 @@ class RcloneManager:
 # ---------------------------------------------------------------------------
 
 
-def _format_bytes(num_bytes: int) -> str:
+def _format_bytes(num_bytes: float) -> str:
     """Convert *num_bytes* to a human-readable size string."""
     for unit in ("B", "KB", "MB", "GB", "TB"):
         if num_bytes < 1024.0:
             return f"{num_bytes:.2f} {unit}"
-        num_bytes /= 1024.0  # type: ignore[assignment]
+        num_bytes /= 1024.0
     return f"{num_bytes:.2f} PB"

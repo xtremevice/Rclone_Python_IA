@@ -10,7 +10,7 @@ Left-hand navigation menu with 7 sections:
   6. Espacio en Disco
   7. Información del Servicio
 
-Window size: 60 % of screen height × 70 % of screen width.
+Window size: 70 % of screen width × 60 % of screen height.
 """
 
 import threading

@@ -6,7 +6,7 @@ platform, a scrollable list of the last 50 changed files, and three action
 buttons.
 
 Window properties:
-- Size: 60 % of screen height × 20 % of screen width (portrait strip)
+- Size: 20 % of screen width × 60 % of screen height (portrait strip)
 - No Maximise button
 - Minimising sends the window to the notification tray instead of the taskbar
 """

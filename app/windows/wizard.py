@@ -5,7 +5,7 @@ Step 1 – Choose local folder.
 Step 2 – Choose cloud service type and give it a name.
 Step 3 – Authenticate via browser OAuth and confirm.
 
-Window size: 70 % of screen height × 60 % of screen width.
+Window size: 60 % of screen width × 70 % of screen height.
 """
 
 import threading

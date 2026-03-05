@@ -57,8 +57,8 @@ class Application:
             mb.showwarning(
                 "rclone no encontrado",
                 "No se encontró rclone en el PATH.\n\n"
-                "Descárguelo desde https://rclone.org/downloads/ e "
-                "instálelo para que la sincronización funcione.",
+                "Descárgalo desde https://rclone.org/downloads/ e "
+                "instálalo para que la sincronización funcione.",
             )
             _tmp.destroy()
 
