@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build_tmp/
+*.egg
+
+# PyInstaller
+*.spec.bak
+
+# Virtual environments
+.venv/
+venv/
+env/
+.env/
+
+# IDE files
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs
+*.log
+
+# Test coverage
+.coverage
+htmlcov/
+
+# Type checker
+.mypy_cache/
