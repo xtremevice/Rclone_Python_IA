@@ -279,8 +279,12 @@ class TestRcloneManager(unittest.TestCase):
         self.rclone._emit_error("MySvc", "Test error message")
         self.assertIn(("MySvc", "Test error message"), errors)
 
-    def test_vfs_args_included_in_bisync_command(self):
-        """_do_bisync() should include --vfs-cache-mode flag in the rclone command."""
+    def test_vfs_args_not_in_bisync_command(self):
+        """_do_bisync() must NOT include VFS cache flags (--vfs-cache-mode etc.)
+
+        rclone bisync does not accept VFS cache options; those are exclusive to
+        the rclone mount command.  Passing them to bisync causes a fatal error.
+        """
         self.config.add_service("VfsSvc", "onedrive", "/tmp/vfs_test")
         self.config.update_service("VfsSvc", {
             "vfs_cache_mode": "full",
@@ -299,19 +303,17 @@ class TestRcloneManager(unittest.TestCase):
 
         self.assertTrue(len(captured_cmds) > 0)
         full_cmd = captured_cmds[0]
-        self.assertIn("--vfs-cache-mode", full_cmd)
-        self.assertIn("full", full_cmd)
-        self.assertIn("--vfs-cache-max-size", full_cmd)
-        self.assertIn("5G", full_cmd)
-        self.assertIn("--cache-dir", full_cmd)
-        self.assertIn("/tmp/cache_vfs", full_cmd)
+        # VFS flags must NOT appear in the bisync command
+        self.assertNotIn("--vfs-cache-mode", full_cmd)
+        self.assertNotIn("--vfs-cache-max-size", full_cmd)
+        self.assertNotIn("--cache-dir", full_cmd)
 
-    def test_vfs_cache_dir_omitted_when_empty(self):
-        """_do_bisync() should NOT include --cache-dir when vfs_cache_dir is empty."""
+    def test_vfs_cache_dir_never_in_bisync_command(self):
+        """_do_bisync() should never include --cache-dir regardless of vfs_cache_dir setting."""
         self.config.add_service("VfsSvc2", "onedrive", "/tmp/vfs_test2")
         self.config.update_service("VfsSvc2", {
             "vfs_cache_mode": "writes",
-            "vfs_cache_dir": "",
+            "vfs_cache_dir": "/some/cache/dir",
         })
         captured_cmds = []
 
@@ -551,6 +553,8 @@ class TestRcloneManager(unittest.TestCase):
         self.assertEqual(svc["vfs_read_chunk_size"], "10M")
         self.assertIn("vfs_read_chunk_size_limit", svc)
         self.assertEqual(svc["vfs_read_chunk_size_limit"], "100M")
+        # VFS cache mode default must be "writes" (not the invalid "on_demand")
+        self.assertEqual(svc.get("vfs_cache_mode"), "writes")
 
     def test_new_service_has_bisync_flags(self):
         """New services should include resync_mode and verbose_sync fields."""

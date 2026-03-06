@@ -226,10 +226,10 @@ class ConfigWindow:
         self._remote_path_var = tk.StringVar(value=self._svc.get("remote_path", "/"))
         tk.Entry(p, textvariable=self._remote_path_var, width=40).pack(anchor="w", pady=(2, 10))
 
-        # VFS cache mode
-        tk.Label(p, text="Modo de caché VFS:", anchor="w").pack(anchor="w")
-        self._vfs_var = tk.StringVar(value=self._svc.get("vfs_cache_mode", "on_demand"))
-        cache_modes = ["off", "minimal", "writes", "on_demand", "full"]
+        # VFS cache mode (used by the mount command; not applicable to bisync)
+        tk.Label(p, text="Modo de caché VFS (solo para montaje):", anchor="w").pack(anchor="w")
+        self._vfs_var = tk.StringVar(value=self._svc.get("vfs_cache_mode", "writes"))
+        cache_modes = ["off", "minimal", "writes", "full"]
         ttk.Combobox(p, textvariable=self._vfs_var, values=cache_modes, state="readonly", width=20).pack(anchor="w", pady=(2, 10))
 
         # Max cache size

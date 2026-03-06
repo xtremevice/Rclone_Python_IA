@@ -393,7 +393,10 @@ class RcloneManager:
             if pattern != PERSONAL_VAULT_PATTERN:
                 exclude_args += ["--exclude", pattern]
 
-        # Performance options
+        # Performance options.
+        # Note: VFS cache flags (--vfs-cache-mode, --vfs-cache-max-size, etc.) are
+        # NOT valid for bisync; they belong exclusively to the mount command and are
+        # applied in start_mount() instead.
         perf_args = [
             "--transfers", "16",
             "--checkers", "32",
@@ -405,18 +408,6 @@ class RcloneManager:
         if svc.get("verbose_sync", False):
             perf_args.append("--verbose")
 
-        # VFS cache options
-        vfs_cache_mode = svc.get("vfs_cache_mode", "on_demand")
-        vfs_cache_max_size = svc.get("vfs_cache_max_size", "10G")
-        vfs_cache_dir = svc.get("vfs_cache_dir", "").strip()
-
-        vfs_args = [
-            "--vfs-cache-mode", vfs_cache_mode,
-            "--vfs-cache-max-size", vfs_cache_max_size,
-        ]
-        if vfs_cache_dir:
-            vfs_args += ["--cache-dir", vfs_cache_dir]
-
         # Conflict resolution mode used during --resync retries
         resync_mode = svc.get("resync_mode", "newer")
 
@@ -424,7 +415,7 @@ class RcloneManager:
         Path(local).mkdir(parents=True, exist_ok=True)
 
         # First attempt: standard bisync
-        cmd = base + ["bisync", remote, local] + perf_args + vfs_args + exclude_args
+        cmd = base + ["bisync", remote, local] + perf_args + exclude_args
         # Log the exact command being run so it appears in the error log as reference
         self._emit_error(name, "[CMD] " + " ".join(cmd))
         success = self._run_rclone(cmd, name, svc)

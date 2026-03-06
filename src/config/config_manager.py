@@ -39,7 +39,7 @@ DEFAULT_RCLONE_OPTS = {
     "checkers": 32,
     "drive_chunk_size": "128M",
     "buffer_size": "64M",
-    "vfs_cache_mode": "on_demand",
+    "vfs_cache_mode": "writes",
     "vfs_cache_max_size": "10G",
 }
 
@@ -155,8 +155,9 @@ class ConfigManager:
             "exclusions": list(DEFAULT_EXCLUSIONS),
             # Whether to exclude "Almacén personal" (OneDrive Personal Vault)
             "exclude_personal_vault": True,
-            # rclone VFS cache settings (shared by mount and bisync)
-            "vfs_cache_mode": "on_demand",
+            # rclone VFS cache settings (used by the mount command only;
+            # bisync does not accept VFS cache flags)
+            "vfs_cache_mode": "writes",
             "vfs_cache_max_size": "10G",
             # Custom cache directory (empty = rclone default)
             "vfs_cache_dir": "",
