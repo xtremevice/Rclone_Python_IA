@@ -347,6 +347,43 @@ class TestRcloneManager(unittest.TestCase):
         # The logged command should contain 'bisync'
         self.assertIn("bisync", cmd_entries[0][1])
 
+    def test_do_bisync_cmd_log_quotes_patterns_with_spaces(self):
+        """[CMD] log entries must shell-quote arguments that contain spaces.
+
+        rclone is invoked via a subprocess list so execution is always correct,
+        but the logged command must be copy-pasteable to a shell.  Arguments
+        such as --exclude '/Almacén personal/**' must appear with quotes so
+        the space inside the path is not misinterpreted by a shell.
+        """
+        self.config.add_service("QuoteSvc", "onedrive", "/tmp/quote_test")
+        self.config.update_service("QuoteSvc", {
+            "exclude_personal_vault": True,
+            "exclusions": [PERSONAL_VAULT_PATTERN],
+        })
+        logged = []
+        self.rclone.on_error = lambda name, msg: logged.append((name, msg))
+
+        def fake_run_rclone(cmd, service_name, svc, is_retry=False):
+            return True
+
+        self.rclone._run_rclone = fake_run_rclone
+        svc = self.config.get_service("QuoteSvc")
+        self.rclone._do_bisync(svc)
+
+        cmd_entries = [m for _, m in logged if m.startswith("[CMD]")]
+        self.assertTrue(len(cmd_entries) >= 1)
+        logged_cmd = cmd_entries[0]
+        # The pattern with a space must appear quoted so the log is
+        # copy-pasteable; the bare unquoted string must NOT be present.
+        self.assertNotIn("--exclude /Almacén", logged_cmd,
+                         "Pattern with space must be quoted in the CMD log")
+        # Either single- or double-quoted form is acceptable
+        self.assertTrue(
+            '"/Almacén personal/**"' in logged_cmd or
+            "'/Almacén personal/**'" in logged_cmd,
+            f"Expected quoted pattern in CMD log, got: {logged_cmd!r}",
+        )
+
     def test_do_bisync_logs_resync_command_on_failure(self):
         """_do_bisync() should emit a [CMD] entry for the --resync retry."""
         self.config.add_service("ResyncSvc", "onedrive", "/tmp/resync_test")

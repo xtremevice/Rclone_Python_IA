@@ -7,6 +7,7 @@ and stream output from rclone operations.
 
 import os
 import platform
+import shlex
 import subprocess
 import threading
 from pathlib import Path
@@ -155,7 +156,7 @@ class RcloneManager:
             cmd += ["--cache-dir", vfs_cache_dir]
 
         # Log the command for reference
-        self._emit_error(service_name, "[MOUNT CMD] " + " ".join(cmd))
+        self._emit_error(service_name, "[MOUNT CMD] " + shlex.join(cmd))
 
         try:
             proc = subprocess.Popen(
@@ -417,13 +418,13 @@ class RcloneManager:
         # First attempt: standard bisync
         cmd = base + ["bisync", remote, local] + perf_args + exclude_args
         # Log the exact command being run so it appears in the error log as reference
-        self._emit_error(name, "[CMD] " + " ".join(cmd))
+        self._emit_error(name, "[CMD] " + shlex.join(cmd))
         success = self._run_rclone(cmd, name, svc)
 
         # Second attempt: bisync --resync if first attempt failed
         if not success:
             cmd_resync = cmd + ["--resync", "--resync-mode", resync_mode]
-            self._emit_error(name, "[CMD] " + " ".join(cmd_resync))
+            self._emit_error(name, "[CMD] " + shlex.join(cmd_resync))
             success = self._run_rclone(cmd_resync, name, svc, is_retry=True)
 
         if not success:
