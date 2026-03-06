@@ -30,6 +30,8 @@ from src.rclone.rclone_manager import (
     _extract_file_path,
     _human_size,
     _rclone_supports_resync_mode,
+    _bisync_cache_dir,
+    _clear_bisync_stale_files,
 )
 
 
@@ -696,6 +698,185 @@ class TestRcloneManager(unittest.TestCase):
         self.assertEqual(svc["resync_mode"], "newer")
         self.assertIn("verbose_sync", svc)
         self.assertFalse(svc["verbose_sync"])
+
+
+class TestBisyncLockCleanup(unittest.TestCase):
+    """Tests for the bisync stale-lock-file detection and cleanup helpers."""
+
+    def setUp(self):
+        self._tmpdir = tempfile.mkdtemp()
+        import src.config.config_manager as cm_mod
+        self._original_get_config_dir = cm_mod.get_config_dir
+        cm_mod.get_config_dir = lambda: Path(self._tmpdir)
+        self.config = ConfigManager()
+        self.rclone = RcloneManager(self.config)
+
+    def tearDown(self):
+        import src.config.config_manager as cm_mod
+        cm_mod.get_config_dir = self._original_get_config_dir
+        import shutil
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+
+    # ------------------------------------------------------------------
+    # _bisync_cache_dir()
+    # ------------------------------------------------------------------
+
+    def test_bisync_cache_dir_returns_path_ending_in_rclone_bisync(self):
+        """_bisync_cache_dir() should end with 'rclone/bisync' on all platforms."""
+        cache_dir = _bisync_cache_dir()
+        self.assertIsInstance(cache_dir, Path)
+        # The last two parts of the path must always be rclone/bisync
+        self.assertEqual(cache_dir.parts[-1], "bisync")
+        self.assertEqual(cache_dir.parts[-2], "rclone")
+
+    # ------------------------------------------------------------------
+    # _clear_bisync_stale_files()
+    # ------------------------------------------------------------------
+
+    def test_clear_removes_matching_lck_file(self):
+        """_clear_bisync_stale_files() should delete *.lck files for the remote."""
+        cache_dir = Path(self._tmpdir) / "bisync"
+        cache_dir.mkdir()
+        lock = cache_dir / "myremote_..mnt_data.lck"
+        lock.write_text("pid")
+
+        msgs = []
+        count = _clear_bisync_stale_files("myremote", cache_dir, msgs.append)
+
+        self.assertEqual(count, 1)
+        self.assertFalse(lock.exists(), "Lock file should have been deleted")
+        self.assertTrue(any("[LOCK]" in m for m in msgs), "Should log the removal")
+
+    def test_clear_removes_matching_lst_new_file(self):
+        """_clear_bisync_stale_files() should also delete *.lst-new files."""
+        cache_dir = Path(self._tmpdir) / "bisync"
+        cache_dir.mkdir()
+        lst_new = cache_dir / "myremote_..mnt_data.path1.lst-new"
+        lst_new.write_text("data")
+
+        count = _clear_bisync_stale_files("myremote", cache_dir, lambda m: None)
+
+        self.assertEqual(count, 1)
+        self.assertFalse(lst_new.exists())
+
+    def test_clear_does_not_remove_unrelated_files(self):
+        """_clear_bisync_stale_files() must NOT remove files for other remotes."""
+        cache_dir = Path(self._tmpdir) / "bisync"
+        cache_dir.mkdir()
+        other_lock = cache_dir / "otherremote_..mnt_data.lck"
+        other_lock.write_text("pid")
+
+        count = _clear_bisync_stale_files("myremote", cache_dir, lambda m: None)
+
+        self.assertEqual(count, 0)
+        self.assertTrue(other_lock.exists(), "File for other remote must be preserved")
+
+    def test_clear_returns_zero_when_cache_dir_missing(self):
+        """_clear_bisync_stale_files() should return 0 if cache dir does not exist."""
+        missing_dir = Path(self._tmpdir) / "nonexistent_cache"
+        count = _clear_bisync_stale_files("myremote", missing_dir, lambda m: None)
+        self.assertEqual(count, 0)
+
+    def test_clear_multiple_files(self):
+        """_clear_bisync_stale_files() should delete all matching files."""
+        cache_dir = Path(self._tmpdir) / "bisync"
+        cache_dir.mkdir()
+        files = [
+            "myremote_..mnt_a.lck",
+            "myremote_..mnt_a.path1.lst-new",
+            "myremote_..mnt_a.path2.lst-new",
+        ]
+        for fname in files:
+            (cache_dir / fname).write_text("data")
+
+        count = _clear_bisync_stale_files("myremote", cache_dir, lambda m: None)
+        self.assertEqual(count, 3)
+        for fname in files:
+            self.assertFalse((cache_dir / fname).exists())
+
+    def test_clear_empty_remote_name_does_not_delete_all(self):
+        """An empty remote_name must not match every file in the cache dir."""
+        cache_dir = Path(self._tmpdir) / "bisync"
+        cache_dir.mkdir()
+        lock = cache_dir / "someremote_..path.lck"
+        lock.write_text("pid")
+
+        # All file names start with "" (empty string), so this is a degenerate
+        # case - we still only delete files whose names literally start with "".
+        # In practice every non-empty filename satisfies startswith(""), so to
+        # avoid accidentally nuking the entire cache we skip deletion when
+        # remote_name is empty.
+        count = _clear_bisync_stale_files("", cache_dir, lambda m: None)
+        # Empty remote name: no files should be touched (guard against rm-all)
+        self.assertEqual(count, 0)
+        self.assertTrue(lock.exists(), "Files must not be removed for empty remote_name")
+
+    # ------------------------------------------------------------------
+    # RcloneManager.clear_bisync_locks()
+    # ------------------------------------------------------------------
+
+    def test_clear_bisync_locks_returns_zero_for_unknown_service(self):
+        """clear_bisync_locks() should return 0 for a service that does not exist."""
+        self.assertEqual(self.rclone.clear_bisync_locks("nonexistent"), 0)
+
+    def test_clear_bisync_locks_removes_files_for_service(self):
+        """clear_bisync_locks() should remove lock files matching the service remote."""
+        self.config.add_service("LockSvc", "onedrive", "/tmp/lock_test")
+        self.config.update_service("LockSvc", {"remote_name": "lockremote"})
+
+        # Create a fake lock file in a temp cache dir
+        fake_cache = Path(self._tmpdir) / "fake_bisync_cache"
+        fake_cache.mkdir()
+        lock = fake_cache / "lockremote_..tmp_lock_test.lck"
+        lock.write_text("pid")
+
+        errors = []
+        self.rclone.on_error = lambda name, msg: errors.append(msg)
+
+        with patch("src.rclone.rclone_manager._bisync_cache_dir", return_value=fake_cache):
+            count = self.rclone.clear_bisync_locks("LockSvc")
+
+        self.assertEqual(count, 1)
+        self.assertFalse(lock.exists())
+        self.assertTrue(any("[LOCK]" in e for e in errors))
+
+    # ------------------------------------------------------------------
+    # _do_bisync() integration: lock cleanup runs before bisync
+    # ------------------------------------------------------------------
+
+    def test_do_bisync_clears_lock_files_before_running(self):
+        """_do_bisync() should remove stale lock files before the first bisync call."""
+        self.config.add_service("PreCleanSvc", "onedrive", "/tmp/preclean_test")
+        self.config.update_service("PreCleanSvc", {"remote_name": "preclean"})
+
+        fake_cache = Path(self._tmpdir) / "fake_cache_preclean"
+        fake_cache.mkdir()
+        lock = fake_cache / "preclean_..tmp_preclean_test.lck"
+        lock.write_text("pid")
+
+        # Track call order: cleanup must happen before bisync runs
+        call_order = []
+
+        def fake_run_rclone(cmd, service_name, svc, is_retry=False):
+            call_order.append("bisync")
+            return True
+
+        def fake_clear(remote_name, cache_dir, emit_fn):
+            call_order.append("clear")
+            # Delegate to real implementation to actually remove the file
+            return _clear_bisync_stale_files(remote_name, cache_dir, emit_fn)
+
+        self.rclone._run_rclone = fake_run_rclone
+        svc = self.config.get_service("PreCleanSvc")
+
+        with patch("src.rclone.rclone_manager._bisync_cache_dir", return_value=fake_cache):
+            with patch("src.rclone.rclone_manager._clear_bisync_stale_files", side_effect=fake_clear):
+                self.rclone._do_bisync(svc)
+
+        # Cleanup must be called before bisync
+        self.assertIn("clear", call_order)
+        self.assertIn("bisync", call_order)
+        self.assertLess(call_order.index("clear"), call_order.index("bisync"))
 
 
 class TestErrorLogger(unittest.TestCase):

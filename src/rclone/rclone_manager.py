@@ -17,6 +17,68 @@ from typing import Callable, Dict, List, Optional
 from src.config.config_manager import ConfigManager, get_rclone_config_path, PERSONAL_VAULT_PATTERN
 
 
+def _bisync_cache_dir() -> Path:
+    """Return the platform-appropriate directory where rclone stores bisync state.
+
+    rclone writes lock files (``*.lck``) and partial listing files
+    (``*.lst-new``) here.  A stale lock from an interrupted sync prevents the
+    next run from proceeding, so we clean up these files before each bisync.
+
+    Paths by platform:
+        Linux  : ``~/.cache/rclone/bisync/``
+        macOS  : ``~/Library/Caches/rclone/bisync/``
+        Windows: ``%LOCALAPPDATA%\\rclone\\bisync\\``
+    """
+    system = platform.system()
+    if system == "Windows":
+        base = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
+    elif system == "Darwin":
+        base = Path.home() / "Library" / "Caches"
+    else:
+        base = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
+    return base / "rclone" / "bisync"
+
+
+def _clear_bisync_stale_files(
+    remote_name: str,
+    cache_dir: Path,
+    emit_fn: Callable[[str], None],
+) -> int:
+    """Remove stale rclone bisync lock and partial-listing files for *remote_name*.
+
+    Only files whose names begin with *remote_name* (case-sensitive) are
+    removed, so we never accidentally delete state that belongs to a
+    different remote.  Both ``*.lck`` and ``*.lst-new`` files are targeted.
+
+    Args:
+        remote_name: The rclone remote identifier (e.g. ``"duexy"``).
+        cache_dir: Path to the rclone bisync cache directory.
+        emit_fn: Callable that accepts a single log-message string.
+
+    Returns:
+        The number of files that were successfully deleted.
+    """
+    if not cache_dir.is_dir():
+        return 0
+
+    # An empty remote_name would match every file in the directory; skip.
+    if not remote_name:
+        return 0
+
+    removed = 0
+    for pattern in ("*.lck", "*.lst-new"):
+        for stale in cache_dir.glob(pattern):
+            if not stale.name.startswith(remote_name):
+                continue
+            try:
+                stale.unlink()
+                emit_fn(f"[LOCK] Archivo de bloqueo eliminado: {stale.name}")
+                removed += 1
+            except OSError as exc:
+                emit_fn(f"[LOCK] No se pudo eliminar {stale.name}: {exc}")
+    return removed
+
+
 # Keywords that indicate an error or fatal condition in rclone output lines.
 # rclone writes "ERROR : ..." and "FATAL : ..." to stderr (merged into stdout).
 _RCLONE_ERROR_KEYWORDS = ("ERROR", "FATAL", "Fatal error", "error:")
@@ -233,6 +295,29 @@ class RcloneManager:
             return False
         return self._do_bisync(svc)
 
+    def clear_bisync_locks(self, service_name: str) -> int:
+        """
+        Remove stale rclone bisync lock and partial-listing files for the
+        given service.
+
+        This is useful when a previous bisync was interrupted and left a
+        ``*.lck`` or ``*.lst-new`` file in the rclone cache directory that
+        blocks the next run.  Any removed files are reported via the
+        ``on_error`` callback.
+
+        Returns the number of files that were deleted.
+        """
+        svc = self._config.get_service(service_name)
+        if svc is None:
+            return 0
+        remote_name = svc.get("remote_name", "")
+        cache_dir = _bisync_cache_dir()
+        return _clear_bisync_stale_files(
+            remote_name,
+            cache_dir,
+            lambda msg: self._emit_error(service_name, msg),
+        )
+
     def open_browser_auth(self, remote_name: str, platform_type: str) -> subprocess.Popen:
         """
         Launch 'rclone config create' in an interactive subprocess so that
@@ -398,6 +483,14 @@ class RcloneManager:
         remote = f"{svc['remote_name']}:{svc.get('remote_path', '/')}"
         local = svc.get("local_path", "")
         name = svc.get("name", "?")
+
+        # Clear any stale lock / partial-listing files left by a previous
+        # interrupted bisync before attempting to run again.
+        _clear_bisync_stale_files(
+            svc.get("remote_name", ""),
+            _bisync_cache_dir(),
+            lambda msg: self._emit_error(name, msg),
+        )
 
         # Build the exclusion flags
         exclude_args: List[str] = []
