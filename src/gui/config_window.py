@@ -131,6 +131,7 @@ class ConfigWindow:
             "6. Espacio en disco",
             "7. Información del servicio",
             "8. Errores",
+            "9. Montaje",
         ]
 
         self._menu_buttons: List[tk.Button] = []
@@ -201,6 +202,7 @@ class ConfigWindow:
             self._panel_disk,
             self._panel_info,
             self._panel_errors,
+            self._panel_mount,
         ]
         panels[index]()
 
@@ -250,6 +252,16 @@ class ConfigWindow:
         # Resync checkbox
         self._resync_var = tk.BooleanVar(value=self._svc.get("use_resync", True))
         tk.Checkbutton(p, text="Usar --resync al detectar conflictos", variable=self._resync_var).pack(anchor="w", pady=5)
+
+        # Resync mode (conflict resolution strategy used with --resync)
+        tk.Label(p, text="Modo de resolución de conflictos (--resync-mode):", anchor="w").pack(anchor="w", pady=(10, 0))
+        self._resync_mode_var = tk.StringVar(value=self._svc.get("resync_mode", "newer"))
+        resync_modes = ["newer", "older", "larger", "path1", "path2", "union"]
+        ttk.Combobox(p, textvariable=self._resync_mode_var, values=resync_modes, state="readonly", width=15).pack(anchor="w", pady=(2, 10))
+
+        # Verbose sync
+        self._verbose_sync_var = tk.BooleanVar(value=self._svc.get("verbose_sync", False))
+        tk.Checkbutton(p, text="Activar --verbose en sincronización (más detalles en el registro)", variable=self._verbose_sync_var).pack(anchor="w", pady=5)
 
     def _browse_cache_dir(self) -> None:
         """Open folder picker to select a custom VFS cache directory."""
@@ -961,6 +973,121 @@ class ConfigWindow:
             )
 
     # ------------------------------------------------------------------
+    # Panel 9 – Mount
+    # ------------------------------------------------------------------
+
+    def _panel_mount(self) -> None:
+        """Panel to configure and control the persistent rclone mount service."""
+        p = self._make_panel("Montaje (rclone mount)")
+
+        tk.Label(
+            p,
+            text=(
+                "Ejecuta un proceso de montaje permanente que hace que el almacenamiento "
+                "remoto aparezca como una carpeta local del sistema.\n"
+                "Los ajustes de caché VFS (modo, tamaño, directorio) se comparten con bisync "
+                "y se configuran en la sección 1."
+            ),
+            wraplength=450,
+            justify="left",
+        ).pack(anchor="w", pady=(0, 10))
+
+        # Enable mount checkbox
+        self._mount_enabled_var = tk.BooleanVar(value=self._svc.get("mount_enabled", False))
+        tk.Checkbutton(
+            p,
+            text="Activar montaje automático al iniciar la aplicación",
+            variable=self._mount_enabled_var,
+        ).pack(anchor="w", pady=(0, 10))
+
+        # Mount path
+        tk.Label(p, text="Directorio de montaje (punto de montaje local):", anchor="w").pack(anchor="w")
+        mount_frame = tk.Frame(p)
+        mount_frame.pack(fill=tk.X, pady=(2, 10))
+        self._mount_path_var = tk.StringVar(value=self._svc.get("mount_path", ""))
+        tk.Entry(mount_frame, textvariable=self._mount_path_var, width=45).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        tk.Button(mount_frame, text="…", command=self._browse_mount_dir).pack(side=tk.LEFT, padx=4)
+
+        # VFS read chunk size
+        tk.Label(p, text="Tamaño de bloque de lectura VFS (--vfs-read-chunk-size):", anchor="w").pack(anchor="w")
+        self._vfs_read_chunk_var = tk.StringVar(value=self._svc.get("vfs_read_chunk_size", "10M"))
+        tk.Entry(p, textvariable=self._vfs_read_chunk_var, width=15).pack(anchor="w", pady=(2, 10))
+
+        # VFS read chunk size limit
+        tk.Label(p, text="Límite de bloque de lectura VFS (--vfs-read-chunk-size-limit):", anchor="w").pack(anchor="w")
+        self._vfs_read_chunk_limit_var = tk.StringVar(value=self._svc.get("vfs_read_chunk_size_limit", "100M"))
+        tk.Entry(p, textvariable=self._vfs_read_chunk_limit_var, width=15).pack(anchor="w", pady=(2, 10))
+
+        tk.Separator(p, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=12)
+
+        # Live mount controls
+        mount_status = "Montado ✅" if self._rclone.is_mounted(self._service_name) else "No montado ❌"
+        self._mount_status_var = tk.StringVar(value=mount_status)
+        tk.Label(p, textvariable=self._mount_status_var, font=("Segoe UI", 10, "bold"), fg="#0078d4").pack(anchor="w", pady=(0, 8))
+
+        btn_row = tk.Frame(p)
+        btn_row.pack(anchor="w")
+        tk.Button(
+            btn_row,
+            text="▶ Iniciar montaje ahora",
+            command=self._start_mount_now,
+            bg="#107c10",
+            fg="white",
+            font=("Segoe UI", 9),
+            relief=tk.FLAT,
+            padx=8,
+            pady=4,
+        ).pack(side=tk.LEFT, padx=(0, 8))
+        tk.Button(
+            btn_row,
+            text="⏹ Detener montaje",
+            command=self._stop_mount_now,
+            bg="#c50f1f",
+            fg="white",
+            font=("Segoe UI", 9),
+            relief=tk.FLAT,
+            padx=8,
+            pady=4,
+        ).pack(side=tk.LEFT)
+
+    def _browse_mount_dir(self) -> None:
+        """Open folder picker to select the mount point directory."""
+        current = self._mount_path_var.get().strip() or os.path.expanduser("~")
+        folder = filedialog.askdirectory(initialdir=current, parent=self._win)
+        if folder:
+            self._mount_path_var.set(folder)
+
+    def _start_mount_now(self) -> None:
+        """Apply mount path from the entry and start the mount immediately."""
+        # Temporarily update the service config with the current UI values so
+        # start_mount() uses the latest settings without requiring a full save.
+        mount_path = self._mount_path_var.get().strip()
+        if not mount_path:
+            messagebox.showwarning(
+                "Sin ruta",
+                "Configura el directorio de montaje antes de iniciar.",
+                parent=self._win,
+            )
+            return
+        self._config.update_service(self._service_name, {
+            "mount_enabled": True,
+            "mount_path": mount_path,
+            "vfs_read_chunk_size": self._vfs_read_chunk_var.get().strip(),
+            "vfs_read_chunk_size_limit": self._vfs_read_chunk_limit_var.get().strip(),
+        })
+        self._svc = dict(self._config.get_service(self._service_name) or {})
+        ok = self._rclone.start_mount(self._service_name)
+        if ok:
+            self._mount_status_var.set("Montado ✅")
+        else:
+            self._mount_status_var.set("Error al montar ❌")
+
+    def _stop_mount_now(self) -> None:
+        """Stop the running mount process immediately."""
+        self._rclone.stop_mount(self._service_name)
+        self._mount_status_var.set("No montado ❌")
+
+    # ------------------------------------------------------------------
     # Save
     # ------------------------------------------------------------------
 
@@ -984,6 +1111,10 @@ class ConfigWindow:
             updates["vfs_cache_dir"] = self._cache_dir_var.get().strip()
         if hasattr(self, "_resync_var"):
             updates["use_resync"] = self._resync_var.get()
+        if hasattr(self, "_resync_mode_var"):
+            updates["resync_mode"] = self._resync_mode_var.get()
+        if hasattr(self, "_verbose_sync_var"):
+            updates["verbose_sync"] = self._verbose_sync_var.get()
 
         # Panel 2 – directory
         if hasattr(self, "_local_path_var"):
@@ -1021,6 +1152,16 @@ class ConfigWindow:
         # Cancel the disk refresh timer if it exists
         if hasattr(self, "_disk_refresh_id"):
             self._win.after_cancel(self._disk_refresh_id)
+
+        # Panel 9 – mount
+        if hasattr(self, "_mount_enabled_var"):
+            updates["mount_enabled"] = self._mount_enabled_var.get()
+        if hasattr(self, "_mount_path_var"):
+            updates["mount_path"] = self._mount_path_var.get().strip()
+        if hasattr(self, "_vfs_read_chunk_var"):
+            updates["vfs_read_chunk_size"] = self._vfs_read_chunk_var.get().strip()
+        if hasattr(self, "_vfs_read_chunk_limit_var"):
+            updates["vfs_read_chunk_size_limit"] = self._vfs_read_chunk_limit_var.get().strip()
 
         self._config.update_service(self._service_name, updates)
 

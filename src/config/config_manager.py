@@ -155,11 +155,23 @@ class ConfigManager:
             "exclusions": list(DEFAULT_EXCLUSIONS),
             # Whether to exclude "Almacén personal" (OneDrive Personal Vault)
             "exclude_personal_vault": True,
-            # rclone VFS cache settings
+            # rclone VFS cache settings (shared by mount and bisync)
             "vfs_cache_mode": "on_demand",
             "vfs_cache_max_size": "10G",
             # Custom cache directory (empty = rclone default)
             "vfs_cache_dir": "",
+            # bisync: conflict resolution mode used during --resync
+            "resync_mode": "newer",
+            # bisync: emit verbose output (--verbose flag)
+            "verbose_sync": False,
+            # rclone mount: whether to run a persistent mount process
+            "mount_enabled": False,
+            # rclone mount: local directory used as the mount point
+            "mount_path": "",
+            # rclone mount: VFS read chunk size (streamed reads)
+            "vfs_read_chunk_size": "10M",
+            # rclone mount: maximum VFS read chunk size
+            "vfs_read_chunk_size_limit": "100M",
             # Recent file sync history (list of dicts)
             "sync_history": [],
         }

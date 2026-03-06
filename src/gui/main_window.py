@@ -437,8 +437,9 @@ class MainWindow:
     # ------------------------------------------------------------------
 
     def run(self) -> None:
-        """Start all sync threads and enter the Tkinter main loop."""
+        """Start all sync threads and mount processes, then enter the Tkinter main loop."""
         self._rclone.start_all()
+        self._rclone.start_all_mounts()
         self._root.mainloop()
 
 

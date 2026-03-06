@@ -421,6 +421,145 @@ class TestRcloneManager(unittest.TestCase):
 
         self.assertEqual(errors, [], "No errors should be emitted for normal output lines")
 
+    # ------------------------------------------------------------------
+    # Mount service tests
+    # ------------------------------------------------------------------
+
+    def test_is_mounted_false_initially(self):
+        """is_mounted() should return False before start_mount() is called."""
+        self.assertFalse(self.rclone.is_mounted("any_service"))
+
+    def test_stop_mount_is_noop_when_not_mounted(self):
+        """stop_mount() should not raise if the service was never mounted."""
+        self.rclone.stop_mount("never_mounted")
+
+    def test_start_all_mounts_with_no_services(self):
+        """start_all_mounts() should complete without error when no services exist."""
+        self.rclone.start_all_mounts()  # Should not raise
+
+    def test_start_all_mounts_skips_disabled_services(self):
+        """start_all_mounts() should not attempt to mount services with mount_enabled=False."""
+        self.config.add_service("NoMount", "onedrive", "/tmp/nomount")
+        # mount_enabled defaults to False
+        self.rclone.start_all_mounts()
+        self.assertFalse(self.rclone.is_mounted("NoMount"))
+
+    def test_start_mount_returns_false_without_mount_path(self):
+        """start_mount() should return False and log an error when mount_path is empty."""
+        self.config.add_service("MountSvc", "onedrive", "/tmp/mount_test")
+        self.config.update_service("MountSvc", {"mount_enabled": True, "mount_path": ""})
+        errors = []
+        self.rclone.on_error = lambda name, msg: errors.append(msg)
+        result = self.rclone.start_mount("MountSvc")
+        self.assertFalse(result)
+        self.assertTrue(any("[MOUNT]" in e for e in errors))
+
+    def test_start_mount_returns_false_when_disabled(self):
+        """start_mount() should return False when mount_enabled is False."""
+        self.config.add_service("DisabledMount", "onedrive", "/tmp/disabled_mount")
+        self.config.update_service("DisabledMount", {
+            "mount_enabled": False,
+            "mount_path": "/tmp/mnt_disabled",
+        })
+        result = self.rclone.start_mount("DisabledMount")
+        self.assertFalse(result)
+
+    def test_stop_all_mounts_clears_procs(self):
+        """stop_all_mounts() should terminate all tracked mount processes."""
+        # Inject a fake Popen that is 'running' (poll returns None)
+        class FakeProc:
+            def __init__(self):
+                self.returncode = None
+                self._terminated = False
+            def poll(self): return None
+            def terminate(self): self._terminated = True
+            def wait(self, timeout=None): pass
+
+        fake = FakeProc()
+        self.rclone._mount_procs["FakeMount"] = fake
+        self.rclone.stop_all_mounts()
+        self.assertTrue(fake._terminated)
+        self.assertEqual(len(self.rclone._mount_procs), 0)
+
+    def test_do_bisync_resync_uses_resync_mode(self):
+        """_do_bisync() retry command should include --resync-mode from service config."""
+        self.config.add_service("RMSvc", "onedrive", "/tmp/rm_test")
+        self.config.update_service("RMSvc", {"resync_mode": "newer"})
+        logged = []
+        self.rclone.on_error = lambda name, msg: logged.append((name, msg))
+
+        def fake_run_rclone(cmd, service_name, svc, is_retry=False):
+            return False  # Always fail to trigger the resync retry
+
+        self.rclone._run_rclone = fake_run_rclone
+        svc = self.config.get_service("RMSvc")
+        self.rclone._do_bisync(svc)
+
+        cmd_entries = [m for _, m in logged if m.startswith("[CMD]")]
+        self.assertEqual(len(cmd_entries), 2)
+        # The retry command must include both --resync and --resync-mode newer
+        self.assertIn("--resync", cmd_entries[1])
+        self.assertIn("--resync-mode", cmd_entries[1])
+        self.assertIn("newer", cmd_entries[1])
+
+    def test_do_bisync_includes_verbose_when_enabled(self):
+        """_do_bisync() should include --verbose in the command when verbose_sync=True."""
+        self.config.add_service("VerbSvc", "onedrive", "/tmp/verb_test")
+        self.config.update_service("VerbSvc", {"verbose_sync": True})
+        captured_cmds = []
+
+        def fake_run_rclone(cmd, service_name, svc, is_retry=False):
+            captured_cmds.append(cmd)
+            return True
+
+        self.rclone._run_rclone = fake_run_rclone
+        svc = self.config.get_service("VerbSvc")
+        self.rclone._do_bisync(svc)
+
+        self.assertTrue(len(captured_cmds) > 0)
+        self.assertIn("--verbose", captured_cmds[0])
+
+    def test_do_bisync_excludes_verbose_when_disabled(self):
+        """_do_bisync() should NOT include --verbose when verbose_sync=False."""
+        self.config.add_service("NoVerbSvc", "onedrive", "/tmp/noverb_test")
+        self.config.update_service("NoVerbSvc", {"verbose_sync": False})
+        captured_cmds = []
+
+        def fake_run_rclone(cmd, service_name, svc, is_retry=False):
+            captured_cmds.append(cmd)
+            return True
+
+        self.rclone._run_rclone = fake_run_rclone
+        svc = self.config.get_service("NoVerbSvc")
+        self.rclone._do_bisync(svc)
+
+        self.assertTrue(len(captured_cmds) > 0)
+        self.assertNotIn("--verbose", captured_cmds[0])
+
+    # ------------------------------------------------------------------
+    # Config field tests for new mount fields
+    # ------------------------------------------------------------------
+
+    def test_new_service_has_mount_fields(self):
+        """New services should include mount_enabled, mount_path, and chunk size fields."""
+        svc = self.config.add_service("MountFieldSvc", "onedrive", "/tmp/mf")
+        self.assertIn("mount_enabled", svc)
+        self.assertFalse(svc["mount_enabled"])
+        self.assertIn("mount_path", svc)
+        self.assertEqual(svc["mount_path"], "")
+        self.assertIn("vfs_read_chunk_size", svc)
+        self.assertEqual(svc["vfs_read_chunk_size"], "10M")
+        self.assertIn("vfs_read_chunk_size_limit", svc)
+        self.assertEqual(svc["vfs_read_chunk_size_limit"], "100M")
+
+    def test_new_service_has_bisync_flags(self):
+        """New services should include resync_mode and verbose_sync fields."""
+        svc = self.config.add_service("BisyncFlagSvc", "onedrive", "/tmp/bf")
+        self.assertIn("resync_mode", svc)
+        self.assertEqual(svc["resync_mode"], "newer")
+        self.assertIn("verbose_sync", svc)
+        self.assertFalse(svc["verbose_sync"])
+
 
 class TestErrorLogger(unittest.TestCase):
     """Tests for the ErrorLogger class."""

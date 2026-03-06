@@ -42,6 +42,8 @@ class RcloneManager:
         self._stop_events: Dict[str, threading.Event] = {}
         # Map of service_name → current sync status string
         self._status: Dict[str, str] = {}
+        # Map of service_name → active rclone mount Popen process
+        self._mount_procs: Dict[str, subprocess.Popen] = {}
         # Optional callback(service_name, status_str) called on status changes
         self.on_status_change: Optional[Callable[[str, str], None]] = None
         # Optional callback(service_name, file_path, synced) for history updates
@@ -95,9 +97,113 @@ class RcloneManager:
                 self.start_service(svc["name"])
 
     def stop_all(self) -> None:
-        """Stop all running sync loops."""
+        """Stop all running sync loops and mounts."""
         for name in list(self._sync_threads.keys()):
             self.stop_service(name)
+        self.stop_all_mounts()
+
+    def start_mount(self, service_name: str) -> bool:
+        """
+        Start a persistent rclone mount process for the given service.
+
+        The mount path is taken from ``svc['mount_path']``.  Does nothing and
+        returns False if the service is already mounted, mount is disabled, or
+        no mount_path is configured.
+
+        Returns True if the mount process was successfully launched.
+        """
+        if self.is_mounted(service_name):
+            return True
+
+        svc = self._config.get_service(service_name)
+        if svc is None or not svc.get("mount_enabled", False):
+            return False
+
+        mount_path = svc.get("mount_path", "").strip()
+        if not mount_path:
+            self._emit_error(service_name, "[MOUNT] No se ha configurado la ruta de montaje")
+            return False
+
+        remote = f"{svc['remote_name']}:{svc.get('remote_path', '/')}"
+
+        # Shared VFS cache options
+        vfs_cache_mode = svc.get("vfs_cache_mode", "writes")
+        vfs_cache_max_size = svc.get("vfs_cache_max_size", "10G")
+        vfs_cache_dir = svc.get("vfs_cache_dir", "").strip()
+
+        # Mount-specific VFS options
+        vfs_read_chunk_size = svc.get("vfs_read_chunk_size", "10M")
+        vfs_read_chunk_size_limit = svc.get("vfs_read_chunk_size_limit", "100M")
+
+        # Ensure the mount directory exists
+        try:
+            Path(mount_path).mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            self._emit_error(service_name, f"[MOUNT] No se pudo crear el directorio de montaje: {exc}")
+            return False
+
+        cmd = _rclone_base_args(self._config) + [
+            "mount",
+            remote,
+            mount_path,
+            "--vfs-cache-mode", vfs_cache_mode,
+            "--vfs-cache-max-size", vfs_cache_max_size,
+            "--vfs-read-chunk-size", vfs_read_chunk_size,
+            "--vfs-read-chunk-size-limit", vfs_read_chunk_size_limit,
+        ]
+        if vfs_cache_dir:
+            cmd += ["--cache-dir", vfs_cache_dir]
+
+        # Log the command for reference
+        self._emit_error(service_name, "[MOUNT CMD] " + " ".join(cmd))
+
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+            self._mount_procs[service_name] = proc
+            # Background thread to forward mount error output
+            threading.Thread(
+                target=self._read_mount_output,
+                args=(service_name, proc),
+                daemon=True,
+                name=f"mount-{service_name}",
+            ).start()
+            return True
+        except (OSError, subprocess.SubprocessError) as exc:
+            self._emit_error(service_name, f"[MOUNT] Error al iniciar montaje: {exc}")
+            return False
+
+    def stop_mount(self, service_name: str) -> None:
+        """Terminate the rclone mount process for the given service."""
+        proc = self._mount_procs.pop(service_name, None)
+        if proc is None:
+            return
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+
+    def is_mounted(self, service_name: str) -> bool:
+        """Return True if the mount process for this service is alive."""
+        proc = self._mount_procs.get(service_name)
+        return proc is not None and proc.poll() is None
+
+    def start_all_mounts(self) -> None:
+        """Start mount processes for all services that have mount_enabled=True."""
+        for svc in self._config.get_services():
+            if svc.get("mount_enabled", False):
+                self.start_mount(svc["name"])
+
+    def stop_all_mounts(self) -> None:
+        """Terminate all running mount processes."""
+        for name in list(self._mount_procs.keys()):
+            self.stop_mount(name)
 
     def run_bisync_once(self, service_name: str) -> bool:
         """
@@ -295,6 +401,9 @@ class RcloneManager:
             "--buffer-size", "64M",
             "-P",
         ]
+        # Optional verbose output
+        if svc.get("verbose_sync", False):
+            perf_args.append("--verbose")
 
         # VFS cache options
         vfs_cache_mode = svc.get("vfs_cache_mode", "on_demand")
@@ -308,6 +417,9 @@ class RcloneManager:
         if vfs_cache_dir:
             vfs_args += ["--cache-dir", vfs_cache_dir]
 
+        # Conflict resolution mode used during --resync retries
+        resync_mode = svc.get("resync_mode", "newer")
+
         base = _rclone_base_args(self._config)
         Path(local).mkdir(parents=True, exist_ok=True)
 
@@ -319,7 +431,7 @@ class RcloneManager:
 
         # Second attempt: bisync --resync if first attempt failed
         if not success:
-            cmd_resync = cmd + ["--resync"]
+            cmd_resync = cmd + ["--resync", "--resync-mode", resync_mode]
             self._emit_error(name, "[CMD] " + " ".join(cmd_resync))
             success = self._run_rclone(cmd_resync, name, svc, is_retry=True)
 
@@ -386,6 +498,28 @@ class RcloneManager:
                 self.on_error(service_name, message)
             except Exception:
                 pass
+
+    def _read_mount_output(self, service_name: str, proc: subprocess.Popen) -> None:
+        """
+        Background thread: read mount process output and forward error lines.
+
+        Called automatically by start_mount().
+        """
+        if proc.stdout:
+            for raw_line in proc.stdout:
+                line = raw_line.strip()
+                if not line:
+                    continue
+                if any(kw in line for kw in _RCLONE_ERROR_KEYWORDS):
+                    self._emit_error(service_name, f"[MOUNT] {line}")
+        proc.wait()
+        rc = proc.returncode
+        # -15 = SIGTERM (normal shutdown), -9 = SIGKILL, 0 = clean exit
+        if rc is not None and rc not in (0, -15, -9):
+            self._emit_error(
+                service_name,
+                f"[MOUNT] El proceso de montaje terminó inesperadamente con código {rc}",
+            )
 
 
 # ------------------------------------------------------------------
