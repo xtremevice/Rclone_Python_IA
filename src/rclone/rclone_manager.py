@@ -487,6 +487,11 @@ class RcloneManager:
                     self._config.add_sync_history_entry(service_name, file_path, True)
 
             proc.wait()
+            if proc.returncode != 0:
+                self._emit_error(
+                    service_name,
+                    f"rclone terminó con código {proc.returncode}",
+                )
             return proc.returncode == 0
         except (OSError, subprocess.SubprocessError) as exc:
             self._emit_error(service_name, f"Error al ejecutar rclone: {exc}")

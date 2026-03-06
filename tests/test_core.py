@@ -489,6 +489,47 @@ class TestRcloneManager(unittest.TestCase):
 
         self.assertEqual(errors, [], "No errors should be emitted for normal output lines")
 
+    def test_run_rclone_logs_exit_code_on_failure(self):
+        """_run_rclone() should emit the rclone exit code when it exits non-zero.
+
+        When rclone fails silently (no ERROR/FATAL in output), the only
+        diagnostic hint in the log is the exit code.  Without it, the user
+        sees only the generic 'La sincronización falló' message and has no
+        way to diagnose the root cause.
+        """
+        import io
+        errors = []
+        self.rclone.on_error = lambda name, msg: errors.append(msg)
+
+        class FakeProc:
+            returncode = 5  # rclone exit code 5 = temporary error
+            stdout = io.StringIO("")  # no output at all
+            def wait(self): pass
+
+        with patch("subprocess.Popen", return_value=FakeProc()):
+            result = self.rclone._run_rclone(["rclone", "bisync"], "FailSvc", {})
+
+        self.assertFalse(result)
+        self.assertEqual(len(errors), 1)
+        self.assertIn("5", errors[0], "Exit code must appear in the error message")
+
+    def test_run_rclone_does_not_log_exit_code_on_success(self):
+        """_run_rclone() should NOT emit an exit code message when rclone succeeds."""
+        import io
+        errors = []
+        self.rclone.on_error = lambda name, msg: errors.append(msg)
+
+        class FakeProc:
+            returncode = 0
+            stdout = io.StringIO("Transferred: some/file.txt: Copied (new)\n")
+            def wait(self): pass
+
+        with patch("subprocess.Popen", return_value=FakeProc()):
+            result = self.rclone._run_rclone(["rclone", "bisync"], "OkSvc", {})
+
+        self.assertTrue(result)
+        self.assertEqual(errors, [], "No exit-code message should appear on success")
+
     # ------------------------------------------------------------------
     # Mount service tests
     # ------------------------------------------------------------------
