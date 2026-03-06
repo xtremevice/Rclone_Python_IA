@@ -878,6 +878,49 @@ class TestBisyncLockCleanup(unittest.TestCase):
         self.assertIn("bisync", call_order)
         self.assertLess(call_order.index("clear"), call_order.index("bisync"))
 
+    def test_do_bisync_clears_lock_files_before_resync_retry(self):
+        """_do_bisync() should remove stale lock files before the --resync retry.
+
+        If the first bisync attempt is killed or crashes, it may leave its own
+        lock file behind.  Without a second cleanup the --resync retry would
+        immediately fail with 'prior lock file found'.
+        """
+        self.config.add_service("RetrySvc", "onedrive", "/tmp/retry_test")
+        self.config.update_service("RetrySvc", {"remote_name": "retryremote"})
+
+        fake_cache = Path(self._tmpdir) / "fake_cache_retry"
+        fake_cache.mkdir()
+        lock = fake_cache / "retryremote_..tmp_retry_test.lck"
+
+        call_order = []
+
+        def fake_run_rclone(cmd, service_name, svc, is_retry=False):
+            call_order.append("bisync")
+            # Recreate the lock to simulate the first run leaving it behind
+            lock.write_text("pid")
+            return False  # Always fail to trigger the --resync retry
+
+        def fake_clear(remote_name, cache_dir, emit_fn):
+            call_order.append("clear")
+            return _clear_bisync_stale_files(remote_name, cache_dir, emit_fn)
+
+        self.rclone._run_rclone = fake_run_rclone
+        svc = self.config.get_service("RetrySvc")
+
+        with patch("src.rclone.rclone_manager._bisync_cache_dir", return_value=fake_cache):
+            with patch("src.rclone.rclone_manager._clear_bisync_stale_files", side_effect=fake_clear):
+                self.rclone._do_bisync(svc)
+
+        # cleanup must have been called at least twice (before first attempt
+        # and before the --resync retry)
+        clear_count = call_order.count("clear")
+        self.assertGreaterEqual(clear_count, 2,
+            "cleanup must run before both the initial bisync and the --resync retry")
+        # Verify ordering: first call is clear, then bisync, then clear again
+        self.assertEqual(call_order[0], "clear")
+        self.assertEqual(call_order[1], "bisync")
+        self.assertEqual(call_order[2], "clear")
+
 
 class TestErrorLogger(unittest.TestCase):
     """Tests for the ErrorLogger class."""

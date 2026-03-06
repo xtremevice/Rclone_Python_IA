@@ -530,8 +530,17 @@ class RcloneManager:
         self._emit_error(name, "[CMD] " + shlex.join(cmd))
         success = self._run_rclone(cmd, name, svc)
 
-        # Second attempt: bisync --resync if first attempt failed
+        # Second attempt: bisync --resync if first attempt failed.
+        # Clean stale lock files again before retrying: the first attempt may
+        # have created a lock that it never released (e.g. if the process was
+        # killed), which would cause the retry to fail immediately with
+        # "prior lock file found".
         if not success:
+            _clear_bisync_stale_files(
+                svc.get("remote_name", ""),
+                _bisync_cache_dir(),
+                lambda msg: self._emit_error(name, msg),
+            )
             cmd_resync = cmd + ["--resync"]
             if _rclone_supports_resync_mode(self._config):
                 cmd_resync += ["--resync-mode", resync_mode]
