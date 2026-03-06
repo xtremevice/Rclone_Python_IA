@@ -10,6 +10,7 @@ Implementa la interfaz principal con:
 """
 
 import sys
+import threading
 
 from PyQt5.QtCore import QSize, Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import QColor, QFont, QIcon, QPixmap
@@ -33,7 +34,7 @@ from PyQt5.QtWidgets import (
 )
 
 from core.config import ConfigManager
-from core.rclone import SyncManager, open_folder
+from core.rclone import SyncManager, get_remote_storage_info, open_folder
 from core.service import Service
 
 
@@ -156,6 +157,10 @@ class ServiceTab(QWidget):
 
         self._build_ui()
         self._load_recent_files()
+        # Counter used to discard storage-info results from stale fetches
+        self._storage_fetch_gen = 0
+        # Fetch cloud storage quota asynchronously
+        self._fetch_storage_info()
 
     def _build_ui(self):
         """Construye la interfaz de la pestaña del servicio."""
@@ -183,6 +188,11 @@ class ServiceTab(QWidget):
         )
         platform_label.setObjectName("service_info")
         left_info.addWidget(platform_label)
+
+        # Storage quota label — loaded asynchronously via rclone about
+        self.storage_label = QLabel("💾 Consultando almacenamiento…")
+        self.storage_label.setObjectName("service_info")
+        left_info.addWidget(self.storage_label)
         info_layout.addLayout(left_info)
 
         # Separador vertical
@@ -301,7 +311,13 @@ class ServiceTab(QWidget):
         """
         Callback llamado desde el SyncManager cuando cambia el estado.
         Actualiza el label de estado en el hilo principal.
+
+        Cuando el servicio está pausado y el SyncManager reporta "Detenido"
+        (porque terminó el proceso), se muestra "Pausado" para que el estado
+        sea coherente con el botón "▶️ Reanudar sync".
         """
+        if self.service.is_paused and status == "Detenido":
+            status = "Pausado"
         QTimer.singleShot(0, lambda: self._update_status(status))
 
     def _update_status(self, status: str):
@@ -317,6 +333,34 @@ class ServiceTab(QWidget):
         """
         QTimer.singleShot(0, lambda: self._add_file_item(file_entry))
 
+    def _fetch_storage_info(self):
+        """
+        Consulta el espacio de almacenamiento remoto con ``rclone about``
+        en un hilo secundario para no bloquear la interfaz gráfica.
+        El resultado actualiza ``storage_label`` en el hilo principal.
+
+        Un contador de generación descarta resultados de solicitudes antiguas
+        cuando varias llamadas se solapan (p.ej. al refrescar la configuración).
+        """
+        self._storage_fetch_gen += 1
+        gen = self._storage_fetch_gen
+
+        def _worker():
+            info = get_remote_storage_info(self.service)
+            # Only update the label if this is still the latest request
+            if gen == self._storage_fetch_gen:
+                QTimer.singleShot(0, lambda: self._update_storage_label(info))
+
+        threading.Thread(target=_worker, daemon=True, name=f"about-{self.service.service_id}").start()
+
+    def _update_storage_label(self, info):
+        """Actualiza el label de almacenamiento en el hilo principal."""
+        if hasattr(self, "storage_label"):
+            if info:
+                self.storage_label.setText(f"💾 {info}")
+            else:
+                self.storage_label.setText("💾 Info de almacenamiento no disponible")
+
     def refresh_service_data(self):
         """Refresca los datos del servicio desde el gestor de configuración."""
         updated = self.config_manager.get_service(self.service.service_id)
@@ -331,6 +375,8 @@ class ServiceTab(QWidget):
             if hasattr(self, "interval_label"):
                 self.interval_label.setText(self.service.get_sync_interval_display())
             self._load_recent_files()
+            # Refresh cloud quota in the background
+            self._fetch_storage_info()
 
     def toggle_sync(self):
         """Alterna el estado de sincronización (pausar/reanudar)."""
