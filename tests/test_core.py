@@ -326,6 +326,101 @@ class TestRcloneManager(unittest.TestCase):
         self.assertTrue(len(captured_cmds) > 0)
         self.assertNotIn("--cache-dir", captured_cmds[0])
 
+    def test_do_bisync_logs_command_before_running(self):
+        """_do_bisync() should emit a [CMD] entry via on_error before the first run."""
+        self.config.add_service("CmdSvc", "onedrive", "/tmp/cmd_test")
+        logged = []
+        self.rclone.on_error = lambda name, msg: logged.append((name, msg))
+
+        def fake_run_rclone(cmd, service_name, svc, is_retry=False):
+            return True
+
+        self.rclone._run_rclone = fake_run_rclone
+        svc = self.config.get_service("CmdSvc")
+        self.rclone._do_bisync(svc)
+
+        # At least one [CMD] entry should have been logged
+        cmd_entries = [(n, m) for n, m in logged if m.startswith("[CMD]")]
+        self.assertTrue(len(cmd_entries) >= 1, "Expected at least one [CMD] log entry")
+        # The logged command should contain 'bisync'
+        self.assertIn("bisync", cmd_entries[0][1])
+
+    def test_do_bisync_logs_resync_command_on_failure(self):
+        """_do_bisync() should emit a [CMD] entry for the --resync retry."""
+        self.config.add_service("ResyncSvc", "onedrive", "/tmp/resync_test")
+        logged = []
+        self.rclone.on_error = lambda name, msg: logged.append((name, msg))
+
+        call_count = [0]
+
+        def fake_run_rclone(cmd, service_name, svc, is_retry=False):
+            call_count[0] += 1
+            return False  # Always fail to trigger the resync retry
+
+        self.rclone._run_rclone = fake_run_rclone
+        svc = self.config.get_service("ResyncSvc")
+        self.rclone._do_bisync(svc)
+
+        cmd_entries = [(n, m) for n, m in logged if m.startswith("[CMD]")]
+        self.assertEqual(len(cmd_entries), 2, "Expected two [CMD] entries (initial + resync)")
+        self.assertIn("--resync", cmd_entries[1][1])
+
+    def test_run_rclone_emits_error_lines_from_output(self):
+        """_run_rclone() should emit lines containing 'ERROR' via on_error."""
+        import io
+        errors = []
+        self.rclone.on_error = lambda name, msg: errors.append(msg)
+
+        fake_output = (
+            "2023/11/15 10:30:45 ERROR : some/path: file not found\n"
+            "2023/11/15 10:30:46 INFO  : some/other: transferred\n"
+            "FATAL error: bisync not initialised\n"
+        )
+
+        class FakeProc:
+            returncode = 1
+            stdout = io.StringIO(fake_output)
+            def wait(self): pass
+
+        with patch("subprocess.Popen", return_value=FakeProc()):
+            self.rclone._run_rclone(["rclone", "bisync"], "ErrSvc", {})
+
+        # ERROR and FATAL lines should be in errors
+        self.assertTrue(
+            any("ERROR" in e for e in errors),
+            "Expected ERROR line to be emitted",
+        )
+        self.assertTrue(
+            any("FATAL" in e or "Fatal" in e for e in errors),
+            "Expected FATAL line to be emitted",
+        )
+        # Plain INFO line should NOT be in errors
+        self.assertFalse(
+            any("INFO" in e for e in errors),
+            "INFO lines should not be emitted as errors",
+        )
+
+    def test_run_rclone_does_not_emit_normal_lines(self):
+        """_run_rclone() should NOT emit normal rclone progress lines as errors."""
+        import io
+        errors = []
+        self.rclone.on_error = lambda name, msg: errors.append(msg)
+
+        fake_output = (
+            "Transferred: 1 / 1 Bytes, 100%, 512 Bytes/s, ETA 0s\n"
+            "Elapsed time: 0.1s\n"
+        )
+
+        class FakeProc:
+            returncode = 0
+            stdout = io.StringIO(fake_output)
+            def wait(self): pass
+
+        with patch("subprocess.Popen", return_value=FakeProc()):
+            self.rclone._run_rclone(["rclone", "bisync"], "NormSvc", {})
+
+        self.assertEqual(errors, [], "No errors should be emitted for normal output lines")
+
 
 class TestErrorLogger(unittest.TestCase):
     """Tests for the ErrorLogger class."""

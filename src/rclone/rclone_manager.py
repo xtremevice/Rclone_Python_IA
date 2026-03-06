@@ -15,6 +15,11 @@ from typing import Callable, Dict, List, Optional
 from src.config.config_manager import ConfigManager, get_rclone_config_path, PERSONAL_VAULT_PATTERN
 
 
+# Keywords that indicate an error or fatal condition in rclone output lines.
+# rclone writes "ERROR : ..." and "FATAL : ..." to stderr (merged into stdout).
+_RCLONE_ERROR_KEYWORDS = ("ERROR", "FATAL", "Fatal error", "error:")
+
+
 def _rclone_base_args(config_manager: ConfigManager) -> List[str]:
     """Return the common rclone arguments including --config path."""
     return ["rclone", "--config", str(config_manager.rclone_config_path())]
@@ -308,11 +313,14 @@ class RcloneManager:
 
         # First attempt: standard bisync
         cmd = base + ["bisync", remote, local] + perf_args + vfs_args + exclude_args
+        # Log the exact command being run so it appears in the error log as reference
+        self._emit_error(name, "[CMD] " + " ".join(cmd))
         success = self._run_rclone(cmd, name, svc)
 
         # Second attempt: bisync --resync if first attempt failed
         if not success:
             cmd_resync = cmd + ["--resync"]
+            self._emit_error(name, "[CMD] " + " ".join(cmd_resync))
             success = self._run_rclone(cmd_resync, name, svc, is_retry=True)
 
         if not success:
@@ -340,11 +348,14 @@ class RcloneManager:
                 stderr=subprocess.STDOUT,
                 text=True,
             )
-            # Read output line-by-line to detect file changes
+            # Read output line-by-line to detect file changes and errors
             for raw_line in proc.stdout or []:
                 line = raw_line.strip()
                 if not line:
                     continue
+                # Forward any rclone error / fatal output to the error log
+                if any(kw in line for kw in _RCLONE_ERROR_KEYWORDS):
+                    self._emit_error(service_name, line)
                 # rclone -P outputs lines like: "Transferred: <path>"
                 # or lines starting with a file path
                 file_path = _extract_file_path(line)
