@@ -123,6 +123,10 @@ class RcloneManager:
         self._status: Dict[str, str] = {}
         # Map of service_name → active rclone mount Popen process
         self._mount_procs: Dict[str, subprocess.Popen] = {}
+        # Map of service_name → currently-running rclone bisync Popen process.
+        # Used to terminate a long-running bisync immediately when stop_service
+        # is called, without waiting for the process to finish naturally.
+        self._running_procs: Dict[str, subprocess.Popen] = {}
         # Optional callback(service_name, status_str) called on status changes
         self.on_status_change: Optional[Callable[[str, str], None]] = None
         # Optional callback(service_name, file_path, synced) for history updates
@@ -155,10 +159,25 @@ class RcloneManager:
         thread.start()
 
     def stop_service(self, service_name: str) -> None:
-        """Signal the background sync loop for this service to stop."""
+        """Signal the background sync loop for this service to stop.
+
+        In addition to setting the stop event (which interrupts the inter-cycle
+        wait), any rclone bisync process that is actively running for this
+        service is terminated immediately so the UI reflects the stopped state
+        without delay.
+        """
         event = self._stop_events.get(service_name)
         if event:
             event.set()
+        # Terminate the running rclone process if present so the stop takes
+        # effect immediately rather than waiting for the current bisync to finish.
+        proc = self._running_procs.get(service_name)
+        if proc and proc.poll() is None:
+            try:
+                proc.terminate()
+            except OSError:
+                # Process may have exited between poll() and terminate()
+                pass
 
     def is_running(self, service_name: str) -> bool:
         """Return True if the sync thread for this service is alive."""
@@ -441,6 +460,55 @@ class RcloneManager:
             pass
         return []
 
+    def get_storage_info(self, service_name: str) -> Optional[str]:
+        """
+        Query the remote storage quota using ``rclone about remote:``.
+
+        Returns a human-readable summary such as
+        ``"Total: 1.024 TiB  |  Usado: 125.3 GiB  |  Libre: 898.7 GiB"``
+        or ``None`` when the command fails (e.g. the service does not support
+        ``about``, rclone is not installed, or the service is not configured).
+
+        Supported platforms: OneDrive, Google Drive, Dropbox, Box, pCloud.
+        Unsupported (returns None): Amazon S3, Backblaze B2, SFTP, FTP, etc.
+        """
+        svc = self._config.get_service(service_name)
+        if svc is None:
+            return None
+        remote_name = svc.get("remote_name", "")
+        if not remote_name:
+            return None
+
+        cmd = _rclone_base_args(self._config) + ["about", f"{remote_name}:"]
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            if result.returncode != 0:
+                return None
+
+            # Parse output lines such as "Total:   1.024 TiB", "Used:    125.3 GiB"
+            info: dict = {}
+            for line in result.stdout.strip().splitlines():
+                if ":" in line:
+                    key, _, value = line.partition(":")
+                    info[key.strip().lower()] = value.strip()
+
+            parts: List[str] = []
+            if "total" in info:
+                parts.append(f"Total: {info['total']}")
+            if "used" in info:
+                parts.append(f"Usado: {info['used']}")
+            if "free" in info:
+                parts.append(f"Libre: {info['free']}")
+
+            return "  |  ".join(parts) if parts else None
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
@@ -531,11 +599,17 @@ class RcloneManager:
         success = self._run_rclone(cmd, name, svc)
 
         # Second attempt: bisync --resync if first attempt failed.
+        # Skip the retry if a stop was explicitly requested (the process was
+        # terminated on purpose, not due to a real error).
         # Clean stale lock files again before retrying: the first attempt may
         # have created a lock that it never released (e.g. if the process was
         # killed), which would cause the retry to fail immediately with
         # "prior lock file found".
         if not success:
+            stop_ev = self._stop_events.get(name)
+            if stop_ev and stop_ev.is_set():
+                # Service is being stopped; don't retry or log spurious errors
+                return False
             _clear_bisync_stale_files(
                 svc.get("remote_name", ""),
                 _bisync_cache_dir(),
@@ -572,6 +646,9 @@ class RcloneManager:
                 stderr=subprocess.STDOUT,
                 text=True,
             )
+            # Track the running process so stop_service() can terminate it
+            # immediately without waiting for the current bisync to finish.
+            self._running_procs[service_name] = proc
             # Read output line-by-line to detect file changes and errors
             for raw_line in proc.stdout or []:
                 line = raw_line.strip()
@@ -589,13 +666,18 @@ class RcloneManager:
                     self._config.add_sync_history_entry(service_name, file_path, True)
 
             proc.wait()
+            self._running_procs.pop(service_name, None)
             if proc.returncode != 0:
-                self._emit_error(
-                    service_name,
-                    f"rclone terminó con código {proc.returncode}",
-                )
+                # Don't log a spurious error when we stopped the process on purpose
+                stop_ev = self._stop_events.get(service_name)
+                if not (stop_ev and stop_ev.is_set()):
+                    self._emit_error(
+                        service_name,
+                        f"rclone terminó con código {proc.returncode}",
+                    )
             return proc.returncode == 0
         except (OSError, subprocess.SubprocessError) as exc:
+            self._running_procs.pop(service_name, None)
             self._emit_error(service_name, f"Error al ejecutar rclone: {exc}")
             return False
 

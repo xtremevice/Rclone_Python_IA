@@ -91,6 +91,8 @@ class MainWindow:
         self._status_vars: Dict[str, tk.StringVar] = {}
         # Per-service toggle-button StringVars (Detener / Sincronizar)
         self._toggle_vars: Dict[str, tk.StringVar] = {}
+        # Per-service storage info StringVars (from rclone about)
+        self._storage_vars: Dict[str, tk.StringVar] = {}
         # Whether the tray icon has been started
         self._tray_started = False
 
@@ -154,10 +156,9 @@ class MainWindow:
         header = tk.Frame(tab_frame, bg="#f0f4fa", pady=8, padx=10)
         header.pack(fill=tk.X)
 
-        # Service name
+        # Row 0: Service name | Platform | Sync status | Interval | Add button
         tk.Label(header, text=name, font=("Segoe UI", 11, "bold"), bg="#f0f4fa").grid(row=0, column=0, sticky="w", padx=(0, 20))
 
-        # Platform
         tk.Label(header, text=f"Plataforma: {platform_label}", bg="#f0f4fa").grid(row=0, column=1, sticky="w", padx=(0, 20))
 
         # Sync status (dynamic)
@@ -178,6 +179,20 @@ class MainWindow:
             font=("Segoe UI", 9),
             cursor="hand2",
         ).grid(row=0, column=4, sticky="w", padx=(8, 0))
+
+        # Row 1: Storage quota info (fetched asynchronously via rclone about)
+        storage_var = tk.StringVar(value="💾 Total: 0  |  Usado: 0  |  Libre: 0")
+        self._storage_vars[name] = storage_var
+        tk.Label(
+            header,
+            textvariable=storage_var,
+            bg="#f0f4fa",
+            fg="#555555",
+            font=("Segoe UI", 9),
+        ).grid(row=1, column=0, columnspan=5, sticky="w", pady=(4, 0))
+
+        # Fetch storage quota in the background and update the label when ready
+        self._fetch_storage_info_async(name, storage_var)
 
         # ── File change list (60 % of window height) ──────────────────
         list_frame = tk.Frame(tab_frame)
@@ -218,9 +233,13 @@ class MainWindow:
             font=("Segoe UI", 9),
         ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=2, pady=4)
 
-        # Button 2: Stop / Start sync (label reflects current running state)
+        # Button 2: Stop / Start sync
+        # Initialise from the 'sync_enabled' flag rather than is_running()
+        # because services have not started yet when the tab is built
+        # (run() calls start_all() after __init__() finishes).
+        will_run = svc.get("sync_enabled", True)
         toggle_text = tk.StringVar(
-            value="⏹ Detener" if self._rclone.is_running(name) else "▶ Sincronizar"
+            value="⏹ Detener" if will_run else "▶ Sincronizar"
         )
         self._toggle_vars[name] = toggle_text
         tk.Button(
@@ -241,6 +260,31 @@ class MainWindow:
             bg="#e0e0e0",
             font=("Segoe UI", 9),
         ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=2, pady=4)
+
+    # ------------------------------------------------------------------
+    # Storage info helpers
+    # ------------------------------------------------------------------
+
+    def _fetch_storage_info_async(self, service_name: str, var: tk.StringVar) -> None:
+        """
+        Fetch cloud storage quota for *service_name* in a background thread
+        and update *var* on the main thread when the result is available.
+
+        Uses ``rclone about remote:`` which is supported by OneDrive, Google
+        Drive, Dropbox, Box, and pCloud.  For services that do not support
+        ``about`` (e.g. S3, SFTP), the default "💾 Total: 0 | ..." text is
+        left unchanged.
+        """
+        def _worker() -> None:
+            info = self._rclone.get_storage_info(service_name)
+            if info:
+                self._root.after(0, lambda: var.set(f"💾 {info}"))
+
+        threading.Thread(
+            target=_worker,
+            daemon=True,
+            name=f"about-{service_name}",
+        ).start()
 
     # ------------------------------------------------------------------
     # Actions
@@ -287,6 +331,10 @@ class MainWindow:
             text_var.set("▶ Sincronizar")
             self._config.update_service(service_name, {"sync_enabled": False})
         else:
+            # Clear any stale bisync lock files left by a previous interrupted
+            # sync before restarting, so bisync does not fail with "prior lock
+            # file found".
+            self._rclone.clear_bisync_locks(service_name)
             self._config.update_service(service_name, {"sync_enabled": True})
             self._rclone.start_service(service_name)
             text_var.set("⏹ Detener")
@@ -421,6 +469,7 @@ class MainWindow:
         self._file_lists.clear()
         self._status_vars.clear()
         self._toggle_vars.clear()
+        self._storage_vars.clear()
         self._build_ui()
 
     def _on_service_added(self, service_name: str) -> None:
