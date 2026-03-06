@@ -23,6 +23,7 @@ from typing import Callable, Dict, List, Optional
 
 from src.config.config_manager import PLATFORM_LABELS, ConfigManager
 from src.gui.tray_icon import TrayIcon
+from src.gui.elementary_indicator import ElementaryIndicator, is_elementary_os
 from src.gui.error_logger import ErrorLogger
 from src.rclone.rclone_manager import RcloneManager
 
@@ -71,7 +72,21 @@ class MainWindow:
 
         _center_window(self._root, height_pct=0.60, width_pct=0.20)
 
-        # System tray integration
+        # On Elementary OS, use a Wingpanel indicator (AppIndicator3) that is
+        # always visible while the app is running.  For all other systems, fall
+        # back to the pystray-based tray icon that appears only on minimise.
+        if is_elementary_os():
+            self._elementary = ElementaryIndicator(
+                on_show=self._restore_window,
+                on_quit=self._quit,
+            )
+            # Start immediately so the icon appears in Wingpanel right away.
+            if self._elementary.is_available():
+                self._elementary.start()
+        else:
+            self._elementary = None
+
+        # pystray tray icon — used on non-Elementary OS systems only.
         self._tray = TrayIcon(on_show=self._restore_window, on_quit=self._quit)
 
         # Intercept window close (×) to quit the app entirely
@@ -93,7 +108,7 @@ class MainWindow:
         self._toggle_vars: Dict[str, tk.StringVar] = {}
         # Per-service storage info StringVars (from rclone about)
         self._storage_vars: Dict[str, tk.StringVar] = {}
-        # Whether the tray icon has been started
+        # Whether the pystray tray icon has been started (non-Elementary only)
         self._tray_started = False
 
         self._notebook: Optional[ttk.Notebook] = None
@@ -372,20 +387,24 @@ class MainWindow:
         """
         Called when the window is iconified (minimized).
 
-        Hide the window and show the tray icon instead.
+        Hides the window.  On non-Elementary OS systems, also starts the
+        pystray tray icon so the user can restore the window from it.
+        On Elementary OS the Wingpanel indicator is already running and
+        visible, so no additional tray icon is needed.
         """
         # Only respond to the root window's Unmap event
         if event.widget is not self._root:
             return
         # Withdraw (hide) the window
         self._root.withdraw()
-        # Start the tray icon if not yet running
-        if not self._tray_started and self._tray.is_available():
-            self._tray.start()
-            self._tray_started = True
+        # On non-Elementary systems, start the pystray tray icon if not yet running
+        if self._elementary is None or not self._elementary.is_running():
+            if not self._tray_started and self._tray.is_available():
+                self._tray.start()
+                self._tray_started = True
 
     def _restore_window(self) -> None:
-        """Restore the main window from the tray (runs on tray thread → schedule on main)."""
+        """Restore the main window from the tray (runs on tray/indicator thread → schedule on main)."""
         self._root.after(0, self._do_restore)
 
     def _do_restore(self) -> None:
@@ -395,10 +414,12 @@ class MainWindow:
         self._root.focus_force()
 
     def _quit(self) -> None:
-        """Stop all sync threads, save error log, remove tray icon, and destroy the window."""
+        """Stop all sync threads, save error log, remove tray icon(s), and destroy the window."""
         self._rclone.stop_all()
         self._error_logger.save_to_file()
         self._tray.stop()
+        if self._elementary is not None:
+            self._elementary.stop()
         self._root.destroy()
 
     # ------------------------------------------------------------------
@@ -424,8 +445,11 @@ class MainWindow:
                 toggle_var.set("▶ Sincronizar")
             else:
                 toggle_var.set("⏹ Detener")
-        # Also update the tray tooltip with aggregated status
-        self._tray.update_tooltip(f"Rclone Manager – {service_name}: {status}")
+        # Update tooltips in both tray implementations
+        tooltip = f"Rclone Manager – {service_name}: {status}"
+        self._tray.update_tooltip(tooltip)
+        if self._elementary is not None:
+            self._elementary.update_tooltip(tooltip)
 
     def _on_file_synced(self, service_name: str, file_path: str, synced: bool) -> None:
         """

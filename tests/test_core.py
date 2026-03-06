@@ -987,5 +987,106 @@ class TestErrorLogger(unittest.TestCase):
         self.assertEqual(self.logger.get_all_entries(), [])
 
 
+class TestElementaryIndicator(unittest.TestCase):
+    """Tests for the Elementary OS Wingpanel indicator helpers."""
+
+    def test_is_elementary_os_true(self):
+        """is_elementary_os() returns True when /etc/os-release contains ID=elementary."""
+        from src.gui.elementary_indicator import is_elementary_os
+
+        fake_release = "ID=elementary\nNAME=elementary OS\nVERSION=7\n"
+        with patch("builtins.open", unittest.mock.mock_open(read_data=fake_release)):
+            self.assertTrue(is_elementary_os())
+
+    def test_is_elementary_os_false_ubuntu(self):
+        """is_elementary_os() returns False for a non-elementary /etc/os-release."""
+        from src.gui.elementary_indicator import is_elementary_os
+
+        fake_release = "ID=ubuntu\nNAME=Ubuntu\nVERSION_ID=24.04\n"
+        with patch("builtins.open", unittest.mock.mock_open(read_data=fake_release)):
+            self.assertFalse(is_elementary_os())
+
+    def test_is_elementary_os_false_on_ioerror(self):
+        """is_elementary_os() returns False when /etc/os-release cannot be read."""
+        from src.gui.elementary_indicator import is_elementary_os
+
+        with patch("builtins.open", side_effect=OSError("no such file")):
+            self.assertFalse(is_elementary_os())
+
+    def test_indicator_not_available_non_elementary(self):
+        """ElementaryIndicator.is_available() returns False on non-Elementary OS."""
+        from src.gui.elementary_indicator import ElementaryIndicator, is_elementary_os
+
+        ind = ElementaryIndicator()
+        with patch("src.gui.elementary_indicator.is_elementary_os", return_value=False):
+            self.assertFalse(ind.is_available())
+
+    def test_indicator_not_available_missing_library(self):
+        """ElementaryIndicator.is_available() returns False when AppIndicator3 is absent."""
+        from src.gui.elementary_indicator import ElementaryIndicator
+
+        with (
+            patch("src.gui.elementary_indicator.is_elementary_os", return_value=True),
+            patch("src.gui.elementary_indicator._import_app_indicator", return_value=None),
+        ):
+            ind = ElementaryIndicator()
+            self.assertFalse(ind.is_available())
+
+    def test_indicator_available_when_library_present(self):
+        """ElementaryIndicator.is_available() returns True on Elementary with AppIndicator3."""
+        from src.gui.elementary_indicator import ElementaryIndicator
+
+        mock_ai = MagicMock()
+        with (
+            patch("src.gui.elementary_indicator.is_elementary_os", return_value=True),
+            patch("src.gui.elementary_indicator._import_app_indicator", return_value=mock_ai),
+        ):
+            ind = ElementaryIndicator()
+            self.assertTrue(ind.is_available())
+
+    def test_start_does_nothing_when_library_absent(self):
+        """ElementaryIndicator.start() should not raise when AppIndicator3 is absent."""
+        from src.gui.elementary_indicator import ElementaryIndicator
+
+        with patch("src.gui.elementary_indicator._import_app_indicator", return_value=None):
+            ind = ElementaryIndicator()
+            ind.start()  # must not raise
+            self.assertFalse(ind._running)
+
+    def test_stop_does_nothing_when_not_started(self):
+        """ElementaryIndicator.stop() should be safe to call when not running."""
+        from src.gui.elementary_indicator import ElementaryIndicator
+
+        ind = ElementaryIndicator()
+        ind.stop()  # must not raise
+        self.assertFalse(ind._running)
+
+    def test_on_show_callback_invoked(self):
+        """The _on_show_clicked handler must invoke the on_show callback."""
+        from src.gui.elementary_indicator import ElementaryIndicator
+
+        called = []
+        ind = ElementaryIndicator(on_show=lambda: called.append(True))
+        ind._on_show_clicked(None)
+        self.assertEqual(called, [True])
+
+    def test_on_quit_callback_invoked(self):
+        """The _on_quit_clicked handler must invoke the on_quit callback."""
+        from src.gui.elementary_indicator import ElementaryIndicator
+
+        called = []
+        with patch.object(ElementaryIndicator, "stop"):
+            ind = ElementaryIndicator(on_quit=lambda: called.append(True))
+            ind._on_quit_clicked(None)
+        self.assertEqual(called, [True])
+
+    def test_update_tooltip_no_error_when_not_started(self):
+        """update_tooltip() should be a no-op when the indicator is not running."""
+        from src.gui.elementary_indicator import ElementaryIndicator
+
+        ind = ElementaryIndicator()
+        ind.update_tooltip("Some tooltip")  # must not raise
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
