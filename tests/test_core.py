@@ -25,7 +25,12 @@ from src.config.config_manager import (
     DEFAULT_SYNC_INTERVAL,
     DEFAULT_EXCLUSIONS,
 )
-from src.rclone.rclone_manager import RcloneManager, _extract_file_path, _human_size
+from src.rclone.rclone_manager import (
+    RcloneManager,
+    _extract_file_path,
+    _human_size,
+    _rclone_supports_resync_mode,
+)
 
 
 class TestConfigManager(unittest.TestCase):
@@ -209,6 +214,30 @@ class TestRcloneHelpers(unittest.TestCase):
     def test_human_size_gigabytes(self):
         """_human_size() should format gigabytes correctly."""
         self.assertIn("GB", _human_size(3 * 1024 * 1024 * 1024))
+
+    def test_rclone_supports_resync_mode_true_for_v1_64(self):
+        """_rclone_supports_resync_mode() should return True for rclone v1.64+."""
+        mock_cfg = MagicMock()
+        mock_cfg.get_rclone_version.return_value = "rclone v1.64.0"
+        self.assertTrue(_rclone_supports_resync_mode(mock_cfg))
+
+    def test_rclone_supports_resync_mode_true_for_v1_65(self):
+        """_rclone_supports_resync_mode() should return True for rclone v1.65."""
+        mock_cfg = MagicMock()
+        mock_cfg.get_rclone_version.return_value = "rclone v1.65.2"
+        self.assertTrue(_rclone_supports_resync_mode(mock_cfg))
+
+    def test_rclone_supports_resync_mode_false_for_v1_63(self):
+        """_rclone_supports_resync_mode() should return False for rclone v1.63."""
+        mock_cfg = MagicMock()
+        mock_cfg.get_rclone_version.return_value = "rclone v1.63.1"
+        self.assertFalse(_rclone_supports_resync_mode(mock_cfg))
+
+    def test_rclone_supports_resync_mode_false_when_version_unknown(self):
+        """_rclone_supports_resync_mode() should return False when version cannot be parsed."""
+        mock_cfg = MagicMock()
+        mock_cfg.get_rclone_version.return_value = "rclone not found"
+        self.assertFalse(_rclone_supports_resync_mode(mock_cfg))
 
 
 class TestRcloneManager(unittest.TestCase):
@@ -532,7 +561,8 @@ class TestRcloneManager(unittest.TestCase):
 
         self.rclone._run_rclone = fake_run_rclone
         svc = self.config.get_service("RMSvc")
-        self.rclone._do_bisync(svc)
+        with patch("src.rclone.rclone_manager._rclone_supports_resync_mode", return_value=True):
+            self.rclone._do_bisync(svc)
 
         cmd_entries = [m for _, m in logged if m.startswith("[CMD]")]
         self.assertEqual(len(cmd_entries), 2)
@@ -540,6 +570,31 @@ class TestRcloneManager(unittest.TestCase):
         self.assertIn("--resync", cmd_entries[1])
         self.assertIn("--resync-mode", cmd_entries[1])
         self.assertIn("newer", cmd_entries[1])
+
+    def test_do_bisync_resync_omits_resync_mode_on_old_rclone(self):
+        """_do_bisync() retry must NOT add --resync-mode when rclone < v1.64.
+
+        Older rclone versions respond with 'Fatal error: unknown flag: --resync-mode'
+        so we must skip the flag when the version check returns False.
+        """
+        self.config.add_service("OldSvc", "onedrive", "/tmp/old_test")
+        self.config.update_service("OldSvc", {"resync_mode": "newer"})
+        logged = []
+        self.rclone.on_error = lambda name, msg: logged.append((name, msg))
+
+        def fake_run_rclone(cmd, service_name, svc, is_retry=False):
+            return False  # Always fail to trigger the resync retry
+
+        self.rclone._run_rclone = fake_run_rclone
+        svc = self.config.get_service("OldSvc")
+        with patch("src.rclone.rclone_manager._rclone_supports_resync_mode", return_value=False):
+            self.rclone._do_bisync(svc)
+
+        cmd_entries = [m for _, m in logged if m.startswith("[CMD]")]
+        self.assertEqual(len(cmd_entries), 2)
+        # --resync must still be present but --resync-mode must be absent
+        self.assertIn("--resync", cmd_entries[1])
+        self.assertNotIn("--resync-mode", cmd_entries[1])
 
     def test_do_bisync_includes_verbose_when_enabled(self):
         """_do_bisync() should include --verbose in the command when verbose_sync=True."""

@@ -7,6 +7,7 @@ and stream output from rclone operations.
 
 import os
 import platform
+import re
 import shlex
 import subprocess
 import threading
@@ -24,6 +25,21 @@ _RCLONE_ERROR_KEYWORDS = ("ERROR", "FATAL", "Fatal error", "error:")
 def _rclone_base_args(config_manager: ConfigManager) -> List[str]:
     """Return the common rclone arguments including --config path."""
     return ["rclone", "--config", str(config_manager.rclone_config_path())]
+
+
+def _rclone_supports_resync_mode(config_manager: ConfigManager) -> bool:
+    """Return True if the installed rclone version supports --resync-mode (v1.64+).
+
+    ``--resync-mode`` was introduced in rclone v1.64.  On earlier versions the
+    flag is unknown and causes a fatal error.  When the version cannot be
+    determined we return False so the flag is safely omitted.
+    """
+    version_str = config_manager.get_rclone_version()
+    match = re.search(r"v(\d+)\.(\d+)", version_str)
+    if not match:
+        return False
+    major, minor = int(match.group(1)), int(match.group(2))
+    return (major, minor) >= (1, 64)
 
 
 class RcloneManager:
@@ -423,7 +439,9 @@ class RcloneManager:
 
         # Second attempt: bisync --resync if first attempt failed
         if not success:
-            cmd_resync = cmd + ["--resync", "--resync-mode", resync_mode]
+            cmd_resync = cmd + ["--resync"]
+            if _rclone_supports_resync_mode(self._config):
+                cmd_resync += ["--resync-mode", resync_mode]
             self._emit_error(name, "[CMD] " + shlex.join(cmd_resync))
             success = self._run_rclone(cmd_resync, name, svc, is_retry=True)
 
