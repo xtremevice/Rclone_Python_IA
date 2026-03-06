@@ -23,6 +23,8 @@ from typing import Callable, Dict, List, Optional
 
 from src.config.config_manager import PLATFORM_LABELS, ConfigManager
 from src.gui.tray_icon import TrayIcon
+from src.gui.elementary_indicator import ElementaryIndicator, is_elementary_os
+from src.gui.error_logger import ErrorLogger
 from src.rclone.rclone_manager import RcloneManager
 
 # Status string emitted by RcloneManager when no sync is running
@@ -57,6 +59,9 @@ class MainWindow:
         self._config = config_manager
         self._rclone = rclone_manager
 
+        # Application-wide error logger (loads previous session from disk)
+        self._error_logger = ErrorLogger()
+
         # Root Tk window
         self._root = tk.Tk()
         self._root.title("Rclone Manager")
@@ -67,7 +72,21 @@ class MainWindow:
 
         _center_window(self._root, height_pct=0.60, width_pct=0.20)
 
-        # System tray integration
+        # On Elementary OS, use a Wingpanel indicator (AppIndicator3) that is
+        # always visible while the app is running.  For all other systems, fall
+        # back to the pystray-based tray icon that appears only on minimise.
+        if is_elementary_os():
+            self._elementary = ElementaryIndicator(
+                on_show=self._restore_window,
+                on_quit=self._quit,
+            )
+            # Start immediately so the icon appears in Wingpanel right away.
+            if self._elementary.is_available():
+                self._elementary.start()
+        else:
+            self._elementary = None
+
+        # pystray tray icon — used on non-Elementary OS systems only.
         self._tray = TrayIcon(on_show=self._restore_window, on_quit=self._quit)
 
         # Intercept window close (×) to quit the app entirely
@@ -79,6 +98,7 @@ class MainWindow:
         # Register rclone callbacks
         self._rclone.on_status_change = self._on_status_change
         self._rclone.on_file_synced = self._on_file_synced
+        self._rclone.on_error = self._on_rclone_error
 
         # Per-service Listbox widgets: service_name → tk.Listbox
         self._file_lists: Dict[str, tk.Listbox] = {}
@@ -86,7 +106,9 @@ class MainWindow:
         self._status_vars: Dict[str, tk.StringVar] = {}
         # Per-service toggle-button StringVars (Detener / Sincronizar)
         self._toggle_vars: Dict[str, tk.StringVar] = {}
-        # Whether the tray icon has been started
+        # Per-service storage info StringVars (from rclone about)
+        self._storage_vars: Dict[str, tk.StringVar] = {}
+        # Whether the pystray tray icon has been started (non-Elementary only)
         self._tray_started = False
 
         self._notebook: Optional[ttk.Notebook] = None
@@ -149,10 +171,9 @@ class MainWindow:
         header = tk.Frame(tab_frame, bg="#f0f4fa", pady=8, padx=10)
         header.pack(fill=tk.X)
 
-        # Service name
+        # Row 0: Service name | Platform | Sync status | Interval | Add button
         tk.Label(header, text=name, font=("Segoe UI", 11, "bold"), bg="#f0f4fa").grid(row=0, column=0, sticky="w", padx=(0, 20))
 
-        # Platform
         tk.Label(header, text=f"Plataforma: {platform_label}", bg="#f0f4fa").grid(row=0, column=1, sticky="w", padx=(0, 20))
 
         # Sync status (dynamic)
@@ -173,6 +194,20 @@ class MainWindow:
             font=("Segoe UI", 9),
             cursor="hand2",
         ).grid(row=0, column=4, sticky="w", padx=(8, 0))
+
+        # Row 1: Storage quota info (fetched asynchronously via rclone about)
+        storage_var = tk.StringVar(value="💾 Total: 0  |  Usado: 0  |  Libre: 0")
+        self._storage_vars[name] = storage_var
+        tk.Label(
+            header,
+            textvariable=storage_var,
+            bg="#f0f4fa",
+            fg="#555555",
+            font=("Segoe UI", 9),
+        ).grid(row=1, column=0, columnspan=5, sticky="w", pady=(4, 0))
+
+        # Fetch storage quota in the background and update the label when ready
+        self._fetch_storage_info_async(name, storage_var)
 
         # ── File change list (60 % of window height) ──────────────────
         list_frame = tk.Frame(tab_frame)
@@ -213,9 +248,13 @@ class MainWindow:
             font=("Segoe UI", 9),
         ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=2, pady=4)
 
-        # Button 2: Stop / Start sync (label reflects current running state)
+        # Button 2: Stop / Start sync
+        # Initialise from the 'sync_enabled' flag rather than is_running()
+        # because services have not started yet when the tab is built
+        # (run() calls start_all() after __init__() finishes).
+        will_run = svc.get("sync_enabled", True)
         toggle_text = tk.StringVar(
-            value="⏹ Detener" if self._rclone.is_running(name) else "▶ Sincronizar"
+            value="⏹ Detener" if will_run else "▶ Sincronizar"
         )
         self._toggle_vars[name] = toggle_text
         tk.Button(
@@ -236,6 +275,31 @@ class MainWindow:
             bg="#e0e0e0",
             font=("Segoe UI", 9),
         ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=2, pady=4)
+
+    # ------------------------------------------------------------------
+    # Storage info helpers
+    # ------------------------------------------------------------------
+
+    def _fetch_storage_info_async(self, service_name: str, var: tk.StringVar) -> None:
+        """
+        Fetch cloud storage quota for *service_name* in a background thread
+        and update *var* on the main thread when the result is available.
+
+        Uses ``rclone about remote:`` which is supported by OneDrive, Google
+        Drive, Dropbox, Box, and pCloud.  For services that do not support
+        ``about`` (e.g. S3, SFTP), the default "💾 Total: 0 | ..." text is
+        left unchanged.
+        """
+        def _worker() -> None:
+            info = self._rclone.get_storage_info(service_name)
+            if info:
+                self._root.after(0, lambda: var.set(f"💾 {info}"))
+
+        threading.Thread(
+            target=_worker,
+            daemon=True,
+            name=f"about-{service_name}",
+        ).start()
 
     # ------------------------------------------------------------------
     # Actions
@@ -282,6 +346,10 @@ class MainWindow:
             text_var.set("▶ Sincronizar")
             self._config.update_service(service_name, {"sync_enabled": False})
         else:
+            # Clear any stale bisync lock files left by a previous interrupted
+            # sync before restarting, so bisync does not fail with "prior lock
+            # file found".
+            self._rclone.clear_bisync_locks(service_name)
             self._config.update_service(service_name, {"sync_enabled": True})
             self._rclone.start_service(service_name)
             text_var.set("⏹ Detener")
@@ -297,6 +365,7 @@ class MainWindow:
             service_name=service_name,
             on_saved=self._refresh_tabs,
             on_deleted=self._on_service_deleted,
+            error_logger=self._error_logger,
         )
 
     def _open_wizard(self) -> None:
@@ -318,20 +387,24 @@ class MainWindow:
         """
         Called when the window is iconified (minimized).
 
-        Hide the window and show the tray icon instead.
+        Hides the window.  On non-Elementary OS systems, also starts the
+        pystray tray icon so the user can restore the window from it.
+        On Elementary OS the Wingpanel indicator is already running and
+        visible, so no additional tray icon is needed.
         """
         # Only respond to the root window's Unmap event
         if event.widget is not self._root:
             return
         # Withdraw (hide) the window
         self._root.withdraw()
-        # Start the tray icon if not yet running
-        if not self._tray_started and self._tray.is_available():
-            self._tray.start()
-            self._tray_started = True
+        # On non-Elementary systems, start the pystray tray icon if not yet running
+        if self._elementary is None or not self._elementary.is_running():
+            if not self._tray_started and self._tray.is_available():
+                self._tray.start()
+                self._tray_started = True
 
     def _restore_window(self) -> None:
-        """Restore the main window from the tray (runs on tray thread → schedule on main)."""
+        """Restore the main window from the tray (runs on tray/indicator thread → schedule on main)."""
         self._root.after(0, self._do_restore)
 
     def _do_restore(self) -> None:
@@ -341,9 +414,12 @@ class MainWindow:
         self._root.focus_force()
 
     def _quit(self) -> None:
-        """Stop all sync threads, remove tray icon, and destroy the window."""
+        """Stop all sync threads, save error log, remove tray icon(s), and destroy the window."""
         self._rclone.stop_all()
+        self._error_logger.save_to_file()
         self._tray.stop()
+        if self._elementary is not None:
+            self._elementary.stop()
         self._root.destroy()
 
     # ------------------------------------------------------------------
@@ -369,8 +445,11 @@ class MainWindow:
                 toggle_var.set("▶ Sincronizar")
             else:
                 toggle_var.set("⏹ Detener")
-        # Also update the tray tooltip with aggregated status
-        self._tray.update_tooltip(f"Rclone Manager – {service_name}: {status}")
+        # Update tooltips in both tray implementations
+        tooltip = f"Rclone Manager – {service_name}: {status}"
+        self._tray.update_tooltip(tooltip)
+        if self._elementary is not None:
+            self._elementary.update_tooltip(tooltip)
 
     def _on_file_synced(self, service_name: str, file_path: str, synced: bool) -> None:
         """
@@ -378,6 +457,13 @@ class MainWindow:
         Schedules a Listbox update on the main thread.
         """
         self._root.after(0, lambda: self._add_file_entry(service_name, file_path, synced))
+
+    def _on_rclone_error(self, service_name: str, message: str) -> None:
+        """
+        Invoked by RcloneManager when an error occurs.
+        Logs the error via ErrorLogger (thread-safe: no UI update needed).
+        """
+        self._error_logger.log(service_name, message)
 
     def _add_file_entry(self, service_name: str, file_path: str, synced: bool) -> None:
         """Insert a new file entry into the service's Listbox (max 50 items)."""
@@ -407,6 +493,7 @@ class MainWindow:
         self._file_lists.clear()
         self._status_vars.clear()
         self._toggle_vars.clear()
+        self._storage_vars.clear()
         self._build_ui()
 
     def _on_service_added(self, service_name: str) -> None:
@@ -423,8 +510,9 @@ class MainWindow:
     # ------------------------------------------------------------------
 
     def run(self) -> None:
-        """Start all sync threads and enter the Tkinter main loop."""
+        """Start all sync threads and mount processes, then enter the Tkinter main loop."""
         self._rclone.start_all()
+        self._rclone.start_all_mounts()
         self._root.mainloop()
 
 
