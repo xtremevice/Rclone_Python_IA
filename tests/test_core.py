@@ -757,7 +757,12 @@ class TestRcloneManager(unittest.TestCase):
         self.assertEqual(result, [], "Entries from the app's own config must be excluded")
 
     def test_find_drive_id_returns_multiple_candidates(self):
-        """find_drive_id_in_known_configs() returns all matching sections across files."""
+        """find_drive_id_in_known_configs() returns all matching sections across files.
+
+        The search is NOT filtered by remote_name — it returns every section
+        from every candidate file that has both drive_id and drive_type, so the
+        caller can choose the best match.
+        """
         conf_a = Path(self._tmpdir) / "confA.conf"
         conf_b = Path(self._tmpdir) / "confB.conf"
         conf_a.write_text(
@@ -773,7 +778,9 @@ class TestRcloneManager(unittest.TestCase):
             "_candidate_rclone_configs",
             staticmethod(lambda: [conf_a, conf_b]),
         ):
-            result = self.rclone.find_drive_id_in_known_configs("any")
+            # Searching for "foo" still returns "bar" from conf_b because the
+            # search collects all sections with drive_id regardless of name.
+            result = self.rclone.find_drive_id_in_known_configs("foo")
         self.assertEqual(len(result), 2)
         drive_ids = {r["drive_id"] for r in result}
         self.assertEqual(drive_ids, {"AAA", "BBB"})

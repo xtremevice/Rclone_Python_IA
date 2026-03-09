@@ -640,7 +640,11 @@ class RcloneManager:
             if config_path.exists():
                 parser.read(str(config_path), encoding="utf-8")
             if not parser.has_section(remote_name):
-                return False, f"La sección '[{remote_name}]' no existe en rclone.conf."
+                # Only include the first 64 characters of remote_name in the
+                # message so an unusually long or unusual section name does not
+                # produce a confusing or very long error string for the user.
+                safe_name = remote_name[:64]
+                return False, f"La sección '[{safe_name}]' no existe en rclone.conf."
             parser.set(remote_name, "drive_id", drive_id)
             parser.set(remote_name, "drive_type", drive_type)
             config_path.parent.mkdir(parents=True, exist_ok=True)

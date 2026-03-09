@@ -977,10 +977,14 @@ class ConfigWindow:
             try:
                 idx = int(raw.strip()) - 1
             except ValueError:
-                self._reconnect_status_var.set("❌ Entrada no válida.")
+                self._reconnect_status_var.set(
+                    f"❌ Entrada no válida. Escribe un número entre 1 y {len(candidates)}."
+                )
                 return
             if idx < 0 or idx >= len(candidates):
-                self._reconnect_status_var.set("")
+                self._reconnect_status_var.set(
+                    f"❌ Número fuera de rango. Escribe un número entre 1 y {len(candidates)}."
+                )
                 return
             c = candidates[idx]
             self._apply_drive_id_patch(remote_name, c["drive_id"], c["drive_type"])
