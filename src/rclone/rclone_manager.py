@@ -656,6 +656,61 @@ class RcloneManager:
             return False, f"No se pudo actualizar la configuración: {exc}"
         return True, ""
 
+    # Terminal emulators tried in preference order when launching an interactive
+    # rclone configuration session.  Each tuple is (executable, argument-flag)
+    # where the flag precedes the shell command string.
+    _TERMINAL_CANDIDATES: "List[tuple[str, str]]" = [
+        ("xterm", "-e"),
+        ("gnome-terminal", "--"),
+        ("xfce4-terminal", "--command"),
+        ("konsole", "-e"),
+        ("lxterminal", "-e"),
+        ("rxvt", "-e"),
+    ]
+
+    def open_terminal_reconnect(self, remote_name: str) -> "tuple[bool, str]":
+        """Launch ``rclone config reconnect <remote>:`` inside a terminal emulator.
+
+        ``rclone config reconnect`` is the recommended way to fix a remote
+        that was created with an older rclone version and therefore lacks the
+        ``drive_id`` / ``drive_type`` fields required by newer releases.
+        Unlike ``rclone config create --auto-confirm``, *reconnect* presents
+        the full OAuth flow **including** the post-auth drive-selection
+        prompt, so ``drive_id`` is properly populated after the user
+        completes the authentication.
+
+        This method tries the terminal emulators listed in
+        ``_TERMINAL_CANDIDATES`` in order.  If none is found it returns the
+        shell command so the caller can display it to the user as a manual
+        step.
+
+        Returns
+        -------
+        ``(True, "")``
+            A terminal was launched successfully.
+        ``(False, command)``
+            No terminal emulator was available; *command* is the shell
+            command the user should run in their own terminal.
+        """
+        config_path = self._config.rclone_config_path()
+        cmd = (
+            f"rclone --config {shlex.quote(str(config_path))} "
+            f"config reconnect {shlex.quote(remote_name)}:"
+        )
+        for exe, flag in self._TERMINAL_CANDIDATES:
+            try:
+                subprocess.Popen(
+                    [exe, flag, cmd],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    close_fds=True,
+                )
+                return True, ""
+            except (FileNotFoundError, OSError):
+                continue
+        return False, cmd
+
     def get_disk_usage(self, service_name: str) -> str:
         """
         Return a human-readable string of local disk space used by the service.
@@ -968,8 +1023,10 @@ class RcloneManager:
                         service_name,
                         "⚠️ La configuración del remoto está desactualizada: "
                         "faltan los campos drive_id y drive_type. "
-                        "Ve a Configuración → panel de información → Reconectar "
-                        "para volver a autenticar el remoto con rclone.",
+                        "Ve a Configuración → panel de información → "
+                        "'Reconectar' para abrir un terminal con el comando "
+                        "de reconfiguración, o usa '🔎 Buscar drive_id' si ya "
+                        "tienes el valor en otro archivo de configuración.",
                     )
                 # Forward any rclone error / fatal output to the error log
                 if any(kw in line for kw in _RCLONE_ERROR_KEYWORDS):

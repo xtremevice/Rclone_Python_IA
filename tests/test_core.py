@@ -829,6 +829,67 @@ class TestRcloneManager(unittest.TestCase):
         self.assertEqual(parser.get("other", "client_id"), "CID")
 
     # ------------------------------------------------------------------
+    # open_terminal_reconnect tests
+    # ------------------------------------------------------------------
+
+    def test_open_terminal_reconnect_launches_first_available_terminal(self):
+        """open_terminal_reconnect() returns (True, '') when the first terminal is found."""
+        launched_with = []
+
+        def fake_popen(args, **kwargs):
+            if args[0] == "xterm":
+                launched_with.extend(args)
+                return MagicMock()
+            raise FileNotFoundError("not found")
+
+        with patch("subprocess.Popen", side_effect=fake_popen):
+            ok, cmd = self.rclone.open_terminal_reconnect("juan")
+
+        self.assertTrue(ok)
+        self.assertEqual(cmd, "")
+        # The first terminal tried must be xterm
+        self.assertEqual(launched_with[0], "xterm")
+        # The command must contain 'config reconnect' and the remote name
+        full_cmd = " ".join(launched_with)
+        self.assertIn("config reconnect", full_cmd)
+        self.assertIn("juan", full_cmd)
+
+    def test_open_terminal_reconnect_tries_fallback_terminal(self):
+        """open_terminal_reconnect() tries the next emulator if the first is absent."""
+        call_log = []
+
+        def fake_popen(args, **kwargs):
+            call_log.append(args[0])
+            if args[0] == "gnome-terminal":
+                return MagicMock()
+            raise FileNotFoundError("not found")
+
+        with patch("subprocess.Popen", side_effect=fake_popen):
+            ok, cmd = self.rclone.open_terminal_reconnect("juan")
+
+        self.assertTrue(ok)
+        self.assertEqual(cmd, "")
+        self.assertIn("xterm", call_log)
+        self.assertIn("gnome-terminal", call_log)
+
+    def test_open_terminal_reconnect_returns_false_when_no_terminal(self):
+        """open_terminal_reconnect() returns (False, cmd_str) when no terminal is found."""
+        with patch("subprocess.Popen", side_effect=FileNotFoundError("not found")):
+            ok, cmd = self.rclone.open_terminal_reconnect("juan")
+
+        self.assertFalse(ok)
+        self.assertIn("config reconnect", cmd)
+        self.assertIn("juan", cmd)
+
+    def test_open_terminal_reconnect_command_contains_config_path(self):
+        """The returned command includes the app's rclone.conf path."""
+        with patch("subprocess.Popen", side_effect=FileNotFoundError("not found")):
+            _, cmd = self.rclone.open_terminal_reconnect("myremote")
+
+        config_path = str(self.config.rclone_config_path())
+        self.assertIn(config_path, cmd)
+
+    # ------------------------------------------------------------------
     # Mega credential remote creation tests
     # ------------------------------------------------------------------
 

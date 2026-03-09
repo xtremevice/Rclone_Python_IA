@@ -16,7 +16,6 @@ Window size: 60 % of screen height × 35 % of screen width.
 
 import os
 import threading
-import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
 from typing import Callable, Dict, List, Optional
@@ -28,7 +27,7 @@ from src.config.config_manager import (
     ConfigManager,
 )
 from src.rclone.rclone_manager import RcloneManager
-from src.gui.setup_wizard import _center_window, _OAUTH_TIMEOUT_SECONDS
+from src.gui.setup_wizard import _center_window
 
 # Import type for annotation; avoid circular imports at runtime by using TYPE_CHECKING
 from typing import TYPE_CHECKING
@@ -849,9 +848,10 @@ class ConfigWindow:
             tk.Label(
                 p,
                 text=(
-                    "Si la sincronización falla con un error de configuración "
-                    "(p. ej. drive_id o drive_type ausentes), haz clic en "
-                    "'Reconectar' para volver a autenticar este remoto con rclone."
+                    "Si la sincronización falla con un error de drive_id o "
+                    "drive_type, haz clic en 'Reconectar' para abrir un terminal "
+                    "con el comando de reconfiguración. Sigue las instrucciones "
+                    "en el terminal para que rclone obtenga drive_id automáticamente."
                 ),
                 wraplength=450,
                 justify="left",
@@ -1004,78 +1004,76 @@ class ConfigWindow:
             self._reconnect_status_var.set(f"❌ Error al aplicar: {error}")
 
     def _start_reconnect(self) -> None:
-        """Re-run the OAuth flow for this service's remote in a background thread.
+        """Re-authenticate the remote via ``rclone config reconnect`` in a terminal.
 
-        This fixes a rclone.conf that is missing the ``drive_id`` and
-        ``drive_type`` fields that newer rclone versions require for
-        OneDrive/SharePoint remotes.  Calling ``rclone config create`` again
-        overwrites the remote section in rclone.conf with the full set of
-        fields after the user re-authenticates.
+        ``rclone config reconnect <remote>:`` is the correct command for
+        fixing a remote that lacks ``drive_id`` / ``drive_type``.  Unlike
+        ``rclone config create --auto-confirm`` (which skips the post-OAuth
+        drive-selection prompt), *reconnect* presents the full interactive
+        flow so that ``drive_id`` is properly written to rclone.conf.
+
+        This method tries to launch the command inside a terminal emulator.
+        If no emulator is found it displays the shell command in a dialog so
+        the user can run it manually in their own terminal.
         """
         remote_name = self._svc.get("remote_name", "")
-        platform = self._svc.get("platform", "")
-        if not remote_name or not platform:
+        if not remote_name:
             messagebox.showwarning(
                 "Datos insuficientes",
-                "No se pudo determinar el nombre o la plataforma del remoto.",
+                "No se pudo determinar el nombre del remoto.",
                 parent=self._win,
             )
             return
 
-        self._reconnect_btn.configure(state=tk.DISABLED, text="Reconectando…")
-        self._find_drive_id_btn.configure(state=tk.DISABLED)
-        self._reconnect_status_var.set("Abriendo el navegador para autenticación…")
+        launched, cmd = self._rclone.open_terminal_reconnect(remote_name)
+        if launched:
+            self._reconnect_status_var.set(
+                "✅ Terminal abierto — autentica el remoto y sigue las "
+                "instrucciones que aparecen en él. Reinicia la "
+                "sincronización cuando termines."
+            )
+        else:
+            # No terminal emulator found: show the command for the user to run.
+            self._show_reconnect_command_dialog(cmd)
+            self._reconnect_status_var.set(
+                "No se encontró un emulador de terminal. "
+                "Ejecuta el comando mostrado en tu terminal."
+            )
 
-        # Keys that must be present before we consider auth complete.
-        # OneDrive requires drive_id (written after the token) so that bisync
-        # has a fully-configured remote and does not fail with exit-code 1.
-        extra_keys: "tuple[str, ...]" = (
-            ("drive_id",) if platform == "onedrive" else ()
-        )
+    def _show_reconnect_command_dialog(self, cmd: str) -> None:
+        """Show a dialog with the reconnect command for the user to copy."""
+        dialog = tk.Toplevel(self._win)
+        dialog.title("Ejecutar en terminal")
+        dialog.resizable(False, False)
+        _center_window(dialog, self._win)
 
-        def run_reconnect() -> None:
-            proc = self._rclone.open_browser_auth(remote_name, platform)
+        tk.Label(
+            dialog,
+            text=(
+                "No se encontró un emulador de terminal instalado.\n"
+                "Copia y ejecuta el siguiente comando en tu terminal:"
+            ),
+            wraplength=500,
+            justify="left",
+            pady=8,
+            padx=12,
+        ).pack(anchor="w")
 
-            deadline = time.monotonic() + _OAUTH_TIMEOUT_SECONDS
-            success = False
-            while time.monotonic() < deadline:
-                ret = proc.poll()
-                if ret is not None:
-                    success = ret == 0
-                    break
-                if self._rclone.remote_has_token(remote_name, extra_required_keys=extra_keys):
-                    time.sleep(0.5)
-                    try:
-                        proc.terminate()
-                    except OSError:
-                        pass
-                    success = True
-                    break
-                time.sleep(1)
-            else:
-                try:
-                    proc.terminate()
-                except OSError:
-                    pass
+        cmd_var = tk.StringVar(value=cmd)
+        entry = tk.Entry(dialog, textvariable=cmd_var, width=70, state="readonly")
+        entry.pack(padx=12, pady=(0, 8), fill=tk.X)
 
-            if success:
-                self._win.after(0, self._reconnect_success)
-            else:
-                self._win.after(0, self._reconnect_failed)
+        def copy_cmd() -> None:
+            dialog.clipboard_clear()
+            dialog.clipboard_append(cmd)
+            copy_btn.configure(text="✅ Copiado")
+            dialog.after(1500, lambda: copy_btn.configure(text="📋 Copiar"))
 
-        threading.Thread(target=run_reconnect, daemon=True).start()
-
-    def _reconnect_success(self) -> None:
-        """Called on the main thread after successful re-authentication."""
-        self._reconnect_status_var.set("✅ Reconexión completada. Reinicia la sincronización.")
-        self._reconnect_btn.configure(state=tk.NORMAL, text="🔄 Reconectar")
-        self._find_drive_id_btn.configure(state=tk.NORMAL)
-
-    def _reconnect_failed(self) -> None:
-        """Called on the main thread if re-authentication failed or timed out."""
-        self._reconnect_status_var.set("❌ La autenticación falló o superó el tiempo límite. Intenta de nuevo.")
-        self._reconnect_btn.configure(state=tk.NORMAL, text="🔄 Reconectar")
-        self._find_drive_id_btn.configure(state=tk.NORMAL)
+        btn_row = tk.Frame(dialog)
+        btn_row.pack(padx=12, pady=(0, 12))
+        copy_btn = tk.Button(btn_row, text="📋 Copiar", command=copy_cmd)
+        copy_btn.pack(side=tk.LEFT, padx=(0, 8))
+        tk.Button(btn_row, text="Cerrar", command=dialog.destroy).pack(side=tk.LEFT)
 
     # ------------------------------------------------------------------
     # Panel 8 – Errors
