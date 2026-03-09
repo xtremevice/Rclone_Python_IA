@@ -99,6 +99,7 @@ class MainWindow:
         self._rclone.on_status_change = self._on_status_change
         self._rclone.on_file_synced = self._on_file_synced
         self._rclone.on_error = self._on_rclone_error
+        self._rclone.on_drive_id_error = self._on_drive_id_error
 
         # Per-service Listbox widgets: service_name → tk.Listbox
         self._file_lists: Dict[str, tk.Listbox] = {}
@@ -108,6 +109,9 @@ class MainWindow:
         self._toggle_vars: Dict[str, tk.StringVar] = {}
         # Per-service storage info StringVars (from rclone about)
         self._storage_vars: Dict[str, tk.StringVar] = {}
+        # Per-service drive_id error banner frames (shown when bisync detects
+        # a missing drive_id/drive_type in rclone.conf)
+        self._drive_id_banners: Dict[str, tk.Frame] = {}
         # Whether the pystray tray icon has been started (non-Elementary only)
         self._tray_started = False
 
@@ -234,6 +238,41 @@ class MainWindow:
 
         # Fetch storage quota in the background and update the label when ready
         self._fetch_storage_info_async(name, storage_var)
+
+        # ── Drive-ID error banner (hidden until a drive_id error is detected) ──
+        # Uses a yellow background to stand out and includes a direct button
+        # to open the "Información del servicio" panel where the user can
+        # run 'Reconectar' or 'Buscar drive_id' to fix the configuration.
+        # Colours: #fff3cd background with #4d3800 text gives ~7.5:1 contrast
+        # ratio (WCAG AA compliant for normal and large text).
+        drive_id_banner = tk.Frame(tab_frame, bg="#fff3cd", bd=1, relief=tk.SOLID)
+        # The banner is not packed initially — _show_drive_id_banner() will
+        # pack it (before the file list) when needed.
+        tk.Label(
+            drive_id_banner,
+            text=(
+                "⚠️  Falta drive_id en la configuración del remoto.  "
+                "La sincronización no puede continuar."
+            ),
+            bg="#fff3cd",
+            fg="#4d3800",
+            font=("Segoe UI", 9, "bold"),
+            wraplength=400,
+            justify="left",
+        ).pack(side=tk.LEFT, padx=(8, 4), pady=6, fill=tk.X, expand=True)
+        tk.Button(
+            drive_id_banner,
+            text="🔧 Reconfigurar ahora",
+            command=lambda n=name: self._open_config_at_info(n),
+            relief=tk.FLAT,
+            bg="#e6a817",
+            fg="white",
+            font=("Segoe UI", 9, "bold"),
+            cursor="hand2",
+            padx=8,
+            pady=4,
+        ).pack(side=tk.RIGHT, padx=8, pady=6)
+        self._drive_id_banners[name] = drive_id_banner
 
         # ── File change list (60 % of window height) ──────────────────
         list_frame = tk.Frame(tab_frame)
@@ -394,6 +433,27 @@ class MainWindow:
             error_logger=self._error_logger,
         )
 
+    def _open_config_at_info(self, service_name: str) -> None:
+        """Open the configuration window at the 'Información del servicio' panel.
+
+        Uses the ``INFO_PANEL_INDEX`` constant exported by ``config_window`` so
+        that the panel index stays in sync with the sidebar menu definition.
+        The info panel contains the 'Reconectar' and 'Buscar drive_id' buttons
+        for fixing a missing drive_id/drive_type configuration error.
+        """
+        from src.gui.config_window import ConfigWindow, INFO_PANEL_INDEX
+
+        ConfigWindow(
+            parent=self._root,
+            config_manager=self._config,
+            rclone_manager=self._rclone,
+            service_name=service_name,
+            on_saved=self._refresh_tabs,
+            on_deleted=self._on_service_deleted,
+            error_logger=self._error_logger,
+            initial_panel=INFO_PANEL_INDEX,
+        )
+
     def _open_wizard(self) -> None:
         """Launch the add-new-service wizard."""
         from src.gui.setup_wizard import SetupWizard
@@ -501,6 +561,30 @@ class MainWindow:
         Logs the error via ErrorLogger (thread-safe: no UI update needed).
         """
         self._error_logger.log(service_name, message)
+
+    def _on_drive_id_error(self, service_name: str) -> None:
+        """
+        Invoked by RcloneManager when a drive_id/drive_type missing error is
+        detected in bisync output.  Schedules showing a warning banner on the
+        main thread so the user can fix the configuration immediately.
+        """
+        self._root.after(0, lambda: self._show_drive_id_banner(service_name))
+
+    def _show_drive_id_banner(self, service_name: str) -> None:
+        """Make the drive_id error banner visible in the service's tab.
+
+        The banner was created (hidden) by ``_add_service_tab``; this method
+        packs it so it appears between the header and the file list.  Calling
+        it repeatedly is safe — the banner is only packed once.
+        """
+        banner = self._drive_id_banners.get(service_name)
+        if banner is None:
+            return
+        try:
+            if not banner.winfo_ismapped():
+                banner.pack(fill=tk.X, padx=4, pady=(2, 0))
+        except tk.TclError:
+            pass
 
     def _add_file_entry(self, service_name: str, file_path: str, synced: bool) -> None:
         """Insert a new file entry into the service's Listbox (max 50 items)."""

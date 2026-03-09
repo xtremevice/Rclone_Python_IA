@@ -650,6 +650,56 @@ class TestRcloneManager(unittest.TestCase):
         # Service must be flagged
         self.assertIn("DriveIdSvc2", self.rclone._config_error_services)
 
+    def test_run_rclone_fires_on_drive_id_error_callback(self):
+        """on_drive_id_error callback must be called exactly once when the
+        drive_id missing phrase is detected in rclone output."""
+        import io
+        fired_for = []
+        self.rclone.on_drive_id_error = lambda name: fired_for.append(name)
+
+        fake_output = (
+            f'Failed to create file system for "svc:/": '
+            f'{_DRIVE_ID_MISSING_PHRASE} - if you are upgrading from older '
+            f'versions of rclone, please run `rclone config`\n'
+        )
+
+        class FakeProc:
+            returncode = 1
+            stdout = io.StringIO(fake_output)
+            def wait(self): pass
+
+        with patch("subprocess.Popen", return_value=FakeProc()):
+            self.rclone._run_rclone(["rclone", "bisync"], "DriveIdCbSvc", {})
+
+        self.assertEqual(
+            fired_for,
+            ["DriveIdCbSvc"],
+            "on_drive_id_error must be called once with the correct service name",
+        )
+
+    def test_on_drive_id_error_callback_not_fired_for_normal_error(self):
+        """on_drive_id_error must NOT be called when rclone emits a normal error
+        that does not contain the drive_id missing phrase."""
+        import io
+        fired_for = []
+        self.rclone.on_drive_id_error = lambda name: fired_for.append(name)
+
+        fake_output = "ERROR : Failed to copy file: network timeout\n"
+
+        class FakeProc:
+            returncode = 1
+            stdout = io.StringIO(fake_output)
+            def wait(self): pass
+
+        with patch("subprocess.Popen", return_value=FakeProc()):
+            self.rclone._run_rclone(["rclone", "bisync"], "NormalErrSvc", {})
+
+        self.assertEqual(
+            fired_for,
+            [],
+            "on_drive_id_error must not fire for errors unrelated to drive_id",
+        )
+
     def test_do_bisync_skips_resync_retry_on_drive_id_config_error(self):
         """_do_bisync() must NOT retry with --resync when the failure is caused by
         a missing drive_id/drive_type configuration error.

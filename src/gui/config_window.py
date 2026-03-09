@@ -49,6 +49,11 @@ INTERVAL_OPTIONS: Dict[str, int] = {
     "24 horas": 86400,
 }
 
+# Index of the "Información del servicio" panel in ConfigWindow._show_panel().
+# Used by MainWindow._open_config_at_info() to land the user directly on the
+# panel that contains the 'Reconectar' and 'Buscar drive_id' buttons.
+INFO_PANEL_INDEX: int = 6
+
 
 class ConfigWindow:
     """
@@ -67,6 +72,7 @@ class ConfigWindow:
         on_saved: Optional[Callable[[], None]] = None,
         on_deleted: Optional[Callable[[str], None]] = None,
         error_logger: Optional["ErrorLogger"] = None,
+        initial_panel: int = 0,
     ) -> None:
         # Store references
         self._config = config_manager
@@ -100,8 +106,8 @@ class ConfigWindow:
         self._remote_tree_cache: List[Dict] = []
 
         self._build_layout()
-        # Show the first panel by default
-        self._show_panel(0)
+        # Show the requested panel (default: panel 0 – configuration)
+        self._show_panel(initial_panel)
 
         # Kick off a background tree fetch immediately so the data is likely
         # ready by the time the user navigates to Panel 4.

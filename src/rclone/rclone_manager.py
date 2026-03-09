@@ -146,6 +146,10 @@ class RcloneManager:
         self.on_file_synced: Optional[Callable[[str, str, bool], None]] = None
         # Optional callback(service_name, error_message) called on sync errors
         self.on_error: Optional[Callable[[str, str], None]] = None
+        # Optional callback(service_name) fired when a drive_id/drive_type
+        # configuration error is detected in bisync output.  The UI registers
+        # this to surface an in-tab "fix now" action for the user.
+        self.on_drive_id_error: Optional[Callable[[str], None]] = None
 
     # ------------------------------------------------------------------
     # Public API
@@ -1028,6 +1032,8 @@ class RcloneManager:
                         "de reconfiguración, o usa '🔎 Buscar drive_id' si ya "
                         "tienes el valor en otro archivo de configuración.",
                     )
+                    # Notify the UI so it can surface an in-tab "fix" action.
+                    self._emit_drive_id_error(service_name)
                 # Forward any rclone error / fatal output to the error log
                 if any(kw in line for kw in _RCLONE_ERROR_KEYWORDS):
                     self._emit_error(service_name, line)
@@ -1069,6 +1075,14 @@ class RcloneManager:
         if self.on_error:
             try:
                 self.on_error(service_name, message)
+            except Exception:
+                pass
+
+    def _emit_drive_id_error(self, service_name: str) -> None:
+        """Fire the on_drive_id_error callback if registered."""
+        if self.on_drive_id_error:
+            try:
+                self.on_drive_id_error(service_name)
             except Exception:
                 pass
 
