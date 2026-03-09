@@ -435,6 +435,52 @@ class TestRcloneManager(unittest.TestCase):
         self.assertEqual(len(cmd_entries), 2, "Expected two [CMD] entries (initial + resync)")
         self.assertIn("--resync", cmd_entries[1][1])
 
+    def test_do_bisync_includes_acknowledge_abuse_for_drive(self):
+        """_do_bisync() must include --drive-acknowledge-abuse for Google Drive services.
+
+        Google Drive occasionally returns HTTP 403 cannotDownloadAbusiveFile for
+        files it has flagged as malware or spam.  Without this flag rclone (and
+        therefore bisync) fails with a critical error even though the file is
+        just a normal project artefact.  Adding the flag lets rclone proceed.
+        """
+        self.config.add_service("DriveSvc", "drive", "/tmp/drive_test")
+        captured_cmds = []
+
+        def fake_run_rclone(cmd, service_name, svc, is_retry=False):
+            captured_cmds.append(cmd)
+            return True
+
+        self.rclone._run_rclone = fake_run_rclone
+        svc = self.config.get_service("DriveSvc")
+        self.rclone._do_bisync(svc)
+
+        self.assertTrue(len(captured_cmds) > 0)
+        self.assertIn(
+            "--drive-acknowledge-abuse",
+            captured_cmds[0],
+            "--drive-acknowledge-abuse must be present in bisync command for drive platform",
+        )
+
+    def test_do_bisync_no_acknowledge_abuse_for_other_platforms(self):
+        """_do_bisync() must NOT include --drive-acknowledge-abuse for non-Drive platforms."""
+        self.config.add_service("OneDriveSvc", "onedrive", "/tmp/od_test")
+        captured_cmds = []
+
+        def fake_run_rclone(cmd, service_name, svc, is_retry=False):
+            captured_cmds.append(cmd)
+            return True
+
+        self.rclone._run_rclone = fake_run_rclone
+        svc = self.config.get_service("OneDriveSvc")
+        self.rclone._do_bisync(svc)
+
+        self.assertTrue(len(captured_cmds) > 0)
+        self.assertNotIn(
+            "--drive-acknowledge-abuse",
+            captured_cmds[0],
+            "--drive-acknowledge-abuse must NOT appear for non-drive platforms",
+        )
+
     def test_run_rclone_emits_error_lines_from_output(self):
         """_run_rclone() should emit lines containing 'ERROR' via on_error."""
         import io

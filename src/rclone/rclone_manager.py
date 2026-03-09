@@ -582,6 +582,12 @@ class RcloneManager:
             "--buffer-size", "64M",
             "-P",
         ]
+        # Google Drive may flag some files as malware/spam and return HTTP 403
+        # (cannotDownloadAbusiveFile).  This flag tells rclone to acknowledge
+        # the warning and download the file anyway, preventing bisync from
+        # failing due to files outside the user's control.
+        if svc.get("platform") == "drive":
+            perf_args.append("--drive-acknowledge-abuse")
         # Optional verbose output
         if svc.get("verbose_sync", False):
             perf_args.append("--verbose")
