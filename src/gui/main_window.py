@@ -440,6 +440,11 @@ class MainWindow:
         that the panel index stays in sync with the sidebar menu definition.
         The info panel contains the 'Reconectar' and 'Buscar drive_id' buttons
         for fixing a missing drive_id/drive_type configuration error.
+
+        When the user saves the configuration after fixing the error, the sync
+        for the service is automatically started (so no manual click is needed),
+        and the drive_id error banner is hidden once the first successful bisync
+        cycle completes (status → "Actualizado").
         """
         from src.gui.config_window import ConfigWindow, INFO_PANEL_INDEX
 
@@ -448,11 +453,34 @@ class MainWindow:
             config_manager=self._config,
             rclone_manager=self._rclone,
             service_name=service_name,
-            on_saved=self._refresh_tabs,
+            on_saved=lambda: self._on_config_fixed_start_sync(service_name),
             on_deleted=self._on_service_deleted,
             error_logger=self._error_logger,
             initial_panel=INFO_PANEL_INDEX,
         )
+
+    def _on_config_fixed_start_sync(self, service_name: str) -> None:
+        """Called after the user saves config from the drive_id reconfigure flow.
+
+        Rebuilds the tabs (picks up the newly written drive_id/drive_type values)
+        and then immediately starts the sync for *service_name* so the user does
+        not have to click the sync button manually.
+
+        Ordering note: ``update_service`` writes synchronously to the in-memory
+        config dict (and to disk) before ``start_service`` spawns the background
+        thread, so the thread will always read the updated ``sync_enabled`` flag
+        when ``_sync_loop`` calls ``get_service()``.  There is no race condition.
+        The toggle button is kept in sync by the "Iniciando…" status callback
+        that ``_sync_loop`` emits as its very first action, which calls
+        ``_update_status`` → sets button to "⏹ Detener".
+        """
+        self._refresh_tabs()
+        # Mark the service as enabled and start the background sync loop.
+        # clear_bisync_locks removes any stale .lck / .lst-new files that may
+        # have been left by the previous failed attempt.
+        self._rclone.clear_bisync_locks(service_name)
+        self._config.update_service(service_name, {"sync_enabled": True})
+        self._rclone.start_service(service_name)
 
     def _open_wizard(self) -> None:
         """Launch the add-new-service wizard."""
@@ -542,6 +570,10 @@ class MainWindow:
                 toggle_var.set("▶ Sincronizar")
             else:
                 toggle_var.set("⏹ Detener")
+        # A successful bisync cycle means the drive_id error (if it was shown)
+        # is now resolved — hide the warning banner automatically.
+        if status == "Actualizado":
+            self._hide_drive_id_banner(service_name)
         # Update tooltips in both tray implementations
         tooltip = f"Rclone Manager – {service_name}: {status}"
         self._tray.update_tooltip(tooltip)
@@ -586,6 +618,22 @@ class MainWindow:
         except tk.TclError:
             pass
 
+    def _hide_drive_id_banner(self, service_name: str) -> None:
+        """Hide the drive_id error banner for the given service (if visible).
+
+        Called automatically by ``_update_status`` when a bisync cycle
+        completes successfully (status → "Actualizado"), confirming that the
+        configuration problem has been resolved.
+        """
+        banner = self._drive_id_banners.get(service_name)
+        if banner is None:
+            return
+        try:
+            if banner.winfo_ismapped():
+                banner.pack_forget()
+        except tk.TclError:
+            pass
+
     def _add_file_entry(self, service_name: str, file_path: str, synced: bool) -> None:
         """Insert a new file entry into the service's Listbox (max 50 items)."""
         import datetime
@@ -615,6 +663,9 @@ class MainWindow:
         self._status_vars.clear()
         self._toggle_vars.clear()
         self._storage_vars.clear()
+        # Banner widgets are destroyed along with their parent frames above;
+        # clear the dict so _add_service_tab can repopulate it with fresh widgets.
+        self._drive_id_banners.clear()
         self._build_ui()
 
     def _on_service_added(self, service_name: str) -> None:
