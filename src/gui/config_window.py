@@ -926,7 +926,7 @@ class ConfigWindow:
             return
 
         if self._error_logger is not None:
-            content = self._error_logger.get_all_text()
+            content = self._error_logger.get_text_for_service(self._service_name)
         else:
             content = "(Registro de errores no disponible)"
 

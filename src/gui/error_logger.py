@@ -77,6 +77,26 @@ class ErrorLogger:
         """Return all log entries joined by newlines (newest first)."""
         return "\n".join(self._entries)
 
+    def get_text_for_service(self, service_name: str) -> str:
+        """Return only the entries that belong to *service_name* (case-insensitive).
+
+        Entries follow the format ``[YYYY-MM-DD HH:MM:SS] [service_name] msg``.
+        The comparison is case-insensitive so that a remote whose name was
+        capitalised differently at different points in time (e.g. ``[Juan]``
+        vs ``[juan]``) is still matched correctly.
+
+        The bracket delimiters (``] [service_name] ``) ensure an exact service
+        name match — a service named ``api`` will not match ``api-gateway``.
+        """
+        # Build the exact bracket-delimited tag we look for, e.g. "] [juan] "
+        tag_lower = f"] [{service_name.lower()}] "
+        filtered = [
+            entry
+            for entry in self._entries
+            if tag_lower in entry.lower()
+        ]
+        return "\n".join(filtered)
+
     def clear(self) -> None:
         """Clear all in-memory entries."""
         self._entries = []
