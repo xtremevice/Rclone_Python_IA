@@ -263,6 +263,26 @@ class ConfigWindow:
         self._verbose_sync_var = tk.BooleanVar(value=self._svc.get("verbose_sync", False))
         tk.Checkbutton(p, text="Activar --verbose en sincronización (más detalles en el registro)", variable=self._verbose_sync_var).pack(anchor="w", pady=5)
 
+        # --- Delete service ---
+        ttk.Separator(p, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=(20, 10))
+        tk.Button(
+            p,
+            text="🗑️  Eliminar este servicio",
+            command=self._confirm_delete,
+            bg="#c50f1f",
+            fg="white",
+            font=("Segoe UI", 10),
+            relief=tk.FLAT,
+            padx=10,
+            pady=6,
+        ).pack(anchor="w", pady=(0, 4))
+        tk.Label(
+            p,
+            text="Elimina la configuración de este servicio. Los archivos locales no se borrarán.",
+            fg="gray",
+            font=("Segoe UI", 9),
+        ).pack(anchor="w")
+
     def _browse_cache_dir(self) -> None:
         """Open folder picker to select a custom VFS cache directory."""
         current = self._cache_dir_var.get().strip() or os.path.expanduser("~")
