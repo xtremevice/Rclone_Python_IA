@@ -5,6 +5,7 @@ Unit tests for the core modules: ConfigManager, RcloneManager.
 Run with:  python3 -m pytest tests/test_core.py -v
 """
 
+import configparser
 import json
 import os
 import sys
@@ -842,27 +843,22 @@ class TestRcloneManager(unittest.TestCase):
         self.assertFalse(svc["verbose_sync"])
 
     def test_import_remote_success(self):
-        """import_remote() should call rclone config create and return (True, '')."""
-        completed = MagicMock()
-        completed.returncode = 0
-        completed.stderr = ""
-        completed.stdout = ""
-
-        with patch("subprocess.run", return_value=completed) as mock_run:
-            ok, err = self.rclone.import_remote(
-                remote_name="mygdrive",
-                new_name="MyGoogleDrive",
-                remote_data={"type": "drive", "client_id": "abc123"},
-            )
+        """import_remote() writes the remote section to the rclone config and returns (True, '')."""
+        ok, err = self.rclone.import_remote(
+            remote_name="mygdrive",
+            new_name="MyGoogleDrive",
+            remote_data={"type": "drive", "client_id": "abc123", "token": '{"access_token":"tok"}'},
+        )
 
         self.assertTrue(ok)
         self.assertEqual(err, "")
-        args_called = mock_run.call_args[0][0]
-        self.assertIn("config", args_called)
-        self.assertIn("create", args_called)
-        self.assertIn("MyGoogleDrive", args_called)
-        self.assertIn("drive", args_called)
-        self.assertIn("client_id=abc123", args_called)
+
+        # Verify the section was actually written to the rclone config file
+        parser = configparser.RawConfigParser()
+        parser.read(str(self.config.rclone_config_path()), encoding="utf-8")
+        self.assertIn("MyGoogleDrive", parser.sections())
+        self.assertEqual(parser.get("MyGoogleDrive", "type"), "drive")
+        self.assertEqual(parser.get("MyGoogleDrive", "client_id"), "abc123")
 
     def test_import_remote_missing_type_returns_error(self):
         """import_remote() should return (False, ...) when the remote has no type."""
@@ -874,44 +870,37 @@ class TestRcloneManager(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("type", err)
 
-    def test_import_remote_rclone_failure(self):
-        """import_remote() should return (False, ...) when rclone exits non-zero."""
-        failed = MagicMock()
-        failed.returncode = 1
-        failed.stderr = "rclone: unknown type 'badtype'"
-        failed.stdout = ""
+    def test_import_remote_overwrites_existing_section(self):
+        """import_remote() should overwrite a section that already exists."""
+        # First import
+        self.rclone.import_remote(
+            remote_name="r",
+            new_name="MyRemote",
+            remote_data={"type": "s3", "provider": "AWS"},
+        )
+        # Second import with different provider
+        ok, err = self.rclone.import_remote(
+            remote_name="r2",
+            new_name="MyRemote",
+            remote_data={"type": "s3", "provider": "Minio"},
+        )
+        self.assertTrue(ok)
+        parser = configparser.RawConfigParser()
+        parser.read(str(self.config.rclone_config_path()), encoding="utf-8")
+        self.assertEqual(parser.get("MyRemote", "provider"), "Minio")
 
-        with patch("subprocess.run", return_value=failed):
-            ok, err = self.rclone.import_remote(
-                remote_name="r",
-                new_name="R",
-                remote_data={"type": "badtype"},
-            )
-
-        self.assertFalse(ok)
-        self.assertIn("badtype", err)
-
-    def test_import_remote_excludes_type_from_extra_args(self):
-        """import_remote() must not duplicate 'type' as a key=value extra arg."""
-        completed = MagicMock()
-        completed.returncode = 0
-        completed.stderr = ""
-        completed.stdout = ""
-
-        with patch("subprocess.run", return_value=completed) as mock_run:
-            self.rclone.import_remote(
-                remote_name="src",
-                new_name="dst",
-                remote_data={"type": "s3", "provider": "AWS"},
-            )
-
-        args_called = mock_run.call_args[0][0]
-        # 'type' must NOT appear as a 'type=...' extra arg
-        self.assertNotIn("type=s3", args_called)
-        # 'type' is passed positionally — it must still be present
-        self.assertIn("s3", args_called)
-        # extra key=value pair must be present
-        self.assertIn("provider=AWS", args_called)
+    def test_import_remote_preserves_token(self):
+        """import_remote() must write the token field unchanged (no re-auth)."""
+        token_json = '{"access_token":"mytoken","expiry":"2099-01-01T00:00:00Z"}'
+        ok, _ = self.rclone.import_remote(
+            remote_name="src",
+            new_name="dst",
+            remote_data={"type": "onedrive", "token": token_json},
+        )
+        self.assertTrue(ok)
+        parser = configparser.RawConfigParser()
+        parser.read(str(self.config.rclone_config_path()), encoding="utf-8")
+        self.assertEqual(parser.get("dst", "token"), token_json)
 
 
 class TestBisyncLockCleanup(unittest.TestCase):

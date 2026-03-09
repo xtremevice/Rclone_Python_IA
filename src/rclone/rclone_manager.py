@@ -5,6 +5,7 @@ Provides methods to configure remotes, run bisync, check mount status,
 and stream output from rclone operations.
 """
 
+import configparser
 import os
 import platform
 import re
@@ -425,13 +426,18 @@ class RcloneManager:
         """
         Import a remote from an external rclone config into the app's own config.
 
+        Credentials (tokens, client_id, etc.) are written **directly** into the
+        app's rclone.conf via ``configparser`` so that already-authenticated
+        remotes keep their stored tokens without triggering a new OAuth browser
+        flow.
+
         Parameters
         ----------
         remote_name:
             Original name of the remote in the source config (used only for
             error messages).
         new_name:
-            Name to register in the app's own rclone config.
+            Section name to register in the app's own rclone config.
         remote_data:
             ``{key: value}`` pairs from the remote's INI section, **including**
             the mandatory ``type`` key.
@@ -444,33 +450,32 @@ class RcloneManager:
         if not remote_type:
             return False, f"El remote '{remote_name}' no tiene un campo 'type' válido."
 
-        # Build extra key=value args (everything except 'type', which is positional)
-        extra_args = [
-            f"{k}={v}"
-            for k, v in remote_data.items()
-            if k != "type"
-        ]
+        dest_path = self._config.rclone_config_path()
 
-        args = (
-            _rclone_base_args(self._config)
-            + ["config", "create", new_name, remote_type]
-            + extra_args
-        )
         try:
-            result = subprocess.run(
-                args,
-                capture_output=True,
-                text=True,
-                timeout=30,
-            )
-        except OSError as exc:
-            return False, f"rclone no encontrado: {exc}"
-        except subprocess.TimeoutExpired:
-            return False, "rclone config create superó el tiempo de espera."
+            # Load existing config (creates an empty parser if the file is new)
+            parser = configparser.RawConfigParser()
+            if dest_path.exists():
+                parser.read(str(dest_path), encoding="utf-8")
 
-        if result.returncode != 0:
-            detail = result.stderr.strip() or result.stdout.strip()
-            return False, detail or f"rclone config create falló (código {result.returncode})."
+            # Overwrite or add the target section
+            if parser.has_section(new_name):
+                parser.remove_section(new_name)
+            parser.add_section(new_name)
+            for key, value in remote_data.items():
+                parser.set(new_name, key, value)
+
+            # Ensure the parent directory exists
+            dest_path.parent.mkdir(parents=True, exist_ok=True)
+
+            # Write atomically: write to a temp file then rename
+            tmp_path = dest_path.with_suffix(".conf.tmp")
+            with tmp_path.open("w", encoding="utf-8") as fh:
+                parser.write(fh)
+            tmp_path.replace(dest_path)
+        except OSError as exc:
+            return False, f"No se pudo escribir la configuración: {exc}"
+
         return True, ""
 
     def delete_remote(self, remote_name: str) -> bool:
