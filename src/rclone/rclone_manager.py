@@ -536,6 +536,122 @@ class RcloneManager:
         except (OSError, subprocess.TimeoutExpired):
             return False
 
+    # ── Drive-ID quick-fix helpers ───────────────────────────────────────
+
+    @staticmethod
+    def _candidate_rclone_configs() -> List[Path]:
+        """Return a list of well-known rclone config paths to search for drive_id.
+
+        Includes:
+          - The standard rclone default config (~/.config/rclone/rclone.conf)
+          - Flatpak sandboxes for popular GUI rclone front-ends
+          - Any extra locations from the RCLONE_CONFIG environment variable
+        """
+        home = Path.home()
+        candidates: List[Path] = [
+            # Standard rclone location
+            home / ".config" / "rclone" / "rclone.conf",
+            # Flatpak: rclone-manager (io.github.zarestia_dev.rclone-manager)
+            home / ".var" / "app" / "io.github.zarestia_dev.rclone-manager"
+                  / "config" / "rclone" / "rclone.conf",
+            # Flatpak: RcloneUI (com.rcloneui.RcloneUI)
+            home / ".var" / "app" / "com.rcloneui.RcloneUI"
+                  / "data" / "com.rclone.ui" / "configs" / "default" / "rclone.conf",
+            # RCX / other common GUI tools
+            home / ".config" / "rcx" / "rclone.conf",
+            home / ".config" / "rclone-browser" / "rclone.conf",
+        ]
+        # Also honour the RCLONE_CONFIG environment variable if set
+        env_config = os.environ.get("RCLONE_CONFIG", "")
+        if env_config:
+            candidates.insert(0, Path(env_config))
+        return candidates
+
+    def find_drive_id_in_known_configs(
+        self, remote_name: str
+    ) -> "List[Dict[str, str]]":
+        """Search well-known rclone config files for ``drive_id`` / ``drive_type``.
+
+        Looks at each candidate config file for **any** remote section that:
+
+          * has a ``drive_id`` value, and
+          * has a ``drive_type`` value, and
+          * is **not** the same file as the app's own ``rclone.conf``.
+
+        Sections in the same file as the app config are excluded because they
+        are precisely the ones that are broken.
+
+        Returns
+        -------
+        A list of dicts, each with keys:
+            ``source_file``, ``section``, ``drive_id``, ``drive_type``.
+        The list is empty when nothing is found.
+        """
+        own_config = self._config.rclone_config_path().resolve()
+        results: List[Dict[str, str]] = []
+
+        for candidate in self._candidate_rclone_configs():
+            try:
+                resolved = candidate.resolve()
+            except OSError:
+                continue
+            if resolved == own_config:
+                continue
+            if not candidate.exists():
+                continue
+            try:
+                parser = configparser.RawConfigParser()
+                parser.read(str(candidate), encoding="utf-8")
+            except Exception:
+                continue
+            for section in parser.sections():
+                drive_id = parser.get(section, "drive_id", fallback="").strip()
+                drive_type = parser.get(section, "drive_type", fallback="").strip()
+                if drive_id and drive_type:
+                    results.append(
+                        {
+                            "source_file": str(candidate),
+                            "section": section,
+                            "drive_id": drive_id,
+                            "drive_type": drive_type,
+                        }
+                    )
+        return results
+
+    def patch_remote_drive_fields(
+        self, remote_name: str, drive_id: str, drive_type: str
+    ) -> "tuple[bool, str]":
+        """Write ``drive_id`` and ``drive_type`` directly into the app's rclone.conf.
+
+        This is the *quick-fix* path for a remote that was created with an older
+        rclone version and therefore lacks these fields.  It avoids the full
+        OAuth re-authentication flow when the correct values can be recovered
+        from another existing config file.
+
+        The write is atomic (write to a temporary file, then ``os.replace``).
+
+        Returns
+        -------
+        ``(True, "")`` on success; ``(False, error_message)`` on failure.
+        """
+        config_path = self._config.rclone_config_path()
+        try:
+            parser = configparser.RawConfigParser()
+            if config_path.exists():
+                parser.read(str(config_path), encoding="utf-8")
+            if not parser.has_section(remote_name):
+                return False, f"La sección '[{remote_name}]' no existe en rclone.conf."
+            parser.set(remote_name, "drive_id", drive_id)
+            parser.set(remote_name, "drive_type", drive_type)
+            config_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path = config_path.with_suffix(".conf.tmp")
+            with tmp_path.open("w", encoding="utf-8") as fh:
+                parser.write(fh)
+            tmp_path.replace(config_path)
+        except OSError as exc:
+            return False, f"No se pudo actualizar la configuración: {exc}"
+        return True, ""
+
     def get_disk_usage(self, service_name: str) -> str:
         """
         Return a human-readable string of local disk space used by the service.

@@ -858,7 +858,7 @@ class ConfigWindow:
                 fg="#555555",
             ).pack(anchor="w", pady=(0, 8))
 
-            # Status label updated during reconnect
+            # Status label updated during reconnect / drive_id search
             self._reconnect_status_var = tk.StringVar(value="")
             tk.Label(
                 p,
@@ -869,8 +869,22 @@ class ConfigWindow:
                 justify="left",
             ).pack(anchor="w", pady=(0, 6))
 
+            btn_row = tk.Frame(p)
+            btn_row.pack(anchor="w")
+
+            self._find_drive_id_btn = tk.Button(
+                btn_row,
+                text="🔎 Buscar drive_id automáticamente",
+                command=self._start_find_drive_id,
+                relief=tk.FLAT,
+                bg="#107c10",
+                fg="white",
+                font=("Segoe UI", 9, "bold"),
+            )
+            self._find_drive_id_btn.pack(side=tk.LEFT, padx=(0, 8))
+
             self._reconnect_btn = tk.Button(
-                p,
+                btn_row,
                 text="🔄 Reconectar",
                 command=self._start_reconnect,
                 relief=tk.FLAT,
@@ -878,7 +892,112 @@ class ConfigWindow:
                 fg="white",
                 font=("Segoe UI", 9, "bold"),
             )
-            self._reconnect_btn.pack(anchor="w")
+            self._reconnect_btn.pack(side=tk.LEFT)
+
+    def _start_find_drive_id(self) -> None:
+        """Search known rclone config files for drive_id/drive_type in a background thread.
+
+        If exactly one candidate is found it is offered to the user for
+        immediate patching.  If multiple candidates are found the user is
+        presented with a choice.  If nothing is found the user is advised to
+        use Reconectar instead.
+        """
+        remote_name = self._svc.get("remote_name", "")
+        if not remote_name:
+            messagebox.showwarning(
+                "Datos insuficientes",
+                "No se pudo determinar el nombre del remoto.",
+                parent=self._win,
+            )
+            return
+
+        self._find_drive_id_btn.configure(state=tk.DISABLED, text="Buscando…")
+        self._reconnect_btn.configure(state=tk.DISABLED)
+        self._reconnect_status_var.set("Buscando drive_id en configuraciones conocidas…")
+
+        def run_search() -> None:
+            candidates = self._rclone.find_drive_id_in_known_configs(remote_name)
+            self._win.after(0, self._on_find_drive_id_done, candidates, remote_name)
+
+        threading.Thread(target=run_search, daemon=True).start()
+
+    def _on_find_drive_id_done(
+        self, candidates: "list[dict]", remote_name: str
+    ) -> None:
+        """Called on the main thread with the search results."""
+        self._find_drive_id_btn.configure(
+            state=tk.NORMAL, text="🔎 Buscar drive_id automáticamente"
+        )
+        self._reconnect_btn.configure(state=tk.NORMAL)
+
+        if not candidates:
+            self._reconnect_status_var.set(
+                "❌ No se encontró drive_id en ninguna configuración conocida. "
+                "Usa 'Reconectar' para volver a autenticarte."
+            )
+            return
+
+        # Build a user-readable list for the choice dialog
+        choice_lines = [
+            f"{i + 1}. [{c['section']}] drive_id={c['drive_id']}  "
+            f"drive_type={c['drive_type']}\n   ({c['source_file']})"
+            for i, c in enumerate(candidates)
+        ]
+
+        if len(candidates) == 1:
+            c = candidates[0]
+            msg = (
+                f"Se encontró un drive_id en:\n\n"
+                f"  Archivo : {c['source_file']}\n"
+                f"  Sección : [{c['section']}]\n"
+                f"  drive_id   = {c['drive_id']}\n"
+                f"  drive_type = {c['drive_type']}\n\n"
+                "¿Deseas aplicar estos valores al remoto actual?"
+            )
+            apply = messagebox.askyesno(
+                "drive_id encontrado", msg, parent=self._win
+            )
+            if apply:
+                self._apply_drive_id_patch(remote_name, c["drive_id"], c["drive_type"])
+        else:
+            # Multiple candidates — ask the user to pick one via simpledialog
+            prompt = (
+                f"Se encontraron {len(candidates)} candidatos. "
+                "Escribe el número del que quieres aplicar (o 0 para cancelar):\n\n"
+                + "\n".join(choice_lines)
+            )
+            raw = simpledialog.askstring(
+                "Seleccionar drive_id",
+                prompt,
+                parent=self._win,
+            )
+            if raw is None:
+                self._reconnect_status_var.set("")
+                return
+            try:
+                idx = int(raw.strip()) - 1
+            except ValueError:
+                self._reconnect_status_var.set("❌ Entrada no válida.")
+                return
+            if idx < 0 or idx >= len(candidates):
+                self._reconnect_status_var.set("")
+                return
+            c = candidates[idx]
+            self._apply_drive_id_patch(remote_name, c["drive_id"], c["drive_type"])
+
+    def _apply_drive_id_patch(
+        self, remote_name: str, drive_id: str, drive_type: str
+    ) -> None:
+        """Write drive_id/drive_type into rclone.conf and report the result."""
+        ok, error = self._rclone.patch_remote_drive_fields(
+            remote_name, drive_id, drive_type
+        )
+        if ok:
+            self._reconnect_status_var.set(
+                "✅ drive_id y drive_type aplicados. Reinicia la sincronización."
+            )
+        else:
+            self._reconnect_status_var.set(f"❌ Error al aplicar: {error}")
 
     def _start_reconnect(self) -> None:
         """Re-run the OAuth flow for this service's remote in a background thread.
@@ -900,6 +1019,7 @@ class ConfigWindow:
             return
 
         self._reconnect_btn.configure(state=tk.DISABLED, text="Reconectando…")
+        self._find_drive_id_btn.configure(state=tk.DISABLED)
         self._reconnect_status_var.set("Abriendo el navegador para autenticación…")
 
         # Keys that must be present before we consider auth complete.
@@ -945,11 +1065,13 @@ class ConfigWindow:
         """Called on the main thread after successful re-authentication."""
         self._reconnect_status_var.set("✅ Reconexión completada. Reinicia la sincronización.")
         self._reconnect_btn.configure(state=tk.NORMAL, text="🔄 Reconectar")
+        self._find_drive_id_btn.configure(state=tk.NORMAL)
 
     def _reconnect_failed(self) -> None:
         """Called on the main thread if re-authentication failed or timed out."""
         self._reconnect_status_var.set("❌ La autenticación falló o superó el tiempo límite. Intenta de nuevo.")
         self._reconnect_btn.configure(state=tk.NORMAL, text="🔄 Reconectar")
+        self._find_drive_id_btn.configure(state=tk.NORMAL)
 
     # ------------------------------------------------------------------
     # Panel 8 – Errors

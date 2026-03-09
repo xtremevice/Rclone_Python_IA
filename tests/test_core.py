@@ -689,6 +689,139 @@ class TestRcloneManager(unittest.TestCase):
         )
 
     # ------------------------------------------------------------------
+    # Drive-ID quick-fix helpers: find_drive_id_in_known_configs &
+    #                             patch_remote_drive_fields
+    # ------------------------------------------------------------------
+
+    def test_find_drive_id_returns_empty_when_no_candidate_exists(self):
+        """find_drive_id_in_known_configs() returns [] when no candidate config has drive_id."""
+        # Override candidate list to a single non-existent file
+        with patch.object(
+            self.rclone.__class__,
+            "_candidate_rclone_configs",
+            staticmethod(lambda: [Path(self._tmpdir) / "nonexistent.conf"]),
+        ):
+            result = self.rclone.find_drive_id_in_known_configs("juan")
+        self.assertEqual(result, [])
+
+    def test_find_drive_id_returns_empty_when_section_has_no_drive_id(self):
+        """find_drive_id_in_known_configs() ignores sections that lack drive_id."""
+        other_conf = Path(self._tmpdir) / "other.conf"
+        other_conf.write_text(
+            "[juan]\ntype = onedrive\ntoken = {\"access_token\":\"X\"}\n",
+            encoding="utf-8",
+        )
+        with patch.object(
+            self.rclone.__class__,
+            "_candidate_rclone_configs",
+            staticmethod(lambda: [other_conf]),
+        ):
+            result = self.rclone.find_drive_id_in_known_configs("juan")
+        self.assertEqual(result, [])
+
+    def test_find_drive_id_finds_section_with_drive_id(self):
+        """find_drive_id_in_known_configs() returns matching section data."""
+        other_conf = Path(self._tmpdir) / "other2.conf"
+        other_conf.write_text(
+            "[juan]\ntype = onedrive\ndrive_id = DEADBEEF\ndrive_type = personal\n",
+            encoding="utf-8",
+        )
+        with patch.object(
+            self.rclone.__class__,
+            "_candidate_rclone_configs",
+            staticmethod(lambda: [other_conf]),
+        ):
+            result = self.rclone.find_drive_id_in_known_configs("juan")
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["drive_id"], "DEADBEEF")
+        self.assertEqual(result[0]["drive_type"], "personal")
+        self.assertEqual(result[0]["section"], "juan")
+        self.assertEqual(result[0]["source_file"], str(other_conf))
+
+    def test_find_drive_id_skips_own_config_file(self):
+        """find_drive_id_in_known_configs() never returns entries from the app's own config."""
+        # Write drive_id into the app's own rclone.conf
+        own_conf = self.config.rclone_config_path()
+        own_conf.parent.mkdir(parents=True, exist_ok=True)
+        own_conf.write_text(
+            "[juan]\ntype = onedrive\ndrive_id = OWNID\ndrive_type = personal\n",
+            encoding="utf-8",
+        )
+        # Candidate list contains only the own config
+        with patch.object(
+            self.rclone.__class__,
+            "_candidate_rclone_configs",
+            staticmethod(lambda: [own_conf]),
+        ):
+            result = self.rclone.find_drive_id_in_known_configs("juan")
+        self.assertEqual(result, [], "Entries from the app's own config must be excluded")
+
+    def test_find_drive_id_returns_multiple_candidates(self):
+        """find_drive_id_in_known_configs() returns all matching sections across files."""
+        conf_a = Path(self._tmpdir) / "confA.conf"
+        conf_b = Path(self._tmpdir) / "confB.conf"
+        conf_a.write_text(
+            "[foo]\ntype = onedrive\ndrive_id = AAA\ndrive_type = personal\n",
+            encoding="utf-8",
+        )
+        conf_b.write_text(
+            "[bar]\ntype = onedrive\ndrive_id = BBB\ndrive_type = business\n",
+            encoding="utf-8",
+        )
+        with patch.object(
+            self.rclone.__class__,
+            "_candidate_rclone_configs",
+            staticmethod(lambda: [conf_a, conf_b]),
+        ):
+            result = self.rclone.find_drive_id_in_known_configs("any")
+        self.assertEqual(len(result), 2)
+        drive_ids = {r["drive_id"] for r in result}
+        self.assertEqual(drive_ids, {"AAA", "BBB"})
+
+    def test_patch_remote_drive_fields_writes_values(self):
+        """patch_remote_drive_fields() should add drive_id and drive_type to the section."""
+        own_conf = self.config.rclone_config_path()
+        own_conf.parent.mkdir(parents=True, exist_ok=True)
+        own_conf.write_text(
+            "[juan]\ntype = onedrive\ntoken = {\"access_token\":\"X\"}\n",
+            encoding="utf-8",
+        )
+        ok, err = self.rclone.patch_remote_drive_fields("juan", "DRIVEABC", "personal")
+        self.assertTrue(ok, f"Expected success; got error: {err}")
+        self.assertEqual(err, "")
+        # Verify values were written
+        parser = configparser.RawConfigParser()
+        parser.read(str(own_conf), encoding="utf-8")
+        self.assertEqual(parser.get("juan", "drive_id"), "DRIVEABC")
+        self.assertEqual(parser.get("juan", "drive_type"), "personal")
+        # Existing token must be preserved
+        self.assertTrue(parser.has_option("juan", "token"))
+
+    def test_patch_remote_drive_fields_fails_for_missing_section(self):
+        """patch_remote_drive_fields() returns (False, msg) when section not found."""
+        own_conf = self.config.rclone_config_path()
+        own_conf.parent.mkdir(parents=True, exist_ok=True)
+        own_conf.write_text("[other]\ntype = drive\n", encoding="utf-8")
+        ok, err = self.rclone.patch_remote_drive_fields("juan", "X", "personal")
+        self.assertFalse(ok)
+        self.assertIn("juan", err)
+
+    def test_patch_remote_drive_fields_preserves_other_sections(self):
+        """patch_remote_drive_fields() must not disturb other sections in rclone.conf."""
+        own_conf = self.config.rclone_config_path()
+        own_conf.parent.mkdir(parents=True, exist_ok=True)
+        own_conf.write_text(
+            "[juan]\ntype = onedrive\n\n[other]\ntype = drive\nclient_id = CID\n",
+            encoding="utf-8",
+        )
+        ok, _ = self.rclone.patch_remote_drive_fields("juan", "DID", "personal")
+        self.assertTrue(ok)
+        parser = configparser.RawConfigParser()
+        parser.read(str(own_conf), encoding="utf-8")
+        self.assertTrue(parser.has_section("other"))
+        self.assertEqual(parser.get("other", "client_id"), "CID")
+
+    # ------------------------------------------------------------------
     # Mega credential remote creation tests
     # ------------------------------------------------------------------
 
