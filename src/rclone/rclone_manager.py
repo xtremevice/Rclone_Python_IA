@@ -688,8 +688,8 @@ class RcloneManager:
         -------
         ``(True, "")``
             A terminal was launched successfully.
-        ``(False, command)``
-            No terminal emulator was available; *command* is the shell
+        ``(False, cmd)``
+            No terminal emulator was available; ``cmd`` is the shell
             command the user should run in their own terminal.
         """
         config_path = self._config.rclone_config_path()

@@ -834,10 +834,11 @@ class TestRcloneManager(unittest.TestCase):
 
     def test_open_terminal_reconnect_launches_first_available_terminal(self):
         """open_terminal_reconnect() returns (True, '') when the first terminal is found."""
+        first_exe = self.rclone._TERMINAL_CANDIDATES[0][0]
         launched_with = []
 
         def fake_popen(args, **kwargs):
-            if args[0] == "xterm":
+            if args[0] == first_exe:
                 launched_with.extend(args)
                 return MagicMock()
             raise FileNotFoundError("not found")
@@ -847,8 +848,8 @@ class TestRcloneManager(unittest.TestCase):
 
         self.assertTrue(ok)
         self.assertEqual(cmd, "")
-        # The first terminal tried must be xterm
-        self.assertEqual(launched_with[0], "xterm")
+        # The first terminal tried must match _TERMINAL_CANDIDATES[0]
+        self.assertEqual(launched_with[0], first_exe)
         # The command must contain 'config reconnect' and the remote name
         full_cmd = " ".join(launched_with)
         self.assertIn("config reconnect", full_cmd)
@@ -856,11 +857,13 @@ class TestRcloneManager(unittest.TestCase):
 
     def test_open_terminal_reconnect_tries_fallback_terminal(self):
         """open_terminal_reconnect() tries the next emulator if the first is absent."""
+        first_exe = self.rclone._TERMINAL_CANDIDATES[0][0]
+        second_exe = self.rclone._TERMINAL_CANDIDATES[1][0]
         call_log = []
 
         def fake_popen(args, **kwargs):
             call_log.append(args[0])
-            if args[0] == "gnome-terminal":
+            if args[0] == second_exe:
                 return MagicMock()
             raise FileNotFoundError("not found")
 
@@ -869,8 +872,8 @@ class TestRcloneManager(unittest.TestCase):
 
         self.assertTrue(ok)
         self.assertEqual(cmd, "")
-        self.assertIn("xterm", call_log)
-        self.assertIn("gnome-terminal", call_log)
+        self.assertIn(first_exe, call_log)
+        self.assertIn(second_exe, call_log)
 
     def test_open_terminal_reconnect_returns_false_when_no_terminal(self):
         """open_terminal_reconnect() returns (False, cmd_str) when no terminal is found."""
