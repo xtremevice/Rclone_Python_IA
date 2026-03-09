@@ -592,18 +592,22 @@ class TestRcloneManager(unittest.TestCase):
             if "obscure" in cmd:
                 result.returncode = 0
                 result.stdout = "OBSCURED_PASS\n"
+                result.stderr = ""
             elif "config" in cmd:
                 result.returncode = 0
                 result.stdout = ""
+                result.stderr = ""
             else:
                 result.returncode = 1
                 result.stdout = ""
+                result.stderr = ""
             return result
 
         with patch("subprocess.run", side_effect=fake_run):
-            ok = self.rclone.create_mega_remote("megasvc", "user@example.com", "secret123")
+            ok, err = self.rclone.create_mega_remote("megasvc", "user@example.com", "secret123")
 
         self.assertTrue(ok, "create_mega_remote should return True on success")
+        self.assertEqual(err, "", "Error message should be empty on success")
 
         # First call must be rclone obscure with the plain password
         self.assertTrue(len(captured_calls) >= 2, "Expected at least two subprocess.run calls")
@@ -628,44 +632,47 @@ class TestRcloneManager(unittest.TestCase):
         )
 
     def test_create_mega_remote_returns_false_when_obscure_fails(self):
-        """create_mega_remote() must return False if rclone obscure fails."""
+        """create_mega_remote() must return (False, msg) if rclone obscure fails."""
         def fake_run(cmd, **kwargs):
             result = MagicMock()
             result.returncode = 1
             result.stdout = ""
+            result.stderr = "obscure error detail"
             return result
 
         with patch("subprocess.run", side_effect=fake_run):
-            ok = self.rclone.create_mega_remote("megasvc2", "user@example.com", "badpass")
+            ok, err = self.rclone.create_mega_remote("megasvc2", "user@example.com", "badpass")
 
         self.assertFalse(ok, "create_mega_remote should return False when rclone obscure fails")
+        self.assertIn("obscure error detail", err, "Error message should include rclone output")
 
     def test_create_mega_remote_returns_false_when_config_create_fails(self):
-        """create_mega_remote() must return False if rclone config create fails."""
-        call_count = [0]
-
+        """create_mega_remote() must return (False, msg) if rclone config create fails."""
         def fake_run(cmd, **kwargs):
-            call_count[0] += 1
             result = MagicMock()
             if "obscure" in cmd:
                 result.returncode = 0
                 result.stdout = "OBSCURED\n"
+                result.stderr = ""
             else:
                 result.returncode = 1
                 result.stdout = ""
+                result.stderr = "config create error detail"
             return result
 
         with patch("subprocess.run", side_effect=fake_run):
-            ok = self.rclone.create_mega_remote("megasvc3", "u@e.com", "pw")
+            ok, err = self.rclone.create_mega_remote("megasvc3", "u@e.com", "pw")
 
         self.assertFalse(ok, "create_mega_remote should return False when rclone config create fails")
+        self.assertIn("config create error detail", err, "Error message should include rclone output")
 
     def test_create_mega_remote_returns_false_on_oserror(self):
-        """create_mega_remote() must return False if rclone is not found."""
+        """create_mega_remote() must return (False, msg) if rclone is not found."""
         with patch("subprocess.run", side_effect=OSError("rclone not found")):
-            ok = self.rclone.create_mega_remote("megasvc4", "u@e.com", "pw")
+            ok, err = self.rclone.create_mega_remote("megasvc4", "u@e.com", "pw")
 
         self.assertFalse(ok)
+        self.assertIn("rclone no encontrado", err)
 
     # ------------------------------------------------------------------
     # Mount service tests

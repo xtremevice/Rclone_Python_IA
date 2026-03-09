@@ -384,13 +384,15 @@ class SetupWizard:
         )
         creds_frame.columnconfigure(1, weight=1)
 
-        # Status label
+        # Status label — wraplength allows long rclone error lines to wrap.
         self._auth_status_var = tk.StringVar(value="")
         tk.Label(
             self._frame,
             textvariable=self._auth_status_var,
             fg="gray",
             font=("Segoe UI", 10, "italic"),
+            wraplength=550,
+            justify="left",
         ).pack(anchor="w", pady=(10, 0))
 
         nav = tk.Frame(self._frame)
@@ -434,11 +436,11 @@ class SetupWizard:
         remote_name = self._service_name.lower().replace(" ", "_")
 
         def run_create() -> None:
-            ok = self._rclone.create_mega_remote(remote_name, user, password)
+            ok, error_msg = self._rclone.create_mega_remote(remote_name, user, password)
             if ok:
                 self._root.after(0, self._auth_success, remote_name)
             else:
-                self._root.after(0, self._auth_failed)
+                self._root.after(0, self._mega_auth_failed, error_msg)
 
         threading.Thread(target=run_create, daemon=True).start()
 
@@ -468,9 +470,15 @@ class SetupWizard:
         self._root.after(1500, lambda: self._finish(remote_name))
 
     def _auth_failed(self) -> None:
-        """Called on the main thread if authentication failed."""
+        """Called on the main thread if OAuth authentication failed."""
         self._auth_status_var.set("❌ La autenticación falló. Intenta de nuevo.")
         self._sync_btn.configure(state=tk.NORMAL, text="🔑 Sincronizar sesión")
+
+    def _mega_auth_failed(self, error_msg: str) -> None:
+        """Called on the main thread if Mega credential setup failed."""
+        display = f"❌ Error: {error_msg}" if error_msg else "❌ La configuración falló. Intenta de nuevo."
+        self._auth_status_var.set(display)
+        self._sync_btn.configure(state=tk.NORMAL, text="✅ Crear configuración")
 
     def _finish(self, remote_name: str) -> None:
         """Save the new service and close the wizard."""

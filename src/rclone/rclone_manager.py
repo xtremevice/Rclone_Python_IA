@@ -359,7 +359,9 @@ class RcloneManager:
         )
         return proc
 
-    def create_mega_remote(self, remote_name: str, user: str, password: str) -> bool:
+    def create_mega_remote(
+        self, remote_name: str, user: str, password: str
+    ) -> "tuple[bool, str]":
         """
         Create a Mega remote in the rclone config using username/password
         credentials.
@@ -369,7 +371,9 @@ class RcloneManager:
         ``rclone obscure`` to encode the plain-text password, then calls
         ``rclone config create`` with the result.
 
-        Returns True if the remote was created successfully.
+        Returns a ``(success, error_message)`` tuple.  On success the error
+        message is an empty string.  On failure it contains the relevant output
+        from rclone so it can be shown to the user.
         """
         base = _rclone_base_args(self._config)
 
@@ -381,10 +385,13 @@ class RcloneManager:
                 text=True,
                 timeout=10,
             )
-        except (OSError, subprocess.TimeoutExpired):
-            return False
+        except OSError as exc:
+            return False, f"rclone no encontrado: {exc}"
+        except subprocess.TimeoutExpired:
+            return False, "rclone obscure superó el tiempo de espera."
         if obscure_result.returncode != 0:
-            return False
+            detail = obscure_result.stderr.strip() or obscure_result.stdout.strip()
+            return False, detail or f"rclone obscure falló (código {obscure_result.returncode})."
         obscured = obscure_result.stdout.strip()
 
         # Step 2: create the Mega remote with the obscured credentials.
@@ -400,9 +407,14 @@ class RcloneManager:
                 text=True,
                 timeout=30,
             )
-            return create_result.returncode == 0
-        except (OSError, subprocess.TimeoutExpired):
-            return False
+        except OSError as exc:
+            return False, f"rclone no encontrado: {exc}"
+        except subprocess.TimeoutExpired:
+            return False, "rclone config create superó el tiempo de espera."
+        if create_result.returncode != 0:
+            detail = create_result.stderr.strip() or create_result.stdout.strip()
+            return False, detail or f"rclone config create falló (código {create_result.returncode})."
+        return True, ""
 
     def delete_remote(self, remote_name: str) -> bool:
         """
