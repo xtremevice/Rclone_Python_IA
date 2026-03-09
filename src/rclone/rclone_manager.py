@@ -359,6 +359,51 @@ class RcloneManager:
         )
         return proc
 
+    def create_mega_remote(self, remote_name: str, user: str, password: str) -> bool:
+        """
+        Create a Mega remote in the rclone config using username/password
+        credentials.
+
+        Mega does not use OAuth; rclone requires the user's email address and
+        an *obscured* version of their password.  This method first calls
+        ``rclone obscure`` to encode the plain-text password, then calls
+        ``rclone config create`` with the result.
+
+        Returns True if the remote was created successfully.
+        """
+        base = _rclone_base_args(self._config)
+
+        # Step 1: obscure the plain-text password so it can be stored safely.
+        try:
+            obscure_result = subprocess.run(
+                ["rclone", "obscure", password],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+        if obscure_result.returncode != 0:
+            return False
+        obscured = obscure_result.stdout.strip()
+
+        # Step 2: create the Mega remote with the obscured credentials.
+        try:
+            create_result = subprocess.run(
+                base + [
+                    "config", "create",
+                    remote_name, "mega",
+                    f"user={user}",
+                    f"pass={obscured}",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            return create_result.returncode == 0
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+
     def delete_remote(self, remote_name: str) -> bool:
         """
         Remove a remote from the rclone config file.

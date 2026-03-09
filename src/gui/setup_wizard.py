@@ -269,7 +269,18 @@ class SetupWizard:
     # ------------------------------------------------------------------
 
     def _show_step3(self) -> None:
-        """Render step 3: launch OAuth browser session and wait for token."""
+        """Render step 3: authenticate with the cloud provider.
+
+        For Mega the authentication is credential-based (email + password).
+        For every other platform it is OAuth via the system browser.
+        """
+        if self._platform == "mega":
+            self._show_step3_mega()
+        else:
+            self._show_step3_oauth()
+
+    def _show_step3_oauth(self) -> None:
+        """Render step 3 for OAuth-based platforms (Google Drive, OneDrive, …)."""
         self._clear_frame()
 
         platform_label = PLATFORM_LABELS.get(self._platform, self._platform)
@@ -322,6 +333,114 @@ class SetupWizard:
             font=("Segoe UI", 10, "bold"),
         )
         self._sync_btn.pack(side=tk.RIGHT)
+
+    def _show_step3_mega(self) -> None:
+        """Render step 3 for Mega: collect email and password credentials."""
+        self._clear_frame()
+
+        tk.Label(
+            self._frame,
+            text="Paso 3 de 3 – Credenciales de Mega",
+            font=("Segoe UI", 14, "bold"),
+        ).pack(anchor="w", pady=(0, 10))
+
+        tk.Label(
+            self._frame,
+            text=(
+                "Mega requiere tu dirección de correo electrónico y contraseña "
+                "para acceder a tu cuenta. Estos datos se almacenan de forma "
+                "segura en el fichero de configuración local de rclone."
+            ),
+            wraplength=550,
+            justify="left",
+        ).pack(anchor="w", pady=(0, 15))
+
+        # Summary box
+        summary_frame = tk.LabelFrame(self._frame, text="Resumen de configuración", padx=10, pady=10)
+        summary_frame.pack(fill=tk.X, pady=10)
+
+        tk.Label(summary_frame, text=f"Nombre: {self._service_name}", anchor="w").pack(anchor="w")
+        tk.Label(summary_frame, text="Plataforma: Mega", anchor="w").pack(anchor="w")
+        tk.Label(summary_frame, text=f"Carpeta local: {self._local_path}", anchor="w", wraplength=500).pack(anchor="w")
+
+        # Credentials form
+        creds_frame = tk.Frame(self._frame)
+        creds_frame.pack(fill=tk.X, pady=(15, 0))
+
+        tk.Label(creds_frame, text="Correo electrónico (usuario):", anchor="w").grid(
+            row=0, column=0, sticky="w", pady=(0, 5)
+        )
+        self._mega_user_var = tk.StringVar()
+        tk.Entry(creds_frame, textvariable=self._mega_user_var, width=40).grid(
+            row=0, column=1, sticky="ew", padx=(8, 0), pady=(0, 5)
+        )
+
+        tk.Label(creds_frame, text="Contraseña:", anchor="w").grid(
+            row=1, column=0, sticky="w"
+        )
+        self._mega_pass_var = tk.StringVar()
+        tk.Entry(creds_frame, textvariable=self._mega_pass_var, show="*", width=40).grid(
+            row=1, column=1, sticky="ew", padx=(8, 0)
+        )
+        creds_frame.columnconfigure(1, weight=1)
+
+        # Status label
+        self._auth_status_var = tk.StringVar(value="")
+        tk.Label(
+            self._frame,
+            textvariable=self._auth_status_var,
+            fg="gray",
+            font=("Segoe UI", 10, "italic"),
+        ).pack(anchor="w", pady=(10, 0))
+
+        nav = tk.Frame(self._frame)
+        nav.pack(side=tk.BOTTOM, fill=tk.X, pady=(20, 0))
+
+        tk.Button(nav, text="← Atrás", command=self._show_step2).pack(side=tk.LEFT)
+
+        self._sync_btn = tk.Button(
+            nav,
+            text="✅ Crear configuración",
+            command=self._start_mega_auth,
+            bg="#d4003f",
+            fg="white",
+            font=("Segoe UI", 10, "bold"),
+        )
+        self._sync_btn.pack(side=tk.RIGHT)
+
+    def _start_mega_auth(self) -> None:
+        """Validate credentials and create the Mega rclone remote."""
+        user = self._mega_user_var.get().strip()
+        password = self._mega_pass_var.get()
+
+        if not user:
+            messagebox.showwarning(
+                "Campo requerido",
+                "Por favor escribe tu dirección de correo electrónico.",
+                parent=self._root,
+            )
+            return
+        if not password:
+            messagebox.showwarning(
+                "Campo requerido",
+                "Por favor escribe tu contraseña.",
+                parent=self._root,
+            )
+            return
+
+        self._sync_btn.configure(state=tk.DISABLED, text="Configurando…")
+        self._auth_status_var.set("Estado: creando configuración de Mega…")
+
+        remote_name = self._service_name.lower().replace(" ", "_")
+
+        def run_create() -> None:
+            ok = self._rclone.create_mega_remote(remote_name, user, password)
+            if ok:
+                self._root.after(0, self._auth_success, remote_name)
+            else:
+                self._root.after(0, self._auth_failed)
+
+        threading.Thread(target=run_create, daemon=True).start()
 
     def _start_auth(self) -> None:
         """Launch rclone auth in a background thread, opening the browser."""

@@ -579,6 +579,95 @@ class TestRcloneManager(unittest.TestCase):
         self.assertEqual(errors, [], "No exit-code message should appear on success")
 
     # ------------------------------------------------------------------
+    # Mega credential remote creation tests
+    # ------------------------------------------------------------------
+
+    def test_create_mega_remote_success(self):
+        """create_mega_remote() must obscure the password then create the remote."""
+        captured_calls = []
+
+        def fake_run(cmd, **kwargs):
+            captured_calls.append(cmd)
+            result = MagicMock()
+            if "obscure" in cmd:
+                result.returncode = 0
+                result.stdout = "OBSCURED_PASS\n"
+            elif "config" in cmd:
+                result.returncode = 0
+                result.stdout = ""
+            else:
+                result.returncode = 1
+                result.stdout = ""
+            return result
+
+        with patch("subprocess.run", side_effect=fake_run):
+            ok = self.rclone.create_mega_remote("megasvc", "user@example.com", "secret123")
+
+        self.assertTrue(ok, "create_mega_remote should return True on success")
+
+        # First call must be rclone obscure with the plain password
+        self.assertTrue(len(captured_calls) >= 2, "Expected at least two subprocess.run calls")
+        obscure_cmd = captured_calls[0]
+        self.assertIn("obscure", obscure_cmd)
+        self.assertIn("secret123", obscure_cmd)
+
+        # Second call must be rclone config create ... mega with user and obscured pass
+        create_cmd = captured_calls[1]
+        self.assertIn("config", create_cmd)
+        self.assertIn("create", create_cmd)
+        self.assertIn("megasvc", create_cmd)
+        self.assertIn("mega", create_cmd)
+        # The user and obscured password must be present as key=value arguments
+        self.assertTrue(
+            any("user@example.com" in arg for arg in create_cmd),
+            "user email must appear in the config create command",
+        )
+        self.assertTrue(
+            any("OBSCURED_PASS" in arg for arg in create_cmd),
+            "obscured password must appear in the config create command",
+        )
+
+    def test_create_mega_remote_returns_false_when_obscure_fails(self):
+        """create_mega_remote() must return False if rclone obscure fails."""
+        def fake_run(cmd, **kwargs):
+            result = MagicMock()
+            result.returncode = 1
+            result.stdout = ""
+            return result
+
+        with patch("subprocess.run", side_effect=fake_run):
+            ok = self.rclone.create_mega_remote("megasvc2", "user@example.com", "badpass")
+
+        self.assertFalse(ok, "create_mega_remote should return False when rclone obscure fails")
+
+    def test_create_mega_remote_returns_false_when_config_create_fails(self):
+        """create_mega_remote() must return False if rclone config create fails."""
+        call_count = [0]
+
+        def fake_run(cmd, **kwargs):
+            call_count[0] += 1
+            result = MagicMock()
+            if "obscure" in cmd:
+                result.returncode = 0
+                result.stdout = "OBSCURED\n"
+            else:
+                result.returncode = 1
+                result.stdout = ""
+            return result
+
+        with patch("subprocess.run", side_effect=fake_run):
+            ok = self.rclone.create_mega_remote("megasvc3", "u@e.com", "pw")
+
+        self.assertFalse(ok, "create_mega_remote should return False when rclone config create fails")
+
+    def test_create_mega_remote_returns_false_on_oserror(self):
+        """create_mega_remote() must return False if rclone is not found."""
+        with patch("subprocess.run", side_effect=OSError("rclone not found")):
+            ok = self.rclone.create_mega_remote("megasvc4", "u@e.com", "pw")
+
+        self.assertFalse(ok)
+
+    # ------------------------------------------------------------------
     # Mount service tests
     # ------------------------------------------------------------------
 
