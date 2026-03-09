@@ -344,6 +344,9 @@ class RcloneManager:
         rclone opens the browser for OAuth authentication.
 
         Returns the Popen object so the caller can wait on it.
+        stdin is closed (DEVNULL) so that any post-OAuth interactive prompts
+        (e.g. OneDrive drive selection) receive EOF and rclone falls back to
+        the built-in defaults instead of blocking indefinitely.
         """
         args = _rclone_base_args(self._config) + [
             "config",
@@ -354,11 +357,26 @@ class RcloneManager:
         ]
         proc = subprocess.Popen(
             args,
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
         )
         return proc
+
+    def remote_has_token(self, remote_name: str) -> bool:
+        """Return True if *remote_name* exists in rclone.conf with an OAuth token.
+
+        Used to detect a completed OAuth flow even when ``rclone config create``
+        is still running (e.g. hung on a post-OAuth drive-selection prompt).
+        """
+        config_path = self._config.rclone_config_path()
+        try:
+            parser = configparser.RawConfigParser()
+            parser.read(str(config_path), encoding="utf-8")
+            return parser.has_section(remote_name) and parser.has_option(remote_name, "token")
+        except Exception:
+            return False
 
     def create_mega_remote(
         self, remote_name: str, user: str, password: str

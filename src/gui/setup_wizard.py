@@ -12,12 +12,16 @@ Window size: 70 % of screen height × 30 % of screen width.
 import os
 import subprocess
 import threading
+import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
 from typing import Callable, Optional
 
 from src.config.config_manager import PLATFORM_LABELS, SUPPORTED_PLATFORMS, ConfigManager
 from src.rclone.rclone_manager import RcloneManager
+
+# Maximum seconds to wait for OAuth to complete (browser login + token write).
+_OAUTH_TIMEOUT_SECONDS = 120
 
 
 class SetupWizard:
@@ -452,11 +456,37 @@ class SetupWizard:
         remote_name = self._service_name.lower().replace(" ", "_")
 
         def run_auth() -> None:
-            # Run rclone config create which opens the browser for OAuth
             proc = self._rclone.open_browser_auth(remote_name, self._platform)
-            proc.wait()
-            if proc.returncode == 0:
-                # Schedule success handling on the main thread
+
+            # Wait up to _OAUTH_TIMEOUT_SECONDS for either:
+            #   a) rclone to exit on its own (normal case), or
+            #   b) the token to appear in rclone.conf (handles providers like
+            #      OneDrive where rclone can hang on post-OAuth drive-selection
+            #      prompts even after the browser shows "success").
+            deadline = time.monotonic() + _OAUTH_TIMEOUT_SECONDS
+            success = False
+            while time.monotonic() < deadline:
+                ret = proc.poll()
+                if ret is not None:
+                    success = ret == 0
+                    break
+                if self._rclone.remote_has_token(remote_name):
+                    # OAuth token already written — consider auth done.
+                    try:
+                        proc.terminate()
+                    except OSError:
+                        pass
+                    success = True
+                    break
+                time.sleep(1)
+            else:
+                # Timed out — kill the stalled process.
+                try:
+                    proc.terminate()
+                except OSError:
+                    pass
+
+            if success:
                 self._root.after(0, self._auth_success, remote_name)
             else:
                 self._root.after(0, self._auth_failed)
