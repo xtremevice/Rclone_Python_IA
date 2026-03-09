@@ -364,17 +364,32 @@ class RcloneManager:
         )
         return proc
 
-    def remote_has_token(self, remote_name: str) -> bool:
-        """Return True if *remote_name* exists in rclone.conf with an OAuth token.
+    def remote_has_token(
+        self, remote_name: str, extra_required_keys: "tuple[str, ...]" = ()
+    ) -> bool:
+        """Return True if *remote_name* exists in rclone.conf with an OAuth token
+        and all *extra_required_keys*.
 
         Used to detect a completed OAuth flow even when ``rclone config create``
         is still running (e.g. hung on a post-OAuth drive-selection prompt).
+
+        Pass ``extra_required_keys=("drive_id",)`` for OneDrive remotes so that
+        the poll loop waits until rclone has also written the drive configuration
+        (drive_id, drive_type) — not just the bare OAuth token.  Without those
+        keys ``rclone bisync`` immediately fails with exit-code 1.
         """
         config_path = self._config.rclone_config_path()
         try:
             parser = configparser.RawConfigParser()
             parser.read(str(config_path), encoding="utf-8")
-            return parser.has_section(remote_name) and parser.has_option(remote_name, "token")
+            if not parser.has_section(remote_name):
+                return False
+            if not parser.has_option(remote_name, "token"):
+                return False
+            for key in extra_required_keys:
+                if not parser.has_option(remote_name, key):
+                    return False
+            return True
         except Exception:
             return False
 

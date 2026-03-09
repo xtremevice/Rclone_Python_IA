@@ -458,11 +458,20 @@ class SetupWizard:
         def run_auth() -> None:
             proc = self._rclone.open_browser_auth(remote_name, self._platform)
 
+            # Keys that must be present in rclone.conf before we consider auth
+            # complete.  OneDrive requires drive_id (written after token) so
+            # that bisync has a fully-configured remote and does not fail with
+            # exit-code 1 due to a missing drive_id/drive_type.
+            extra_keys: "tuple[str, ...]" = (
+                ("drive_id",) if self._platform == "onedrive" else ()
+            )
+
             # Wait up to _OAUTH_TIMEOUT_SECONDS for either:
             #   a) rclone to exit on its own (normal case), or
-            #   b) the token to appear in rclone.conf (handles providers like
-            #      OneDrive where rclone can hang on post-OAuth drive-selection
-            #      prompts even after the browser shows "success").
+            #   b) the token (plus any provider-specific extra keys) to appear in
+            #      rclone.conf (handles OneDrive where rclone can hang on a
+            #      post-OAuth drive-selection prompt even after the browser shows
+            #      "success").
             deadline = time.monotonic() + _OAUTH_TIMEOUT_SECONDS
             success = False
             while time.monotonic() < deadline:
@@ -470,8 +479,11 @@ class SetupWizard:
                 if ret is not None:
                     success = ret == 0
                     break
-                if self._rclone.remote_has_token(remote_name):
-                    # OAuth token already written — consider auth done.
+                if self._rclone.remote_has_token(remote_name, extra_required_keys=extra_keys):
+                    # OAuth token (and required extra keys) already written —
+                    # give rclone a brief moment to flush/close the config file
+                    # before terminating.
+                    time.sleep(0.5)
                     try:
                         proc.terminate()
                     except OSError:
