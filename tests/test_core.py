@@ -33,6 +33,7 @@ from src.rclone.rclone_manager import (
     _rclone_supports_resync_mode,
     _bisync_cache_dir,
     _clear_bisync_stale_files,
+    _DRIVE_ID_MISSING_PHRASE,
 )
 
 
@@ -578,6 +579,114 @@ class TestRcloneManager(unittest.TestCase):
 
         self.assertTrue(result)
         self.assertEqual(errors, [], "No exit-code message should appear on success")
+
+    def test_run_rclone_detects_drive_id_missing_and_emits_actionable_message(self):
+        """_run_rclone() must detect 'unable to get drive_id and drive_type' and emit a
+        helpful actionable message, even when the line lacks an ERROR/FATAL prefix."""
+        import io
+        errors = []
+        self.rclone.on_error = lambda name, msg: errors.append(msg)
+
+        # Simulate rclone output that contains the drive_id error without an
+        # ERROR/FATAL prefix (as rclone may write it as a plain log line).
+        fake_output = (
+            f'Failed to create file system for "svc:/": '
+            f'{_DRIVE_ID_MISSING_PHRASE} - if you are upgrading from older '
+            f'versions of rclone, please run `rclone config` and re-configure '
+            f'this backend\n'
+        )
+
+        class FakeProc:
+            returncode = 1
+            stdout = io.StringIO(fake_output)
+            def wait(self): pass
+
+        with patch("subprocess.Popen", return_value=FakeProc()):
+            self.rclone._run_rclone(["rclone", "bisync"], "DriveIdSvc", {})
+
+        # The raw rclone line should be emitted (it has no ERROR/FATAL keyword)
+        self.assertTrue(
+            any(_DRIVE_ID_MISSING_PHRASE in e for e in errors),
+            "The raw rclone error line must always appear in the error log",
+        )
+        # An actionable guidance message must also be emitted
+        self.assertTrue(
+            any("drive_id" in e and "drive_type" in e for e in errors),
+            "An actionable message about drive_id/drive_type must be emitted",
+        )
+        # The service must be flagged so _do_bisync can skip the retry
+        self.assertIn(
+            "DriveIdSvc",
+            self.rclone._config_error_services,
+            "Service must be added to _config_error_services after drive_id error",
+        )
+
+    def test_run_rclone_detects_drive_id_missing_when_line_has_error_prefix(self):
+        """_run_rclone() must still handle the drive_id error when the rclone line
+        already contains the ERROR keyword (avoids double-emission of the raw line)."""
+        import io
+        errors = []
+        self.rclone.on_error = lambda name, msg: errors.append(msg)
+
+        # Simulate a line that has both the ERROR keyword AND the drive_id phrase
+        fake_output = (
+            f'ERROR : Failed to create file system: '
+            f'{_DRIVE_ID_MISSING_PHRASE}\n'
+        )
+
+        class FakeProc:
+            returncode = 1
+            stdout = io.StringIO(fake_output)
+            def wait(self): pass
+
+        with patch("subprocess.Popen", return_value=FakeProc()):
+            self.rclone._run_rclone(["rclone", "bisync"], "DriveIdSvc2", {})
+
+        # Actionable message must still appear
+        self.assertTrue(
+            any("drive_id" in e and "drive_type" in e for e in errors),
+            "Actionable guidance must be emitted even when line has ERROR prefix",
+        )
+        # Service must be flagged
+        self.assertIn("DriveIdSvc2", self.rclone._config_error_services)
+
+    def test_do_bisync_skips_resync_retry_on_drive_id_config_error(self):
+        """_do_bisync() must NOT retry with --resync when the failure is caused by
+        a missing drive_id/drive_type configuration error.
+
+        Retrying with --resync would fail in exactly the same way because the
+        problem is in the stored remote configuration, not in the bisync state.
+        The user is already informed via the actionable message emitted by
+        _run_rclone; a pointless second run would only add noise to the log.
+        """
+        self.config.add_service("ConfigErrSvc", "onedrive", "/tmp/cfg_err_test")
+        logged = []
+        self.rclone.on_error = lambda name, msg: logged.append((name, msg))
+
+        call_count = [0]
+
+        def fake_run_rclone(cmd, service_name, svc, is_retry=False):
+            call_count[0] += 1
+            # Simulate _run_rclone flagging the service as a config error
+            self.rclone._config_error_services.add(service_name)
+            return False
+
+        self.rclone._run_rclone = fake_run_rclone
+        svc = self.config.get_service("ConfigErrSvc")
+        result = self.rclone._do_bisync(svc)
+
+        self.assertFalse(result, "_do_bisync must return False on config error")
+        self.assertEqual(
+            call_count[0],
+            1,
+            "_run_rclone must be called exactly once; --resync retry must be skipped",
+        )
+        # The service must be removed from the set after the check
+        self.assertNotIn(
+            "ConfigErrSvc",
+            self.rclone._config_error_services,
+            "Service must be removed from _config_error_services after the check",
+        )
 
     # ------------------------------------------------------------------
     # Mega credential remote creation tests

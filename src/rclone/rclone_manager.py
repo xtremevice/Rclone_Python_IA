@@ -84,6 +84,14 @@ def _clear_bisync_stale_files(
 # rclone writes "ERROR : ..." and "FATAL : ..." to stderr (merged into stdout).
 _RCLONE_ERROR_KEYWORDS = ("ERROR", "FATAL", "Fatal error", "error:")
 
+# Phrase emitted by rclone when a OneDrive/SharePoint remote is missing the
+# drive_id and drive_type fields that newer rclone versions require.  This
+# happens when an existing remote was configured with an older rclone version
+# that did not write those fields to rclone.conf.  Bisync fails immediately
+# and retrying with --resync would fail in the same way because the problem is
+# in the stored configuration, not in the sync state.
+_DRIVE_ID_MISSING_PHRASE = "unable to get drive_id and drive_type"
+
 
 def _rclone_base_args(config_manager: ConfigManager) -> List[str]:
     """Return the common rclone arguments including --config path."""
@@ -128,6 +136,10 @@ class RcloneManager:
         # Used to terminate a long-running bisync immediately when stop_service
         # is called, without waiting for the process to finish naturally.
         self._running_procs: Dict[str, subprocess.Popen] = {}
+        # Services whose last bisync failed due to a missing drive_id/drive_type
+        # configuration error.  _do_bisync checks this before retrying with
+        # --resync to avoid a pointless retry for what is a config problem.
+        self._config_error_services: set = set()
         # Optional callback(service_name, status_str) called on status changes
         self.on_status_change: Optional[Callable[[str, str], None]] = None
         # Optional callback(service_name, file_path, synced) for history updates
@@ -768,6 +780,14 @@ class RcloneManager:
             if stop_ev and stop_ev.is_set():
                 # Service is being stopped; don't retry or log spurious errors
                 return False
+            # If the failure was caused by a missing drive_id/drive_type config
+            # error, skip the --resync retry: the problem is in the stored
+            # remote configuration, not in the bisync state, so retrying with
+            # --resync would fail in the same way.  The actionable message was
+            # already emitted by _run_rclone.
+            if name in self._config_error_services:
+                self._config_error_services.discard(name)
+                return False
             _clear_bisync_stale_files(
                 svc.get("remote_name", ""),
                 _bisync_cache_dir(),
@@ -812,6 +832,25 @@ class RcloneManager:
                 line = raw_line.strip()
                 if not line:
                     continue
+                # Detect the drive_id/drive_type config error.  rclone emits
+                # this when a remote was configured with an older rclone version
+                # that did not write those fields to rclone.conf.  The line may
+                # not contain a standard ERROR/FATAL keyword on all rclone
+                # versions, so we check for it explicitly before the general
+                # keyword scan to guarantee it is always logged.
+                if _DRIVE_ID_MISSING_PHRASE in line:
+                    # Always emit the raw rclone line so the user can see it.
+                    if not any(kw in line for kw in _RCLONE_ERROR_KEYWORDS):
+                        self._emit_error(service_name, line)
+                    # Mark this service so _do_bisync can skip the --resync retry.
+                    self._config_error_services.add(service_name)
+                    self._emit_error(
+                        service_name,
+                        "⚠️ La configuración del remoto está desactualizada: "
+                        "faltan los campos drive_id y drive_type. "
+                        "Ve a Configuración → panel de información → Reconectar "
+                        "para volver a autenticar el remoto con rclone.",
+                    )
                 # Forward any rclone error / fatal output to the error log
                 if any(kw in line for kw in _RCLONE_ERROR_KEYWORDS):
                     self._emit_error(service_name, line)
