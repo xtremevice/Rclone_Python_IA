@@ -16,6 +16,7 @@ Window size: 60 % of screen height × 35 % of screen width.
 
 import os
 import threading
+import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
 from typing import Callable, Dict, List, Optional
@@ -27,7 +28,7 @@ from src.config.config_manager import (
     ConfigManager,
 )
 from src.rclone.rclone_manager import RcloneManager
-from src.gui.setup_wizard import _center_window
+from src.gui.setup_wizard import _center_window, _OAUTH_TIMEOUT_SECONDS
 
 # Import type for annotation; avoid circular imports at runtime by using TYPE_CHECKING
 from typing import TYPE_CHECKING
@@ -834,6 +835,121 @@ class ConfigWindow:
             row.pack(fill=tk.X, pady=3)
             tk.Label(row, text=label, width=22, anchor="w", font=("Segoe UI", 9, "bold")).pack(side=tk.LEFT)
             tk.Label(row, text=value, anchor="w", wraplength=350, justify="left").pack(side=tk.LEFT)
+
+        # ── Reconnect section ────────────────────────────────────────────────
+        # Shown for all OAuth-based platforms (non-Mega).  Lets the user re-run
+        # the OAuth flow to fix a missing drive_id/drive_type in rclone.conf,
+        # which causes bisync to fail immediately with "unable to get drive_id
+        # and drive_type - if you are upgrading from older versions of rclone".
+        platform = self._svc.get("platform", "")
+        if platform and platform != "mega":
+            sep = tk.Frame(p, height=1, bg="#cccccc")
+            sep.pack(fill=tk.X, pady=(12, 8))
+
+            tk.Label(
+                p,
+                text=(
+                    "Si la sincronización falla con un error de configuración "
+                    "(p. ej. drive_id o drive_type ausentes), haz clic en "
+                    "'Reconectar' para volver a autenticar este remoto con rclone."
+                ),
+                wraplength=450,
+                justify="left",
+                fg="#555555",
+            ).pack(anchor="w", pady=(0, 8))
+
+            # Status label updated during reconnect
+            self._reconnect_status_var = tk.StringVar(value="")
+            tk.Label(
+                p,
+                textvariable=self._reconnect_status_var,
+                fg="gray",
+                font=("Segoe UI", 9, "italic"),
+                wraplength=450,
+                justify="left",
+            ).pack(anchor="w", pady=(0, 6))
+
+            self._reconnect_btn = tk.Button(
+                p,
+                text="🔄 Reconectar",
+                command=self._start_reconnect,
+                relief=tk.FLAT,
+                bg="#0078d4",
+                fg="white",
+                font=("Segoe UI", 9, "bold"),
+            )
+            self._reconnect_btn.pack(anchor="w")
+
+    def _start_reconnect(self) -> None:
+        """Re-run the OAuth flow for this service's remote in a background thread.
+
+        This fixes a rclone.conf that is missing the ``drive_id`` and
+        ``drive_type`` fields that newer rclone versions require for
+        OneDrive/SharePoint remotes.  Calling ``rclone config create`` again
+        overwrites the remote section in rclone.conf with the full set of
+        fields after the user re-authenticates.
+        """
+        remote_name = self._svc.get("remote_name", "")
+        platform = self._svc.get("platform", "")
+        if not remote_name or not platform:
+            messagebox.showwarning(
+                "Datos insuficientes",
+                "No se pudo determinar el nombre o la plataforma del remoto.",
+                parent=self._win,
+            )
+            return
+
+        self._reconnect_btn.configure(state=tk.DISABLED, text="Reconectando…")
+        self._reconnect_status_var.set("Abriendo el navegador para autenticación…")
+
+        # Keys that must be present before we consider auth complete.
+        # OneDrive requires drive_id (written after the token) so that bisync
+        # has a fully-configured remote and does not fail with exit-code 1.
+        extra_keys: "tuple[str, ...]" = (
+            ("drive_id",) if platform == "onedrive" else ()
+        )
+
+        def run_reconnect() -> None:
+            proc = self._rclone.open_browser_auth(remote_name, platform)
+
+            deadline = time.monotonic() + _OAUTH_TIMEOUT_SECONDS
+            success = False
+            while time.monotonic() < deadline:
+                ret = proc.poll()
+                if ret is not None:
+                    success = ret == 0
+                    break
+                if self._rclone.remote_has_token(remote_name, extra_required_keys=extra_keys):
+                    time.sleep(0.5)
+                    try:
+                        proc.terminate()
+                    except OSError:
+                        pass
+                    success = True
+                    break
+                time.sleep(1)
+            else:
+                try:
+                    proc.terminate()
+                except OSError:
+                    pass
+
+            if success:
+                self._win.after(0, self._reconnect_success)
+            else:
+                self._win.after(0, self._reconnect_failed)
+
+        threading.Thread(target=run_reconnect, daemon=True).start()
+
+    def _reconnect_success(self) -> None:
+        """Called on the main thread after successful re-authentication."""
+        self._reconnect_status_var.set("✅ Reconexión completada. Reinicia la sincronización.")
+        self._reconnect_btn.configure(state=tk.NORMAL, text="🔄 Reconectar")
+
+    def _reconnect_failed(self) -> None:
+        """Called on the main thread if re-authentication failed or timed out."""
+        self._reconnect_status_var.set("❌ La autenticación falló o superó el tiempo límite. Intenta de nuevo.")
+        self._reconnect_btn.configure(state=tk.NORMAL, text="🔄 Reconectar")
 
     # ------------------------------------------------------------------
     # Panel 8 – Errors
