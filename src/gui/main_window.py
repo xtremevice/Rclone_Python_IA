@@ -144,8 +144,11 @@ class MainWindow:
             font=("Segoe UI", 12),
         ).pack(expand=True)
 
+        btn_row = tk.Frame(frame)
+        btn_row.pack(pady=(6, 0))
+
         tk.Button(
-            frame,
+            btn_row,
             text="➕ Agregar primer servicio",
             command=self._open_wizard,
             bg="#0078d4",
@@ -154,7 +157,19 @@ class MainWindow:
             relief=tk.FLAT,
             padx=10,
             pady=6,
-        ).pack()
+        ).pack(side=tk.LEFT, padx=(0, 8))
+
+        tk.Button(
+            btn_row,
+            text="📥 Importar configuración",
+            command=self._open_import_dialog,
+            bg="#5c2d91",
+            fg="white",
+            font=("Segoe UI", 10, "bold"),
+            relief=tk.FLAT,
+            padx=10,
+            pady=6,
+        ).pack(side=tk.LEFT)
 
     def _add_service_tab(self, svc: Dict) -> None:
         """Build and add a tab for the given service dictionary."""
@@ -195,6 +210,17 @@ class MainWindow:
             cursor="hand2",
         ).grid(row=0, column=4, sticky="w", padx=(8, 0))
 
+        # "Import rclone config" shortcut button (next to "➕")
+        tk.Button(
+            header,
+            text="📥 Importar configuración",
+            command=self._open_import_dialog,
+            relief=tk.FLAT,
+            bg="#f0f4fa",
+            font=("Segoe UI", 9),
+            cursor="hand2",
+        ).grid(row=0, column=5, sticky="w", padx=(4, 0))
+
         # Row 1: Storage quota info (fetched asynchronously via rclone about)
         storage_var = tk.StringVar(value="💾 Total: 0  |  Usado: 0  |  Libre: 0")
         self._storage_vars[name] = storage_var
@@ -204,7 +230,7 @@ class MainWindow:
             bg="#f0f4fa",
             fg="#555555",
             font=("Segoe UI", 9),
-        ).grid(row=1, column=0, columnspan=5, sticky="w", pady=(4, 0))
+        ).grid(row=1, column=0, columnspan=6, sticky="w", pady=(4, 0))
 
         # Fetch storage quota in the background and update the label when ready
         self._fetch_storage_info_async(name, storage_var)
@@ -373,6 +399,17 @@ class MainWindow:
         from src.gui.setup_wizard import SetupWizard
 
         SetupWizard(
+            parent=self._root,
+            config_manager=self._config,
+            rclone_manager=self._rclone,
+            on_complete=self._on_service_added,
+        )
+
+    def _open_import_dialog(self) -> None:
+        """Launch the import-rclone-config dialog."""
+        from src.gui.import_dialog import ImportConfigDialog
+
+        ImportConfigDialog(
             parent=self._root,
             config_manager=self._config,
             rclone_manager=self._rclone,

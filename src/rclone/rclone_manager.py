@@ -416,6 +416,63 @@ class RcloneManager:
             return False, detail or f"rclone config create falló (código {create_result.returncode})."
         return True, ""
 
+    def import_remote(
+        self,
+        remote_name: str,
+        new_name: str,
+        remote_data: Dict[str, str],
+    ) -> "tuple[bool, str]":
+        """
+        Import a remote from an external rclone config into the app's own config.
+
+        Parameters
+        ----------
+        remote_name:
+            Original name of the remote in the source config (used only for
+            error messages).
+        new_name:
+            Name to register in the app's own rclone config.
+        remote_data:
+            ``{key: value}`` pairs from the remote's INI section, **including**
+            the mandatory ``type`` key.
+
+        Returns
+        -------
+        ``(True, "")`` on success; ``(False, error_message)`` on failure.
+        """
+        remote_type = remote_data.get("type", "").strip()
+        if not remote_type:
+            return False, f"El remote '{remote_name}' no tiene un campo 'type' válido."
+
+        # Build extra key=value args (everything except 'type', which is positional)
+        extra_args = [
+            f"{k}={v}"
+            for k, v in remote_data.items()
+            if k != "type"
+        ]
+
+        args = (
+            _rclone_base_args(self._config)
+            + ["config", "create", new_name, remote_type]
+            + extra_args
+        )
+        try:
+            result = subprocess.run(
+                args,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        except OSError as exc:
+            return False, f"rclone no encontrado: {exc}"
+        except subprocess.TimeoutExpired:
+            return False, "rclone config create superó el tiempo de espera."
+
+        if result.returncode != 0:
+            detail = result.stderr.strip() or result.stdout.strip()
+            return False, detail or f"rclone config create falló (código {result.returncode})."
+        return True, ""
+
     def delete_remote(self, remote_name: str) -> bool:
         """
         Remove a remote from the rclone config file.
