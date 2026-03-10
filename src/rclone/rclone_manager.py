@@ -918,13 +918,28 @@ class RcloneManager:
         # Note: VFS cache flags (--vfs-cache-mode, --vfs-cache-max-size, etc.) are
         # NOT valid for bisync; they belong exclusively to the mount command and are
         # applied in start_mount() instead.
+        #
+        # --transfers and --checkers default to 16/32 but are overridable per-service
+        # so users can reduce them to avoid Google Drive API quota errors.
+        transfers = str(svc.get("transfers", 16))
+        checkers = str(svc.get("checkers", 32))
         perf_args = [
-            "--transfers", "16",
-            "--checkers", "32",
+            "--transfers", transfers,
+            "--checkers", checkers,
             "--drive-chunk-size", "128M",
             "--buffer-size", "64M",
             "-P",
         ]
+        # --tpslimit throttles API calls per second.  When set to a positive value
+        # it prevents Google Drive 403 "Quota exceeded for 'Queries per minute'"
+        # errors caused by rclone making too many API requests in a short burst.
+        # A value of 0 (default) means no limit.
+        try:
+            tpslimit_f = float(svc.get("tpslimit", 0))
+        except (TypeError, ValueError):
+            tpslimit_f = 0.0
+        if tpslimit_f > 0:
+            perf_args += ["--tpslimit", str(tpslimit_f)]
         # Google Drive may flag some files as malware/spam and return HTTP 403
         # (cannotDownloadAbusiveFile).  This flag tells rclone to acknowledge
         # the warning and download the file anyway, preventing bisync from

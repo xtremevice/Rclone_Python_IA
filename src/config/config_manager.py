@@ -41,6 +41,10 @@ DEFAULT_RCLONE_OPTS = {
     "buffer_size": "64M",
     "vfs_cache_mode": "writes",
     "vfs_cache_max_size": "10G",
+    # Maximum API transactions per second (0 = unlimited).  Set to a low value
+    # (e.g. 5) to avoid Google Drive "Quota exceeded for 'Queries per minute'"
+    # 403 errors when bisync generates too many API calls in a short window.
+    "tpslimit": 0,
 }
 
 # Exclusion pattern for the OneDrive Personal Vault folder

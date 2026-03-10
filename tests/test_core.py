@@ -483,6 +483,78 @@ class TestRcloneManager(unittest.TestCase):
             "--drive-acknowledge-abuse must NOT appear for non-drive platforms",
         )
 
+    def test_do_bisync_includes_tpslimit_when_configured(self):
+        """_do_bisync() must include --tpslimit when tpslimit > 0.
+
+        When a service has tpslimit set to a positive value the bisync command
+        must include '--tpslimit <value>' so that rclone throttles its API calls
+        per second.  This prevents Google Drive 403 "Quota exceeded for 'Queries
+        per minute'" errors.
+        """
+        self.config.add_service("DriveSvc2", "drive", "/tmp/drive_tps")
+        self.config.update_service("DriveSvc2", {"tpslimit": 5.0})
+        captured_cmds = []
+
+        def fake_run_rclone(cmd, service_name, svc, is_retry=False):
+            captured_cmds.append(cmd)
+            return True
+
+        self.rclone._run_rclone = fake_run_rclone
+        svc = self.config.get_service("DriveSvc2")
+        self.rclone._do_bisync(svc)
+
+        self.assertTrue(len(captured_cmds) > 0)
+        cmd = captured_cmds[0]
+        self.assertIn("--tpslimit", cmd, "--tpslimit must be present when tpslimit > 0")
+        tps_idx = cmd.index("--tpslimit")
+        self.assertAlmostEqual(float(cmd[tps_idx + 1]), 5.0, msg="--tpslimit value must match the configured tpslimit")
+
+    def test_do_bisync_omits_tpslimit_when_zero(self):
+        """_do_bisync() must NOT include --tpslimit when tpslimit is 0 (default)."""
+        self.config.add_service("DriveSvc3", "drive", "/tmp/drive_notps")
+        # tpslimit defaults to 0 – no explicit set needed
+        captured_cmds = []
+
+        def fake_run_rclone(cmd, service_name, svc, is_retry=False):
+            captured_cmds.append(cmd)
+            return True
+
+        self.rclone._run_rclone = fake_run_rclone
+        svc = self.config.get_service("DriveSvc3")
+        self.rclone._do_bisync(svc)
+
+        self.assertTrue(len(captured_cmds) > 0)
+        self.assertNotIn(
+            "--tpslimit",
+            captured_cmds[0],
+            "--tpslimit must NOT appear when tpslimit is 0",
+        )
+
+    def test_do_bisync_uses_per_service_transfers_and_checkers(self):
+        """_do_bisync() must respect per-service transfers and checkers values.
+
+        When a service has custom transfers=2 and checkers=4 those values must
+        appear in the bisync command instead of the global defaults (16/32).
+        """
+        self.config.add_service("DriveSvc4", "drive", "/tmp/drive_quota")
+        self.config.update_service("DriveSvc4", {"transfers": 2, "checkers": 4})
+        captured_cmds = []
+
+        def fake_run_rclone(cmd, service_name, svc, is_retry=False):
+            captured_cmds.append(cmd)
+            return True
+
+        self.rclone._run_rclone = fake_run_rclone
+        svc = self.config.get_service("DriveSvc4")
+        self.rclone._do_bisync(svc)
+
+        self.assertTrue(len(captured_cmds) > 0)
+        cmd = captured_cmds[0]
+        transfers_idx = cmd.index("--transfers")
+        self.assertEqual(int(cmd[transfers_idx + 1]), 2, "--transfers must equal the per-service value")
+        checkers_idx = cmd.index("--checkers")
+        self.assertEqual(int(cmd[checkers_idx + 1]), 4, "--checkers must equal the per-service value")
+
     def test_run_rclone_emits_error_lines_from_output(self):
         """_run_rclone() should emit lines containing 'ERROR' via on_error."""
         import io

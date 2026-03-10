@@ -269,6 +269,47 @@ class ConfigWindow:
         self._verbose_sync_var = tk.BooleanVar(value=self._svc.get("verbose_sync", False))
         tk.Checkbutton(p, text="Activar --verbose en sincronización (más detalles en el registro)", variable=self._verbose_sync_var).pack(anchor="w", pady=5)
 
+        # ── API rate-limit / concurrency (quota control) ──────────────────────
+        ttk.Separator(p, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=(12, 8))
+        tk.Label(
+            p,
+            text="Control de cuota de API y concurrencia",
+            font=("Segoe UI", 9, "bold"),
+            anchor="w",
+        ).pack(anchor="w")
+        tk.Label(
+            p,
+            text=(
+                "Reduce estos valores si ves errores 403 'Quota exceeded' de "
+                "Google Drive / OneDrive por demasiadas peticiones por minuto."
+            ),
+            fg="gray",
+            font=("Segoe UI", 8),
+            wraplength=440,
+            justify="left",
+        ).pack(anchor="w", pady=(0, 8))
+
+        row_frame = tk.Frame(p)
+        row_frame.pack(anchor="w", fill=tk.X, pady=(0, 4))
+
+        # --transfers
+        tk.Label(row_frame, text="Transferencias simultáneas (--transfers):", anchor="w").pack(side=tk.LEFT)
+        self._transfers_var = tk.IntVar(value=int(self._svc.get("transfers", 16)))
+        tk.Spinbox(row_frame, from_=1, to=64, textvariable=self._transfers_var, width=5).pack(side=tk.LEFT, padx=(4, 20))
+
+        # --checkers
+        tk.Label(row_frame, text="Verificaciones simultáneas (--checkers):", anchor="w").pack(side=tk.LEFT)
+        self._checkers_var = tk.IntVar(value=int(self._svc.get("checkers", 32)))
+        tk.Spinbox(row_frame, from_=1, to=128, textvariable=self._checkers_var, width=5).pack(side=tk.LEFT, padx=4)
+
+        # --tpslimit
+        tpslimit_frame = tk.Frame(p)
+        tpslimit_frame.pack(anchor="w", fill=tk.X, pady=(4, 0))
+        tk.Label(tpslimit_frame, text="Límite de peticiones API por segundo (--tpslimit):", anchor="w").pack(side=tk.LEFT)
+        self._tpslimit_var = tk.DoubleVar(value=float(self._svc.get("tpslimit", 0)))
+        tk.Spinbox(tpslimit_frame, from_=0, to=100, increment=0.5, textvariable=self._tpslimit_var, width=6, format="%.1f").pack(side=tk.LEFT, padx=4)
+        tk.Label(tpslimit_frame, text="(0 = sin límite)", fg="gray", font=("Segoe UI", 8)).pack(side=tk.LEFT, padx=4)
+
         # --- Delete service ---
         ttk.Separator(p, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=(20, 10))
         tk.Button(
@@ -1381,6 +1422,21 @@ class ConfigWindow:
             updates["resync_mode"] = self._resync_mode_var.get()
         if hasattr(self, "_verbose_sync_var"):
             updates["verbose_sync"] = self._verbose_sync_var.get()
+        if hasattr(self, "_transfers_var"):
+            try:
+                updates["transfers"] = int(self._transfers_var.get())
+            except (tk.TclError, ValueError):
+                pass
+        if hasattr(self, "_checkers_var"):
+            try:
+                updates["checkers"] = int(self._checkers_var.get())
+            except (tk.TclError, ValueError):
+                pass
+        if hasattr(self, "_tpslimit_var"):
+            try:
+                updates["tpslimit"] = float(self._tpslimit_var.get())
+            except (tk.TclError, ValueError):
+                pass
 
         # Panel 2 – directory
         if hasattr(self, "_local_path_var"):
