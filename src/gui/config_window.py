@@ -1,7 +1,7 @@
 """
 Service configuration window.
 
-Shows a left-side menu with 7 sections and a corresponding right-side panel:
+Shows a left-side menu with 8 sections and a corresponding right-side panel:
   1. Default configuration
   2. Change directory (local / remote)
   3. Exclusions management
@@ -9,6 +9,7 @@ Shows a left-side menu with 7 sections and a corresponding right-side panel:
   5. Sync schedule & startup options
   6. Free disk space / delete service
   7. Service information
+  8. Errors
 
 Window size: 60 % of screen height × 35 % of screen width.
 """
@@ -28,6 +29,11 @@ from src.config.config_manager import (
 from src.rclone.rclone_manager import RcloneManager
 from src.gui.setup_wizard import _center_window
 
+# Import type for annotation; avoid circular imports at runtime by using TYPE_CHECKING
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from src.gui.error_logger import ErrorLogger
+
 
 # Mapping from human-readable interval label → seconds
 INTERVAL_OPTIONS: Dict[str, int] = {
@@ -43,12 +49,17 @@ INTERVAL_OPTIONS: Dict[str, int] = {
     "24 horas": 86400,
 }
 
+# Index of the "Información del servicio" panel in ConfigWindow._show_panel().
+# Used by MainWindow._open_config_at_info() to land the user directly on the
+# panel that contains the 'Reconectar' and 'Buscar drive_id' buttons.
+INFO_PANEL_INDEX: int = 6
+
 
 class ConfigWindow:
     """
     Configuration window for a single service.
 
-    Displays seven option panels in a left-side menu.
+    Displays eight option panels in a left-side menu.
     All changes are applied only when the user clicks 'Guardar'.
     """
 
@@ -60,6 +71,8 @@ class ConfigWindow:
         service_name: str,
         on_saved: Optional[Callable[[], None]] = None,
         on_deleted: Optional[Callable[[str], None]] = None,
+        error_logger: Optional["ErrorLogger"] = None,
+        initial_panel: int = 0,
     ) -> None:
         # Store references
         self._config = config_manager
@@ -67,6 +80,8 @@ class ConfigWindow:
         self._service_name = service_name
         self._on_saved = on_saved
         self._on_deleted = on_deleted
+        # Optional ErrorLogger instance; may be None if not provided
+        self._error_logger = error_logger
 
         # Load a mutable copy of the service data
         svc = config_manager.get_service(service_name) or {}
@@ -91,8 +106,8 @@ class ConfigWindow:
         self._remote_tree_cache: List[Dict] = []
 
         self._build_layout()
-        # Show the first panel by default
-        self._show_panel(0)
+        # Show the requested panel (default: panel 0 – configuration)
+        self._show_panel(initial_panel)
 
         # Kick off a background tree fetch immediately so the data is likely
         # ready by the time the user navigates to Panel 4.
@@ -121,6 +136,8 @@ class ConfigWindow:
             "5. Programación de sync",
             "6. Espacio en disco",
             "7. Información del servicio",
+            "8. Errores",
+            "9. Montaje",
         ]
 
         self._menu_buttons: List[tk.Button] = []
@@ -190,6 +207,8 @@ class ConfigWindow:
             self._panel_schedule,
             self._panel_disk,
             self._panel_info,
+            self._panel_errors,
+            self._panel_mount,
         ]
         panels[index]()
 
@@ -213,10 +232,10 @@ class ConfigWindow:
         self._remote_path_var = tk.StringVar(value=self._svc.get("remote_path", "/"))
         tk.Entry(p, textvariable=self._remote_path_var, width=40).pack(anchor="w", pady=(2, 10))
 
-        # VFS cache mode
-        tk.Label(p, text="Modo de caché VFS:", anchor="w").pack(anchor="w")
-        self._vfs_var = tk.StringVar(value=self._svc.get("vfs_cache_mode", "on_demand"))
-        cache_modes = ["off", "minimal", "writes", "on_demand", "full"]
+        # VFS cache mode (used by the mount command; not applicable to bisync)
+        tk.Label(p, text="Modo de caché VFS (solo para montaje):", anchor="w").pack(anchor="w")
+        self._vfs_var = tk.StringVar(value=self._svc.get("vfs_cache_mode", "writes"))
+        cache_modes = ["off", "minimal", "writes", "full"]
         ttk.Combobox(p, textvariable=self._vfs_var, values=cache_modes, state="readonly", width=20).pack(anchor="w", pady=(2, 10))
 
         # Max cache size
@@ -224,9 +243,99 @@ class ConfigWindow:
         self._cache_size_var = tk.StringVar(value=self._svc.get("vfs_cache_max_size", "10G"))
         tk.Entry(p, textvariable=self._cache_size_var, width=15).pack(anchor="w", pady=(2, 10))
 
+        # Cache directory
+        tk.Label(p, text="Directorio de caché (vacío = predeterminado de rclone):", anchor="w").pack(anchor="w")
+        cache_dir_frame = tk.Frame(p)
+        cache_dir_frame.pack(fill=tk.X, pady=(2, 10))
+        self._cache_dir_var = tk.StringVar(value=self._svc.get("vfs_cache_dir", ""))
+        tk.Entry(cache_dir_frame, textvariable=self._cache_dir_var, width=40).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        tk.Button(
+            cache_dir_frame,
+            text="…",
+            command=self._browse_cache_dir,
+        ).pack(side=tk.LEFT, padx=4)
+
         # Resync checkbox
         self._resync_var = tk.BooleanVar(value=self._svc.get("use_resync", True))
         tk.Checkbutton(p, text="Usar --resync al detectar conflictos", variable=self._resync_var).pack(anchor="w", pady=5)
+
+        # Resync mode (conflict resolution strategy used with --resync)
+        tk.Label(p, text="Modo de resolución de conflictos (--resync-mode):", anchor="w").pack(anchor="w", pady=(10, 0))
+        self._resync_mode_var = tk.StringVar(value=self._svc.get("resync_mode", "newer"))
+        resync_modes = ["newer", "older", "larger", "path1", "path2", "union"]
+        ttk.Combobox(p, textvariable=self._resync_mode_var, values=resync_modes, state="readonly", width=15).pack(anchor="w", pady=(2, 10))
+
+        # Verbose sync
+        self._verbose_sync_var = tk.BooleanVar(value=self._svc.get("verbose_sync", False))
+        tk.Checkbutton(p, text="Activar --verbose en sincronización (más detalles en el registro)", variable=self._verbose_sync_var).pack(anchor="w", pady=5)
+
+        # ── API rate-limit / concurrency (quota control) ──────────────────────
+        ttk.Separator(p, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=(12, 8))
+        tk.Label(
+            p,
+            text="Control de cuota de API y concurrencia",
+            font=("Segoe UI", 9, "bold"),
+            anchor="w",
+        ).pack(anchor="w")
+        tk.Label(
+            p,
+            text=(
+                "Reduce estos valores si ves errores 403 'Quota exceeded' de "
+                "Google Drive / OneDrive por demasiadas peticiones por minuto."
+            ),
+            fg="gray",
+            font=("Segoe UI", 8),
+            wraplength=440,
+            justify="left",
+        ).pack(anchor="w", pady=(0, 8))
+
+        row_frame = tk.Frame(p)
+        row_frame.pack(anchor="w", fill=tk.X, pady=(0, 4))
+
+        # --transfers
+        tk.Label(row_frame, text="Transferencias simultáneas (--transfers):", anchor="w").pack(side=tk.LEFT)
+        self._transfers_var = tk.IntVar(value=int(self._svc.get("transfers", 16)))
+        tk.Spinbox(row_frame, from_=1, to=64, textvariable=self._transfers_var, width=5).pack(side=tk.LEFT, padx=(4, 20))
+
+        # --checkers
+        tk.Label(row_frame, text="Verificaciones simultáneas (--checkers):", anchor="w").pack(side=tk.LEFT)
+        self._checkers_var = tk.IntVar(value=int(self._svc.get("checkers", 32)))
+        tk.Spinbox(row_frame, from_=1, to=128, textvariable=self._checkers_var, width=5).pack(side=tk.LEFT, padx=4)
+
+        # --tpslimit
+        tpslimit_frame = tk.Frame(p)
+        tpslimit_frame.pack(anchor="w", fill=tk.X, pady=(4, 0))
+        tk.Label(tpslimit_frame, text="Límite de peticiones API por segundo (--tpslimit):", anchor="w").pack(side=tk.LEFT)
+        self._tpslimit_var = tk.DoubleVar(value=float(self._svc.get("tpslimit", 0)))
+        tk.Spinbox(tpslimit_frame, from_=0, to=100, increment=0.5, textvariable=self._tpslimit_var, width=6, format="%.1f").pack(side=tk.LEFT, padx=4)
+        tk.Label(tpslimit_frame, text="(0 = sin límite)", fg="gray", font=("Segoe UI", 8)).pack(side=tk.LEFT, padx=4)
+
+        # --- Delete service ---
+        ttk.Separator(p, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=(20, 10))
+        tk.Button(
+            p,
+            text="🗑️  Eliminar este servicio",
+            command=self._confirm_delete,
+            bg="#c50f1f",
+            fg="white",
+            font=("Segoe UI", 10),
+            relief=tk.FLAT,
+            padx=10,
+            pady=6,
+        ).pack(anchor="w", pady=(0, 4))
+        tk.Label(
+            p,
+            text="Elimina la configuración de este servicio. Los archivos locales no se borrarán.",
+            fg="gray",
+            font=("Segoe UI", 9),
+        ).pack(anchor="w")
+
+    def _browse_cache_dir(self) -> None:
+        """Open folder picker to select a custom VFS cache directory."""
+        current = self._cache_dir_var.get().strip() or os.path.expanduser("~")
+        folder = filedialog.askdirectory(initialdir=current, parent=self._win)
+        if folder:
+            self._cache_dir_var.set(folder)
 
     # ------------------------------------------------------------------
     # Panel 2 – Change directory
@@ -773,6 +882,518 @@ class ConfigWindow:
             tk.Label(row, text=label, width=22, anchor="w", font=("Segoe UI", 9, "bold")).pack(side=tk.LEFT)
             tk.Label(row, text=value, anchor="w", wraplength=350, justify="left").pack(side=tk.LEFT)
 
+        # ── Reconnect section ────────────────────────────────────────────────
+        # Shown for all OAuth-based platforms (non-Mega).  Lets the user re-run
+        # the OAuth flow to fix a missing drive_id/drive_type in rclone.conf,
+        # which causes bisync to fail immediately with "unable to get drive_id
+        # and drive_type - if you are upgrading from older versions of rclone".
+        platform = self._svc.get("platform", "")
+        if platform and platform != "mega":
+            sep = tk.Frame(p, height=1, bg="#cccccc")
+            sep.pack(fill=tk.X, pady=(12, 8))
+
+            tk.Label(
+                p,
+                text=(
+                    "Si la sincronización falla con un error de drive_id o "
+                    "drive_type, haz clic en 'Reconectar' para abrir un terminal "
+                    "con el comando de reconfiguración. Sigue las instrucciones "
+                    "en el terminal para que rclone obtenga drive_id automáticamente."
+                ),
+                wraplength=450,
+                justify="left",
+                fg="#555555",
+            ).pack(anchor="w", pady=(0, 8))
+
+            # Status label updated during reconnect / drive_id search
+            self._reconnect_status_var = tk.StringVar(value="")
+            tk.Label(
+                p,
+                textvariable=self._reconnect_status_var,
+                fg="gray",
+                font=("Segoe UI", 9, "italic"),
+                wraplength=450,
+                justify="left",
+            ).pack(anchor="w", pady=(0, 6))
+
+            btn_row = tk.Frame(p)
+            btn_row.pack(anchor="w")
+
+            self._find_drive_id_btn = tk.Button(
+                btn_row,
+                text="🔎 Buscar drive_id automáticamente",
+                command=self._start_find_drive_id,
+                relief=tk.FLAT,
+                bg="#107c10",
+                fg="white",
+                font=("Segoe UI", 9, "bold"),
+            )
+            self._find_drive_id_btn.pack(side=tk.LEFT, padx=(0, 8))
+
+            self._reconnect_btn = tk.Button(
+                btn_row,
+                text="🔄 Reconectar",
+                command=self._start_reconnect,
+                relief=tk.FLAT,
+                bg="#0078d4",
+                fg="white",
+                font=("Segoe UI", 9, "bold"),
+            )
+            self._reconnect_btn.pack(side=tk.LEFT)
+
+    def _start_find_drive_id(self) -> None:
+        """Search known rclone config files for drive_id/drive_type in a background thread.
+
+        If exactly one candidate is found it is offered to the user for
+        immediate patching.  If multiple candidates are found the user is
+        presented with a choice.  If nothing is found the user is advised to
+        use Reconectar instead.
+        """
+        remote_name = self._svc.get("remote_name", "")
+        if not remote_name:
+            messagebox.showwarning(
+                "Datos insuficientes",
+                "No se pudo determinar el nombre del remoto.",
+                parent=self._win,
+            )
+            return
+
+        self._find_drive_id_btn.configure(state=tk.DISABLED, text="Buscando…")
+        self._reconnect_btn.configure(state=tk.DISABLED)
+        self._reconnect_status_var.set("Buscando drive_id en configuraciones conocidas…")
+
+        def run_search() -> None:
+            candidates = self._rclone.find_drive_id_in_known_configs(remote_name)
+            self._win.after(0, self._on_find_drive_id_done, candidates, remote_name)
+
+        threading.Thread(target=run_search, daemon=True).start()
+
+    def _on_find_drive_id_done(
+        self, candidates: "list[dict]", remote_name: str
+    ) -> None:
+        """Called on the main thread with the search results."""
+        self._find_drive_id_btn.configure(
+            state=tk.NORMAL, text="🔎 Buscar drive_id automáticamente"
+        )
+        self._reconnect_btn.configure(state=tk.NORMAL)
+
+        if not candidates:
+            self._reconnect_status_var.set(
+                "❌ No se encontró drive_id en ninguna configuración conocida. "
+                "Usa 'Reconectar' para volver a autenticarte."
+            )
+            return
+
+        # Build a user-readable list for the choice dialog
+        choice_lines = [
+            f"{i + 1}. [{c['section']}] drive_id={c['drive_id']}  "
+            f"drive_type={c['drive_type']}\n   ({c['source_file']})"
+            for i, c in enumerate(candidates)
+        ]
+
+        if len(candidates) == 1:
+            c = candidates[0]
+            msg = (
+                f"Se encontró un drive_id en:\n\n"
+                f"  Archivo : {c['source_file']}\n"
+                f"  Sección : [{c['section']}]\n"
+                f"  drive_id   = {c['drive_id']}\n"
+                f"  drive_type = {c['drive_type']}\n\n"
+                "¿Deseas aplicar estos valores al remoto actual?"
+            )
+            apply = messagebox.askyesno(
+                "drive_id encontrado", msg, parent=self._win
+            )
+            if apply:
+                self._apply_drive_id_patch(remote_name, c["drive_id"], c["drive_type"])
+        else:
+            # Multiple candidates — ask the user to pick one via simpledialog
+            prompt = (
+                f"Se encontraron {len(candidates)} candidatos. "
+                "Escribe el número del que quieres aplicar (o 0 para cancelar):\n\n"
+                + "\n".join(choice_lines)
+            )
+            raw = simpledialog.askstring(
+                "Seleccionar drive_id",
+                prompt,
+                parent=self._win,
+            )
+            if raw is None:
+                self._reconnect_status_var.set("")
+                return
+            try:
+                idx = int(raw.strip()) - 1
+            except ValueError:
+                self._reconnect_status_var.set(
+                    f"❌ Entrada no válida. Escribe un número entre 1 y {len(candidates)}."
+                )
+                return
+            if idx < 0 or idx >= len(candidates):
+                self._reconnect_status_var.set(
+                    f"❌ Número fuera de rango. Escribe un número entre 1 y {len(candidates)}."
+                )
+                return
+            c = candidates[idx]
+            self._apply_drive_id_patch(remote_name, c["drive_id"], c["drive_type"])
+
+    def _apply_drive_id_patch(
+        self, remote_name: str, drive_id: str, drive_type: str
+    ) -> None:
+        """Write drive_id/drive_type into rclone.conf and report the result."""
+        ok, error = self._rclone.patch_remote_drive_fields(
+            remote_name, drive_id, drive_type
+        )
+        if ok:
+            self._reconnect_status_var.set(
+                "✅ drive_id y drive_type aplicados. Reinicia la sincronización."
+            )
+        else:
+            self._reconnect_status_var.set(f"❌ Error al aplicar: {error}")
+
+    def _start_reconnect(self) -> None:
+        """Re-authenticate the remote via ``rclone config reconnect`` in a terminal.
+
+        ``rclone config reconnect <remote>:`` is the correct command for
+        fixing a remote that lacks ``drive_id`` / ``drive_type``.  Unlike
+        ``rclone config create --auto-confirm`` (which skips the post-OAuth
+        drive-selection prompt), *reconnect* presents the full interactive
+        flow so that ``drive_id`` is properly written to rclone.conf.
+
+        This method tries to launch the command inside a terminal emulator.
+        If no emulator is found it displays the shell command in a dialog so
+        the user can run it manually in their own terminal.
+        """
+        remote_name = self._svc.get("remote_name", "")
+        if not remote_name:
+            messagebox.showwarning(
+                "Datos insuficientes",
+                "No se pudo determinar el nombre del remoto.",
+                parent=self._win,
+            )
+            return
+
+        launched, cmd = self._rclone.open_terminal_reconnect(remote_name)
+        if launched:
+            self._reconnect_status_var.set(
+                "✅ Terminal abierto — autentica el remoto y sigue las "
+                "instrucciones que aparecen en él. Reinicia la "
+                "sincronización cuando termines."
+            )
+        else:
+            # No terminal emulator found: show the command for the user to run.
+            self._show_reconnect_command_dialog(cmd)
+            self._reconnect_status_var.set(
+                "No se encontró un emulador de terminal. "
+                "Ejecuta el comando mostrado en tu terminal."
+            )
+
+    def _show_reconnect_command_dialog(self, cmd: str) -> None:
+        """Show a dialog with the reconnect command for the user to copy."""
+        dialog = tk.Toplevel(self._win)
+        dialog.title("Ejecutar en terminal")
+        dialog.resizable(False, False)
+        _center_window(dialog, self._win)
+
+        tk.Label(
+            dialog,
+            text=(
+                "No se encontró un emulador de terminal instalado.\n"
+                "Copia y ejecuta el siguiente comando en tu terminal:"
+            ),
+            wraplength=500,
+            justify="left",
+            pady=8,
+            padx=12,
+        ).pack(anchor="w")
+
+        cmd_var = tk.StringVar(value=cmd)
+        entry = tk.Entry(dialog, textvariable=cmd_var, width=70, state="readonly")
+        entry.pack(padx=12, pady=(0, 8), fill=tk.X)
+
+        def copy_cmd() -> None:
+            dialog.clipboard_clear()
+            dialog.clipboard_append(cmd)
+            copy_btn.configure(text="✅ Copiado")
+            dialog.after(1500, lambda: copy_btn.configure(text="📋 Copiar"))
+
+        btn_row = tk.Frame(dialog)
+        btn_row.pack(padx=12, pady=(0, 12))
+        copy_btn = tk.Button(btn_row, text="📋 Copiar", command=copy_cmd)
+        copy_btn.pack(side=tk.LEFT, padx=(0, 8))
+        tk.Button(btn_row, text="Cerrar", command=dialog.destroy).pack(side=tk.LEFT)
+
+    # ------------------------------------------------------------------
+    # Panel 8 – Errors
+    # ------------------------------------------------------------------
+
+    def _panel_errors(self) -> None:
+        """Panel displaying the application error log with copy and export actions."""
+        p = self._make_panel("Errores")
+
+        tk.Label(
+            p,
+            text=(
+                "Registro de errores ocurridos durante la ejecución de la aplicación.\n"
+                "Los mensajes más recientes aparecen primero."
+            ),
+            wraplength=450,
+            justify="left",
+        ).pack(anchor="w", pady=(0, 8))
+
+        # ── Scrollable text box ──────────────────────────────────────
+        text_frame = tk.Frame(p, bd=1, relief=tk.SUNKEN)
+        text_frame.pack(fill=tk.BOTH, expand=True)
+
+        sb = tk.Scrollbar(text_frame, orient=tk.VERTICAL)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+
+        self._errors_text = tk.Text(
+            text_frame,
+            yscrollcommand=sb.set,
+            wrap=tk.WORD,
+            font=("Courier", 9),
+            bg="white",
+            state=tk.DISABLED,
+            relief=tk.FLAT,
+        )
+        self._errors_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        sb.config(command=self._errors_text.yview)
+
+        # Populate the text box
+        self._refresh_errors_text()
+
+        # ── Action buttons ───────────────────────────────────────────
+        btn_frame = tk.Frame(p, bg="white")
+        btn_frame.pack(fill=tk.X, pady=(6, 0))
+
+        tk.Button(
+            btn_frame,
+            text="📋 Copiar selección",
+            command=self._copy_selected_errors,
+            relief=tk.FLAT,
+            bg="#e0e0e0",
+            font=("Segoe UI", 9),
+        ).pack(side=tk.LEFT, padx=(0, 6))
+
+        tk.Button(
+            btn_frame,
+            text="📋 Copiar todo",
+            command=self._copy_all_errors,
+            relief=tk.FLAT,
+            bg="#e0e0e0",
+            font=("Segoe UI", 9),
+        ).pack(side=tk.LEFT, padx=(0, 6))
+
+        tk.Button(
+            btn_frame,
+            text="💾 Exportar",
+            command=self._export_errors,
+            relief=tk.FLAT,
+            bg="#e0e0e0",
+            font=("Segoe UI", 9),
+        ).pack(side=tk.LEFT, padx=(0, 6))
+
+        tk.Button(
+            btn_frame,
+            text="🔄 Actualizar",
+            command=self._refresh_errors_text,
+            relief=tk.FLAT,
+            bg="#e0e0e0",
+            font=("Segoe UI", 9),
+        ).pack(side=tk.LEFT)
+
+    def _refresh_errors_text(self) -> None:
+        """Reload the error log text from the logger into the text widget."""
+        if not hasattr(self, "_errors_text"):
+            return
+        try:
+            if not self._errors_text.winfo_exists():
+                return
+        except tk.TclError:
+            return
+
+        if self._error_logger is not None:
+            content = self._error_logger.get_text_for_service(self._service_name)
+        else:
+            content = "(Registro de errores no disponible)"
+
+        self._errors_text.configure(state=tk.NORMAL)
+        self._errors_text.delete("1.0", tk.END)
+        self._errors_text.insert(tk.END, content if content else "(Sin errores registrados)")
+        self._errors_text.configure(state=tk.DISABLED)
+
+    def _copy_selected_errors(self) -> None:
+        """Copy any selected text from the errors text box to the clipboard."""
+        if not hasattr(self, "_errors_text"):
+            return
+        try:
+            selected = self._errors_text.get(tk.SEL_FIRST, tk.SEL_LAST)
+            self._win.clipboard_clear()
+            self._win.clipboard_append(selected)
+        except tk.TclError:
+            # No selection – copy nothing
+            pass
+
+    def _copy_all_errors(self) -> None:
+        """Copy all error log text to the clipboard."""
+        if not hasattr(self, "_errors_text"):
+            return
+        text = self._errors_text.get("1.0", tk.END).strip()
+        if text:
+            self._win.clipboard_clear()
+            self._win.clipboard_append(text)
+
+    def _export_errors(self) -> None:
+        """Save the error log to a user-chosen text file."""
+        if not hasattr(self, "_errors_text"):
+            return
+        text = self._errors_text.get("1.0", tk.END).strip()
+        if not text:
+            messagebox.showinfo(
+                "Sin errores",
+                "No hay errores registrados para exportar.",
+                parent=self._win,
+            )
+            return
+        path = filedialog.asksaveasfilename(
+            defaultextension=".txt",
+            filetypes=[("Texto", "*.txt"), ("Todos los archivos", "*.*")],
+            initialfile="errores_rclone.txt",
+            parent=self._win,
+            title="Exportar registro de errores",
+        )
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(text)
+            messagebox.showinfo(
+                "Exportado",
+                f"El registro de errores se guardó en:\n{path}",
+                parent=self._win,
+            )
+        except (OSError, IOError) as exc:
+            messagebox.showerror(
+                "Error al exportar",
+                f"No se pudo guardar el archivo:\n{exc}",
+                parent=self._win,
+            )
+
+    # ------------------------------------------------------------------
+    # Panel 9 – Mount
+    # ------------------------------------------------------------------
+
+    def _panel_mount(self) -> None:
+        """Panel to configure and control the persistent rclone mount service."""
+        p = self._make_panel("Montaje (rclone mount)")
+
+        tk.Label(
+            p,
+            text=(
+                "Ejecuta un proceso de montaje permanente que hace que el almacenamiento "
+                "remoto aparezca como una carpeta local del sistema.\n"
+                "Los ajustes de caché VFS (modo, tamaño, directorio) se comparten con bisync "
+                "y se configuran en la sección 1."
+            ),
+            wraplength=450,
+            justify="left",
+        ).pack(anchor="w", pady=(0, 10))
+
+        # Enable mount checkbox
+        self._mount_enabled_var = tk.BooleanVar(value=self._svc.get("mount_enabled", False))
+        tk.Checkbutton(
+            p,
+            text="Activar montaje automático al iniciar la aplicación",
+            variable=self._mount_enabled_var,
+        ).pack(anchor="w", pady=(0, 10))
+
+        # Mount path
+        tk.Label(p, text="Directorio de montaje (punto de montaje local):", anchor="w").pack(anchor="w")
+        mount_frame = tk.Frame(p)
+        mount_frame.pack(fill=tk.X, pady=(2, 10))
+        self._mount_path_var = tk.StringVar(value=self._svc.get("mount_path", ""))
+        tk.Entry(mount_frame, textvariable=self._mount_path_var, width=45).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        tk.Button(mount_frame, text="…", command=self._browse_mount_dir).pack(side=tk.LEFT, padx=4)
+
+        # VFS read chunk size
+        tk.Label(p, text="Tamaño de bloque de lectura VFS (--vfs-read-chunk-size):", anchor="w").pack(anchor="w")
+        self._vfs_read_chunk_var = tk.StringVar(value=self._svc.get("vfs_read_chunk_size", "10M"))
+        tk.Entry(p, textvariable=self._vfs_read_chunk_var, width=15).pack(anchor="w", pady=(2, 10))
+
+        # VFS read chunk size limit
+        tk.Label(p, text="Límite de bloque de lectura VFS (--vfs-read-chunk-size-limit):", anchor="w").pack(anchor="w")
+        self._vfs_read_chunk_limit_var = tk.StringVar(value=self._svc.get("vfs_read_chunk_size_limit", "100M"))
+        tk.Entry(p, textvariable=self._vfs_read_chunk_limit_var, width=15).pack(anchor="w", pady=(2, 10))
+
+        tk.Separator(p, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=12)
+
+        # Live mount controls
+        mount_status = "Montado ✅" if self._rclone.is_mounted(self._service_name) else "No montado ❌"
+        self._mount_status_var = tk.StringVar(value=mount_status)
+        tk.Label(p, textvariable=self._mount_status_var, font=("Segoe UI", 10, "bold"), fg="#0078d4").pack(anchor="w", pady=(0, 8))
+
+        btn_row = tk.Frame(p)
+        btn_row.pack(anchor="w")
+        tk.Button(
+            btn_row,
+            text="▶ Iniciar montaje ahora",
+            command=self._start_mount_now,
+            bg="#107c10",
+            fg="white",
+            font=("Segoe UI", 9),
+            relief=tk.FLAT,
+            padx=8,
+            pady=4,
+        ).pack(side=tk.LEFT, padx=(0, 8))
+        tk.Button(
+            btn_row,
+            text="⏹ Detener montaje",
+            command=self._stop_mount_now,
+            bg="#c50f1f",
+            fg="white",
+            font=("Segoe UI", 9),
+            relief=tk.FLAT,
+            padx=8,
+            pady=4,
+        ).pack(side=tk.LEFT)
+
+    def _browse_mount_dir(self) -> None:
+        """Open folder picker to select the mount point directory."""
+        current = self._mount_path_var.get().strip() or os.path.expanduser("~")
+        folder = filedialog.askdirectory(initialdir=current, parent=self._win)
+        if folder:
+            self._mount_path_var.set(folder)
+
+    def _start_mount_now(self) -> None:
+        """Apply mount path from the entry and start the mount immediately."""
+        # Temporarily update the service config with the current UI values so
+        # start_mount() uses the latest settings without requiring a full save.
+        mount_path = self._mount_path_var.get().strip()
+        if not mount_path:
+            messagebox.showwarning(
+                "Sin ruta",
+                "Configura el directorio de montaje antes de iniciar.",
+                parent=self._win,
+            )
+            return
+        self._config.update_service(self._service_name, {
+            "mount_enabled": True,
+            "mount_path": mount_path,
+            "vfs_read_chunk_size": self._vfs_read_chunk_var.get().strip(),
+            "vfs_read_chunk_size_limit": self._vfs_read_chunk_limit_var.get().strip(),
+        })
+        self._svc = dict(self._config.get_service(self._service_name) or {})
+        ok = self._rclone.start_mount(self._service_name)
+        if ok:
+            self._mount_status_var.set("Montado ✅")
+        else:
+            self._mount_status_var.set("Error al montar ❌")
+
+    def _stop_mount_now(self) -> None:
+        """Stop the running mount process immediately."""
+        self._rclone.stop_mount(self._service_name)
+        self._mount_status_var.set("No montado ❌")
+
     # ------------------------------------------------------------------
     # Save
     # ------------------------------------------------------------------
@@ -793,8 +1414,29 @@ class ConfigWindow:
             updates["vfs_cache_mode"] = self._vfs_var.get()
         if hasattr(self, "_cache_size_var"):
             updates["vfs_cache_max_size"] = self._cache_size_var.get()
+        if hasattr(self, "_cache_dir_var"):
+            updates["vfs_cache_dir"] = self._cache_dir_var.get().strip()
         if hasattr(self, "_resync_var"):
             updates["use_resync"] = self._resync_var.get()
+        if hasattr(self, "_resync_mode_var"):
+            updates["resync_mode"] = self._resync_mode_var.get()
+        if hasattr(self, "_verbose_sync_var"):
+            updates["verbose_sync"] = self._verbose_sync_var.get()
+        if hasattr(self, "_transfers_var"):
+            try:
+                updates["transfers"] = int(self._transfers_var.get())
+            except (tk.TclError, ValueError):
+                pass
+        if hasattr(self, "_checkers_var"):
+            try:
+                updates["checkers"] = int(self._checkers_var.get())
+            except (tk.TclError, ValueError):
+                pass
+        if hasattr(self, "_tpslimit_var"):
+            try:
+                updates["tpslimit"] = float(self._tpslimit_var.get())
+            except (tk.TclError, ValueError):
+                pass
 
         # Panel 2 – directory
         if hasattr(self, "_local_path_var"):
@@ -832,6 +1474,16 @@ class ConfigWindow:
         # Cancel the disk refresh timer if it exists
         if hasattr(self, "_disk_refresh_id"):
             self._win.after_cancel(self._disk_refresh_id)
+
+        # Panel 9 – mount
+        if hasattr(self, "_mount_enabled_var"):
+            updates["mount_enabled"] = self._mount_enabled_var.get()
+        if hasattr(self, "_mount_path_var"):
+            updates["mount_path"] = self._mount_path_var.get().strip()
+        if hasattr(self, "_vfs_read_chunk_var"):
+            updates["vfs_read_chunk_size"] = self._vfs_read_chunk_var.get().strip()
+        if hasattr(self, "_vfs_read_chunk_limit_var"):
+            updates["vfs_read_chunk_size_limit"] = self._vfs_read_chunk_limit_var.get().strip()
 
         self._config.update_service(self._service_name, updates)
 

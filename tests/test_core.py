@@ -5,6 +5,7 @@ Unit tests for the core modules: ConfigManager, RcloneManager.
 Run with:  python3 -m pytest tests/test_core.py -v
 """
 
+import configparser
 import json
 import os
 import sys
@@ -25,7 +26,15 @@ from src.config.config_manager import (
     DEFAULT_SYNC_INTERVAL,
     DEFAULT_EXCLUSIONS,
 )
-from src.rclone.rclone_manager import RcloneManager, _extract_file_path, _human_size
+from src.rclone.rclone_manager import (
+    RcloneManager,
+    _extract_file_path,
+    _human_size,
+    _rclone_supports_resync_mode,
+    _bisync_cache_dir,
+    _clear_bisync_stale_files,
+    _DRIVE_ID_MISSING_PHRASE,
+)
 
 
 class TestConfigManager(unittest.TestCase):
@@ -150,6 +159,12 @@ class TestConfigManager(unittest.TestCase):
         mgr2 = ConfigManager()
         self.assertEqual(mgr2.get_services(), [])
 
+    def test_service_has_vfs_cache_dir_field(self):
+        """New services should include the vfs_cache_dir field defaulting to empty."""
+        svc = self.mgr.add_service("VfsDirSvc", "onedrive", "/tmp/vfsdir")
+        self.assertIn("vfs_cache_dir", svc)
+        self.assertEqual(svc["vfs_cache_dir"], "")
+
 
 class TestConfigManagerConstants(unittest.TestCase):
     """Tests for module-level constants in config_manager."""
@@ -203,6 +218,30 @@ class TestRcloneHelpers(unittest.TestCase):
     def test_human_size_gigabytes(self):
         """_human_size() should format gigabytes correctly."""
         self.assertIn("GB", _human_size(3 * 1024 * 1024 * 1024))
+
+    def test_rclone_supports_resync_mode_true_for_v1_64(self):
+        """_rclone_supports_resync_mode() should return True for rclone v1.64+."""
+        mock_cfg = MagicMock()
+        mock_cfg.get_rclone_version.return_value = "rclone v1.64.0"
+        self.assertTrue(_rclone_supports_resync_mode(mock_cfg))
+
+    def test_rclone_supports_resync_mode_true_for_v1_65(self):
+        """_rclone_supports_resync_mode() should return True for rclone v1.65."""
+        mock_cfg = MagicMock()
+        mock_cfg.get_rclone_version.return_value = "rclone v1.65.2"
+        self.assertTrue(_rclone_supports_resync_mode(mock_cfg))
+
+    def test_rclone_supports_resync_mode_false_for_v1_63(self):
+        """_rclone_supports_resync_mode() should return False for rclone v1.63."""
+        mock_cfg = MagicMock()
+        mock_cfg.get_rclone_version.return_value = "rclone v1.63.1"
+        self.assertFalse(_rclone_supports_resync_mode(mock_cfg))
+
+    def test_rclone_supports_resync_mode_false_when_version_unknown(self):
+        """_rclone_supports_resync_mode() should return False when version cannot be parsed."""
+        mock_cfg = MagicMock()
+        mock_cfg.get_rclone_version.return_value = "rclone not found"
+        self.assertFalse(_rclone_supports_resync_mode(mock_cfg))
 
 
 class TestRcloneManager(unittest.TestCase):
@@ -265,6 +304,1426 @@ class TestRcloneManager(unittest.TestCase):
         self.rclone.on_status_change = lambda name, status: received.append((name, status))
         self.rclone._set_status("MySvc", "Testing")
         self.assertIn(("MySvc", "Testing"), received)
+
+    def test_on_error_callback_is_called(self):
+        """_emit_error() should invoke the on_error callback."""
+        errors = []
+        self.rclone.on_error = lambda name, msg: errors.append((name, msg))
+        self.rclone._emit_error("MySvc", "Test error message")
+        self.assertIn(("MySvc", "Test error message"), errors)
+
+    def test_vfs_args_not_in_bisync_command(self):
+        """_do_bisync() must NOT include VFS cache flags (--vfs-cache-mode etc.)
+
+        rclone bisync does not accept VFS cache options; those are exclusive to
+        the rclone mount command.  Passing them to bisync causes a fatal error.
+        """
+        self.config.add_service("VfsSvc", "onedrive", "/tmp/vfs_test")
+        self.config.update_service("VfsSvc", {
+            "vfs_cache_mode": "full",
+            "vfs_cache_max_size": "5G",
+            "vfs_cache_dir": "/tmp/cache_vfs",
+        })
+        captured_cmds = []
+
+        def fake_run_rclone(cmd, service_name, svc, is_retry=False):
+            captured_cmds.append(cmd)
+            return True
+
+        self.rclone._run_rclone = fake_run_rclone
+        svc = self.config.get_service("VfsSvc")
+        self.rclone._do_bisync(svc)
+
+        self.assertTrue(len(captured_cmds) > 0)
+        full_cmd = captured_cmds[0]
+        # VFS flags must NOT appear in the bisync command
+        self.assertNotIn("--vfs-cache-mode", full_cmd)
+        self.assertNotIn("--vfs-cache-max-size", full_cmd)
+        self.assertNotIn("--cache-dir", full_cmd)
+
+    def test_vfs_cache_dir_never_in_bisync_command(self):
+        """_do_bisync() should never include --cache-dir regardless of vfs_cache_dir setting."""
+        self.config.add_service("VfsSvc2", "onedrive", "/tmp/vfs_test2")
+        self.config.update_service("VfsSvc2", {
+            "vfs_cache_mode": "writes",
+            "vfs_cache_dir": "/some/cache/dir",
+        })
+        captured_cmds = []
+
+        def fake_run_rclone(cmd, service_name, svc, is_retry=False):
+            captured_cmds.append(cmd)
+            return True
+
+        self.rclone._run_rclone = fake_run_rclone
+        svc = self.config.get_service("VfsSvc2")
+        self.rclone._do_bisync(svc)
+
+        self.assertTrue(len(captured_cmds) > 0)
+        self.assertNotIn("--cache-dir", captured_cmds[0])
+
+    def test_do_bisync_logs_command_before_running(self):
+        """_do_bisync() should emit a [CMD] entry via on_error before the first run."""
+        self.config.add_service("CmdSvc", "onedrive", "/tmp/cmd_test")
+        logged = []
+        self.rclone.on_error = lambda name, msg: logged.append((name, msg))
+
+        def fake_run_rclone(cmd, service_name, svc, is_retry=False):
+            return True
+
+        self.rclone._run_rclone = fake_run_rclone
+        svc = self.config.get_service("CmdSvc")
+        self.rclone._do_bisync(svc)
+
+        # At least one [CMD] entry should have been logged
+        cmd_entries = [(n, m) for n, m in logged if m.startswith("[CMD]")]
+        self.assertTrue(len(cmd_entries) >= 1, "Expected at least one [CMD] log entry")
+        # The logged command should contain 'bisync'
+        self.assertIn("bisync", cmd_entries[0][1])
+
+    def test_do_bisync_cmd_log_quotes_patterns_with_spaces(self):
+        """[CMD] log entries must shell-quote arguments that contain spaces.
+
+        rclone is invoked via a subprocess list so execution is always correct,
+        but the logged command must be copy-pasteable to a shell.  Arguments
+        such as --exclude '/Almacén personal/**' must appear with quotes so
+        the space inside the path is not misinterpreted by a shell.
+        """
+        self.config.add_service("QuoteSvc", "onedrive", "/tmp/quote_test")
+        self.config.update_service("QuoteSvc", {
+            "exclude_personal_vault": True,
+            "exclusions": [PERSONAL_VAULT_PATTERN],
+        })
+        logged = []
+        self.rclone.on_error = lambda name, msg: logged.append((name, msg))
+
+        def fake_run_rclone(cmd, service_name, svc, is_retry=False):
+            return True
+
+        self.rclone._run_rclone = fake_run_rclone
+        svc = self.config.get_service("QuoteSvc")
+        self.rclone._do_bisync(svc)
+
+        cmd_entries = [m for _, m in logged if m.startswith("[CMD]")]
+        self.assertTrue(len(cmd_entries) >= 1)
+        logged_cmd = cmd_entries[0]
+        # The pattern with a space must appear quoted so the log is
+        # copy-pasteable; the bare unquoted string must NOT be present.
+        self.assertNotIn("--exclude /Almacén", logged_cmd,
+                         "Pattern with space must be quoted in the CMD log")
+        # Either single- or double-quoted form is acceptable
+        self.assertTrue(
+            '"/Almacén personal/**"' in logged_cmd or
+            "'/Almacén personal/**'" in logged_cmd,
+            f"Expected quoted pattern in CMD log, got: {logged_cmd!r}",
+        )
+
+    def test_do_bisync_logs_resync_command_on_failure(self):
+        """_do_bisync() should emit a [CMD] entry for the --resync retry."""
+        self.config.add_service("ResyncSvc", "onedrive", "/tmp/resync_test")
+        logged = []
+        self.rclone.on_error = lambda name, msg: logged.append((name, msg))
+
+        call_count = [0]
+
+        def fake_run_rclone(cmd, service_name, svc, is_retry=False):
+            call_count[0] += 1
+            return False  # Always fail to trigger the resync retry
+
+        self.rclone._run_rclone = fake_run_rclone
+        svc = self.config.get_service("ResyncSvc")
+        self.rclone._do_bisync(svc)
+
+        cmd_entries = [(n, m) for n, m in logged if m.startswith("[CMD]")]
+        self.assertEqual(len(cmd_entries), 2, "Expected two [CMD] entries (initial + resync)")
+        self.assertIn("--resync", cmd_entries[1][1])
+
+    def test_do_bisync_includes_acknowledge_abuse_for_drive(self):
+        """_do_bisync() must include --drive-acknowledge-abuse for Google Drive services.
+
+        Google Drive occasionally returns HTTP 403 cannotDownloadAbusiveFile for
+        files it has flagged as malware or spam.  Without this flag rclone (and
+        therefore bisync) fails with a critical error even though the file is
+        just a normal project artefact.  Adding the flag lets rclone proceed.
+        """
+        self.config.add_service("DriveSvc", "drive", "/tmp/drive_test")
+        captured_cmds = []
+
+        def fake_run_rclone(cmd, service_name, svc, is_retry=False):
+            captured_cmds.append(cmd)
+            return True
+
+        self.rclone._run_rclone = fake_run_rclone
+        svc = self.config.get_service("DriveSvc")
+        self.rclone._do_bisync(svc)
+
+        self.assertTrue(len(captured_cmds) > 0)
+        self.assertIn(
+            "--drive-acknowledge-abuse",
+            captured_cmds[0],
+            "--drive-acknowledge-abuse must be present in bisync command for drive platform",
+        )
+
+    def test_do_bisync_no_acknowledge_abuse_for_other_platforms(self):
+        """_do_bisync() must NOT include --drive-acknowledge-abuse for non-Drive platforms."""
+        self.config.add_service("OneDriveSvc", "onedrive", "/tmp/od_test")
+        captured_cmds = []
+
+        def fake_run_rclone(cmd, service_name, svc, is_retry=False):
+            captured_cmds.append(cmd)
+            return True
+
+        self.rclone._run_rclone = fake_run_rclone
+        svc = self.config.get_service("OneDriveSvc")
+        self.rclone._do_bisync(svc)
+
+        self.assertTrue(len(captured_cmds) > 0)
+        self.assertNotIn(
+            "--drive-acknowledge-abuse",
+            captured_cmds[0],
+            "--drive-acknowledge-abuse must NOT appear for non-drive platforms",
+        )
+
+    def test_do_bisync_includes_tpslimit_when_configured(self):
+        """_do_bisync() must include --tpslimit when tpslimit > 0.
+
+        When a service has tpslimit set to a positive value the bisync command
+        must include '--tpslimit <value>' so that rclone throttles its API calls
+        per second.  This prevents Google Drive 403 "Quota exceeded for 'Queries
+        per minute'" errors.
+        """
+        self.config.add_service("DriveSvc2", "drive", "/tmp/drive_tps")
+        self.config.update_service("DriveSvc2", {"tpslimit": 5.0})
+        captured_cmds = []
+
+        def fake_run_rclone(cmd, service_name, svc, is_retry=False):
+            captured_cmds.append(cmd)
+            return True
+
+        self.rclone._run_rclone = fake_run_rclone
+        svc = self.config.get_service("DriveSvc2")
+        self.rclone._do_bisync(svc)
+
+        self.assertTrue(len(captured_cmds) > 0)
+        cmd = captured_cmds[0]
+        self.assertIn("--tpslimit", cmd, "--tpslimit must be present when tpslimit > 0")
+        tps_idx = cmd.index("--tpslimit")
+        self.assertAlmostEqual(float(cmd[tps_idx + 1]), 5.0, msg="--tpslimit value must match the configured tpslimit")
+
+    def test_do_bisync_omits_tpslimit_when_zero(self):
+        """_do_bisync() must NOT include --tpslimit when tpslimit is 0 (default)."""
+        self.config.add_service("DriveSvc3", "drive", "/tmp/drive_notps")
+        # tpslimit defaults to 0 – no explicit set needed
+        captured_cmds = []
+
+        def fake_run_rclone(cmd, service_name, svc, is_retry=False):
+            captured_cmds.append(cmd)
+            return True
+
+        self.rclone._run_rclone = fake_run_rclone
+        svc = self.config.get_service("DriveSvc3")
+        self.rclone._do_bisync(svc)
+
+        self.assertTrue(len(captured_cmds) > 0)
+        self.assertNotIn(
+            "--tpslimit",
+            captured_cmds[0],
+            "--tpslimit must NOT appear when tpslimit is 0",
+        )
+
+    def test_do_bisync_uses_per_service_transfers_and_checkers(self):
+        """_do_bisync() must respect per-service transfers and checkers values.
+
+        When a service has custom transfers=2 and checkers=4 those values must
+        appear in the bisync command instead of the global defaults (16/32).
+        """
+        self.config.add_service("DriveSvc4", "drive", "/tmp/drive_quota")
+        self.config.update_service("DriveSvc4", {"transfers": 2, "checkers": 4})
+        captured_cmds = []
+
+        def fake_run_rclone(cmd, service_name, svc, is_retry=False):
+            captured_cmds.append(cmd)
+            return True
+
+        self.rclone._run_rclone = fake_run_rclone
+        svc = self.config.get_service("DriveSvc4")
+        self.rclone._do_bisync(svc)
+
+        self.assertTrue(len(captured_cmds) > 0)
+        cmd = captured_cmds[0]
+        transfers_idx = cmd.index("--transfers")
+        self.assertEqual(int(cmd[transfers_idx + 1]), 2, "--transfers must equal the per-service value")
+        checkers_idx = cmd.index("--checkers")
+        self.assertEqual(int(cmd[checkers_idx + 1]), 4, "--checkers must equal the per-service value")
+
+    def test_run_rclone_emits_error_lines_from_output(self):
+        """_run_rclone() should emit lines containing 'ERROR' via on_error."""
+        import io
+        errors = []
+        self.rclone.on_error = lambda name, msg: errors.append(msg)
+
+        fake_output = (
+            "2023/11/15 10:30:45 ERROR : some/path: file not found\n"
+            "2023/11/15 10:30:46 INFO  : some/other: transferred\n"
+            "FATAL error: bisync not initialised\n"
+        )
+
+        class FakeProc:
+            returncode = 1
+            stdout = io.StringIO(fake_output)
+            def wait(self): pass
+
+        with patch("subprocess.Popen", return_value=FakeProc()):
+            self.rclone._run_rclone(["rclone", "bisync"], "ErrSvc", {})
+
+        # ERROR and FATAL lines should be in errors
+        self.assertTrue(
+            any("ERROR" in e for e in errors),
+            "Expected ERROR line to be emitted",
+        )
+        self.assertTrue(
+            any("FATAL" in e or "Fatal" in e for e in errors),
+            "Expected FATAL line to be emitted",
+        )
+        # Plain INFO line should NOT be in errors
+        self.assertFalse(
+            any("INFO" in e for e in errors),
+            "INFO lines should not be emitted as errors",
+        )
+
+    def test_run_rclone_does_not_emit_normal_lines(self):
+        """_run_rclone() should NOT emit normal rclone progress lines as errors."""
+        import io
+        errors = []
+        self.rclone.on_error = lambda name, msg: errors.append(msg)
+
+        fake_output = (
+            "Transferred: 1 / 1 Bytes, 100%, 512 Bytes/s, ETA 0s\n"
+            "Elapsed time: 0.1s\n"
+        )
+
+        class FakeProc:
+            returncode = 0
+            stdout = io.StringIO(fake_output)
+            def wait(self): pass
+
+        with patch("subprocess.Popen", return_value=FakeProc()):
+            self.rclone._run_rclone(["rclone", "bisync"], "NormSvc", {})
+
+        self.assertEqual(errors, [], "No errors should be emitted for normal output lines")
+
+    def test_run_rclone_logs_exit_code_on_failure(self):
+        """_run_rclone() should emit the rclone exit code when it exits non-zero.
+
+        When rclone fails silently (no ERROR/FATAL in output), the only
+        diagnostic hint in the log is the exit code.  Without it, the user
+        sees only the generic 'La sincronización falló' message and has no
+        way to diagnose the root cause.
+        """
+        import io
+        errors = []
+        self.rclone.on_error = lambda name, msg: errors.append(msg)
+
+        class FakeProc:
+            returncode = 5  # rclone exit code 5 = temporary error
+            stdout = io.StringIO("")  # no output at all
+            def wait(self): pass
+
+        with patch("subprocess.Popen", return_value=FakeProc()):
+            result = self.rclone._run_rclone(["rclone", "bisync"], "FailSvc", {})
+
+        self.assertFalse(result)
+        self.assertEqual(len(errors), 1)
+        self.assertIn("5", errors[0], "Exit code must appear in the error message")
+
+    def test_run_rclone_does_not_log_exit_code_on_success(self):
+        """_run_rclone() should NOT emit an exit code message when rclone succeeds."""
+        import io
+        errors = []
+        self.rclone.on_error = lambda name, msg: errors.append(msg)
+
+        class FakeProc:
+            returncode = 0
+            stdout = io.StringIO("Transferred: some/file.txt: Copied (new)\n")
+            def wait(self): pass
+
+        with patch("subprocess.Popen", return_value=FakeProc()):
+            result = self.rclone._run_rclone(["rclone", "bisync"], "OkSvc", {})
+
+        self.assertTrue(result)
+        self.assertEqual(errors, [], "No exit-code message should appear on success")
+
+    def test_run_rclone_detects_drive_id_missing_and_emits_actionable_message(self):
+        """_run_rclone() must detect 'unable to get drive_id and drive_type' and emit a
+        helpful actionable message, even when the line lacks an ERROR/FATAL prefix."""
+        import io
+        errors = []
+        self.rclone.on_error = lambda name, msg: errors.append(msg)
+
+        # Simulate rclone output that contains the drive_id error without an
+        # ERROR/FATAL prefix (as rclone may write it as a plain log line).
+        fake_output = (
+            f'Failed to create file system for "svc:/": '
+            f'{_DRIVE_ID_MISSING_PHRASE} - if you are upgrading from older '
+            f'versions of rclone, please run `rclone config` and re-configure '
+            f'this backend\n'
+        )
+
+        class FakeProc:
+            returncode = 1
+            stdout = io.StringIO(fake_output)
+            def wait(self): pass
+
+        with patch("subprocess.Popen", return_value=FakeProc()):
+            self.rclone._run_rclone(["rclone", "bisync"], "DriveIdSvc", {})
+
+        # The raw rclone line should be emitted (it has no ERROR/FATAL keyword)
+        self.assertTrue(
+            any(_DRIVE_ID_MISSING_PHRASE in e for e in errors),
+            "The raw rclone error line must always appear in the error log",
+        )
+        # An actionable guidance message must also be emitted
+        self.assertTrue(
+            any("drive_id" in e and "drive_type" in e for e in errors),
+            "An actionable message about drive_id/drive_type must be emitted",
+        )
+        # The service must be flagged so _do_bisync can skip the retry
+        self.assertIn(
+            "DriveIdSvc",
+            self.rclone._config_error_services,
+            "Service must be added to _config_error_services after drive_id error",
+        )
+
+    def test_run_rclone_detects_drive_id_missing_when_line_has_error_prefix(self):
+        """_run_rclone() must still handle the drive_id error when the rclone line
+        already contains the ERROR keyword (avoids double-emission of the raw line)."""
+        import io
+        errors = []
+        self.rclone.on_error = lambda name, msg: errors.append(msg)
+
+        # Simulate a line that has both the ERROR keyword AND the drive_id phrase
+        fake_output = (
+            f'ERROR : Failed to create file system: '
+            f'{_DRIVE_ID_MISSING_PHRASE}\n'
+        )
+
+        class FakeProc:
+            returncode = 1
+            stdout = io.StringIO(fake_output)
+            def wait(self): pass
+
+        with patch("subprocess.Popen", return_value=FakeProc()):
+            self.rclone._run_rclone(["rclone", "bisync"], "DriveIdSvc2", {})
+
+        # Actionable message must still appear
+        self.assertTrue(
+            any("drive_id" in e and "drive_type" in e for e in errors),
+            "Actionable guidance must be emitted even when line has ERROR prefix",
+        )
+        # Service must be flagged
+        self.assertIn("DriveIdSvc2", self.rclone._config_error_services)
+
+    def test_run_rclone_fires_on_drive_id_error_callback(self):
+        """on_drive_id_error callback must be called exactly once when the
+        drive_id missing phrase is detected in rclone output."""
+        import io
+        fired_for = []
+        self.rclone.on_drive_id_error = lambda name: fired_for.append(name)
+
+        fake_output = (
+            f'Failed to create file system for "svc:/": '
+            f'{_DRIVE_ID_MISSING_PHRASE} - if you are upgrading from older '
+            f'versions of rclone, please run `rclone config`\n'
+        )
+
+        class FakeProc:
+            returncode = 1
+            stdout = io.StringIO(fake_output)
+            def wait(self): pass
+
+        with patch("subprocess.Popen", return_value=FakeProc()):
+            self.rclone._run_rclone(["rclone", "bisync"], "DriveIdCbSvc", {})
+
+        self.assertEqual(
+            fired_for,
+            ["DriveIdCbSvc"],
+            "on_drive_id_error must be called once with the correct service name",
+        )
+
+    def test_on_drive_id_error_callback_not_fired_for_normal_error(self):
+        """on_drive_id_error must NOT be called when rclone emits a normal error
+        that does not contain the drive_id missing phrase."""
+        import io
+        fired_for = []
+        self.rclone.on_drive_id_error = lambda name: fired_for.append(name)
+
+        fake_output = "ERROR : Failed to copy file: network timeout\n"
+
+        class FakeProc:
+            returncode = 1
+            stdout = io.StringIO(fake_output)
+            def wait(self): pass
+
+        with patch("subprocess.Popen", return_value=FakeProc()):
+            self.rclone._run_rclone(["rclone", "bisync"], "NormalErrSvc", {})
+
+        self.assertEqual(
+            fired_for,
+            [],
+            "on_drive_id_error must not fire for errors unrelated to drive_id",
+        )
+
+    def test_do_bisync_skips_resync_retry_on_drive_id_config_error(self):
+        """_do_bisync() must NOT retry with --resync when the failure is caused by
+        a missing drive_id/drive_type configuration error.
+
+        Retrying with --resync would fail in exactly the same way because the
+        problem is in the stored remote configuration, not in the bisync state.
+        The user is already informed via the actionable message emitted by
+        _run_rclone; a pointless second run would only add noise to the log.
+        """
+        self.config.add_service("ConfigErrSvc", "onedrive", "/tmp/cfg_err_test")
+        logged = []
+        self.rclone.on_error = lambda name, msg: logged.append((name, msg))
+
+        call_count = [0]
+
+        def fake_run_rclone(cmd, service_name, svc, is_retry=False):
+            call_count[0] += 1
+            # Simulate _run_rclone flagging the service as a config error
+            self.rclone._config_error_services.add(service_name)
+            return False
+
+        self.rclone._run_rclone = fake_run_rclone
+        svc = self.config.get_service("ConfigErrSvc")
+        result = self.rclone._do_bisync(svc)
+
+        self.assertFalse(result, "_do_bisync must return False on config error")
+        self.assertEqual(
+            call_count[0],
+            1,
+            "_run_rclone must be called exactly once; --resync retry must be skipped",
+        )
+        # The service must be removed from the set after the check
+        self.assertNotIn(
+            "ConfigErrSvc",
+            self.rclone._config_error_services,
+            "Service must be removed from _config_error_services after the check",
+        )
+
+    # ------------------------------------------------------------------
+    # Drive-ID quick-fix helpers: find_drive_id_in_known_configs &
+    #                             patch_remote_drive_fields
+    # ------------------------------------------------------------------
+
+    def test_find_drive_id_returns_empty_when_no_candidate_exists(self):
+        """find_drive_id_in_known_configs() returns [] when no candidate config has drive_id."""
+        # Override candidate list to a single non-existent file
+        with patch.object(
+            self.rclone.__class__,
+            "_candidate_rclone_configs",
+            staticmethod(lambda: [Path(self._tmpdir) / "nonexistent.conf"]),
+        ):
+            result = self.rclone.find_drive_id_in_known_configs("juan")
+        self.assertEqual(result, [])
+
+    def test_find_drive_id_returns_empty_when_section_has_no_drive_id(self):
+        """find_drive_id_in_known_configs() ignores sections that lack drive_id."""
+        other_conf = Path(self._tmpdir) / "other.conf"
+        other_conf.write_text(
+            "[juan]\ntype = onedrive\ntoken = {\"access_token\":\"X\"}\n",
+            encoding="utf-8",
+        )
+        with patch.object(
+            self.rclone.__class__,
+            "_candidate_rclone_configs",
+            staticmethod(lambda: [other_conf]),
+        ):
+            result = self.rclone.find_drive_id_in_known_configs("juan")
+        self.assertEqual(result, [])
+
+    def test_find_drive_id_finds_section_with_drive_id(self):
+        """find_drive_id_in_known_configs() returns matching section data."""
+        other_conf = Path(self._tmpdir) / "other2.conf"
+        other_conf.write_text(
+            "[juan]\ntype = onedrive\ndrive_id = DEADBEEF\ndrive_type = personal\n",
+            encoding="utf-8",
+        )
+        with patch.object(
+            self.rclone.__class__,
+            "_candidate_rclone_configs",
+            staticmethod(lambda: [other_conf]),
+        ):
+            result = self.rclone.find_drive_id_in_known_configs("juan")
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["drive_id"], "DEADBEEF")
+        self.assertEqual(result[0]["drive_type"], "personal")
+        self.assertEqual(result[0]["section"], "juan")
+        self.assertEqual(result[0]["source_file"], str(other_conf))
+
+    def test_find_drive_id_skips_own_config_file(self):
+        """find_drive_id_in_known_configs() never returns entries from the app's own config."""
+        # Write drive_id into the app's own rclone.conf
+        own_conf = self.config.rclone_config_path()
+        own_conf.parent.mkdir(parents=True, exist_ok=True)
+        own_conf.write_text(
+            "[juan]\ntype = onedrive\ndrive_id = OWNID\ndrive_type = personal\n",
+            encoding="utf-8",
+        )
+        # Candidate list contains only the own config
+        with patch.object(
+            self.rclone.__class__,
+            "_candidate_rclone_configs",
+            staticmethod(lambda: [own_conf]),
+        ):
+            result = self.rclone.find_drive_id_in_known_configs("juan")
+        self.assertEqual(result, [], "Entries from the app's own config must be excluded")
+
+    def test_find_drive_id_returns_multiple_candidates(self):
+        """find_drive_id_in_known_configs() returns all matching sections across files.
+
+        The search is NOT filtered by remote_name — it returns every section
+        from every candidate file that has both drive_id and drive_type, so the
+        caller can choose the best match.
+        """
+        conf_a = Path(self._tmpdir) / "confA.conf"
+        conf_b = Path(self._tmpdir) / "confB.conf"
+        conf_a.write_text(
+            "[foo]\ntype = onedrive\ndrive_id = AAA\ndrive_type = personal\n",
+            encoding="utf-8",
+        )
+        conf_b.write_text(
+            "[bar]\ntype = onedrive\ndrive_id = BBB\ndrive_type = business\n",
+            encoding="utf-8",
+        )
+        with patch.object(
+            self.rclone.__class__,
+            "_candidate_rclone_configs",
+            staticmethod(lambda: [conf_a, conf_b]),
+        ):
+            # Searching for "foo" still returns "bar" from conf_b because the
+            # search collects all sections with drive_id regardless of name.
+            result = self.rclone.find_drive_id_in_known_configs("foo")
+        self.assertEqual(len(result), 2)
+        drive_ids = {r["drive_id"] for r in result}
+        self.assertEqual(drive_ids, {"AAA", "BBB"})
+
+    def test_patch_remote_drive_fields_writes_values(self):
+        """patch_remote_drive_fields() should add drive_id and drive_type to the section."""
+        own_conf = self.config.rclone_config_path()
+        own_conf.parent.mkdir(parents=True, exist_ok=True)
+        own_conf.write_text(
+            "[juan]\ntype = onedrive\ntoken = {\"access_token\":\"X\"}\n",
+            encoding="utf-8",
+        )
+        ok, err = self.rclone.patch_remote_drive_fields("juan", "DRIVEABC", "personal")
+        self.assertTrue(ok, f"Expected success; got error: {err}")
+        self.assertEqual(err, "")
+        # Verify values were written
+        parser = configparser.RawConfigParser()
+        parser.read(str(own_conf), encoding="utf-8")
+        self.assertEqual(parser.get("juan", "drive_id"), "DRIVEABC")
+        self.assertEqual(parser.get("juan", "drive_type"), "personal")
+        # Existing token must be preserved
+        self.assertTrue(parser.has_option("juan", "token"))
+
+    def test_patch_remote_drive_fields_fails_for_missing_section(self):
+        """patch_remote_drive_fields() returns (False, msg) when section not found."""
+        own_conf = self.config.rclone_config_path()
+        own_conf.parent.mkdir(parents=True, exist_ok=True)
+        own_conf.write_text("[other]\ntype = drive\n", encoding="utf-8")
+        ok, err = self.rclone.patch_remote_drive_fields("juan", "X", "personal")
+        self.assertFalse(ok)
+        self.assertIn("juan", err)
+
+    def test_patch_remote_drive_fields_preserves_other_sections(self):
+        """patch_remote_drive_fields() must not disturb other sections in rclone.conf."""
+        own_conf = self.config.rclone_config_path()
+        own_conf.parent.mkdir(parents=True, exist_ok=True)
+        own_conf.write_text(
+            "[juan]\ntype = onedrive\n\n[other]\ntype = drive\nclient_id = CID\n",
+            encoding="utf-8",
+        )
+        ok, _ = self.rclone.patch_remote_drive_fields("juan", "DID", "personal")
+        self.assertTrue(ok)
+        parser = configparser.RawConfigParser()
+        parser.read(str(own_conf), encoding="utf-8")
+        self.assertTrue(parser.has_section("other"))
+        self.assertEqual(parser.get("other", "client_id"), "CID")
+
+    # ------------------------------------------------------------------
+    # open_terminal_reconnect tests
+    # ------------------------------------------------------------------
+
+    def test_open_terminal_reconnect_launches_first_available_terminal(self):
+        """open_terminal_reconnect() returns (True, '') when the first terminal is found."""
+        first_exe = self.rclone._TERMINAL_CANDIDATES[0][0]
+        launched_with = []
+
+        def fake_popen(args, **kwargs):
+            if args[0] == first_exe:
+                launched_with.extend(args)
+                return MagicMock()
+            raise FileNotFoundError("not found")
+
+        with patch("subprocess.Popen", side_effect=fake_popen):
+            ok, cmd = self.rclone.open_terminal_reconnect("juan")
+
+        self.assertTrue(ok)
+        self.assertEqual(cmd, "")
+        # The first terminal tried must match _TERMINAL_CANDIDATES[0]
+        self.assertEqual(launched_with[0], first_exe)
+        # The command must contain 'config reconnect' and the remote name
+        full_cmd = " ".join(launched_with)
+        self.assertIn("config reconnect", full_cmd)
+        self.assertIn("juan", full_cmd)
+
+    def test_open_terminal_reconnect_tries_fallback_terminal(self):
+        """open_terminal_reconnect() tries the next emulator if the first is absent."""
+        first_exe = self.rclone._TERMINAL_CANDIDATES[0][0]
+        second_exe = self.rclone._TERMINAL_CANDIDATES[1][0]
+        call_log = []
+
+        def fake_popen(args, **kwargs):
+            call_log.append(args[0])
+            if args[0] == second_exe:
+                return MagicMock()
+            raise FileNotFoundError("not found")
+
+        with patch("subprocess.Popen", side_effect=fake_popen):
+            ok, cmd = self.rclone.open_terminal_reconnect("juan")
+
+        self.assertTrue(ok)
+        self.assertEqual(cmd, "")
+        self.assertIn(first_exe, call_log)
+        self.assertIn(second_exe, call_log)
+
+    def test_open_terminal_reconnect_returns_false_when_no_terminal(self):
+        """open_terminal_reconnect() returns (False, cmd_str) when no terminal is found."""
+        with patch("subprocess.Popen", side_effect=FileNotFoundError("not found")):
+            ok, cmd = self.rclone.open_terminal_reconnect("juan")
+
+        self.assertFalse(ok)
+        self.assertIn("config reconnect", cmd)
+        self.assertIn("juan", cmd)
+
+    def test_open_terminal_reconnect_command_contains_config_path(self):
+        """The returned command includes the app's rclone.conf path."""
+        with patch("subprocess.Popen", side_effect=FileNotFoundError("not found")):
+            _, cmd = self.rclone.open_terminal_reconnect("myremote")
+
+        config_path = str(self.config.rclone_config_path())
+        self.assertIn(config_path, cmd)
+
+    # ------------------------------------------------------------------
+    # Mega credential remote creation tests
+    # ------------------------------------------------------------------
+
+    def test_create_mega_remote_success(self):
+        """create_mega_remote() must obscure the password then create the remote."""
+        captured_calls = []
+
+        def fake_run(cmd, **kwargs):
+            captured_calls.append(cmd)
+            result = MagicMock()
+            if "obscure" in cmd:
+                result.returncode = 0
+                result.stdout = "OBSCURED_PASS\n"
+                result.stderr = ""
+            elif "config" in cmd:
+                result.returncode = 0
+                result.stdout = ""
+                result.stderr = ""
+            else:
+                result.returncode = 1
+                result.stdout = ""
+                result.stderr = ""
+            return result
+
+        with patch("subprocess.run", side_effect=fake_run):
+            ok, err = self.rclone.create_mega_remote("megasvc", "user@example.com", "secret123")
+
+        self.assertTrue(ok, "create_mega_remote should return True on success")
+        self.assertEqual(err, "", "Error message should be empty on success")
+
+        # First call must be rclone obscure with the plain password
+        self.assertTrue(len(captured_calls) >= 2, "Expected at least two subprocess.run calls")
+        obscure_cmd = captured_calls[0]
+        self.assertIn("obscure", obscure_cmd)
+        self.assertIn("secret123", obscure_cmd)
+
+        # Second call must be rclone config create ... mega with user and obscured pass
+        create_cmd = captured_calls[1]
+        self.assertIn("config", create_cmd)
+        self.assertIn("create", create_cmd)
+        self.assertIn("megasvc", create_cmd)
+        self.assertIn("mega", create_cmd)
+        # The user and obscured password must be present as key=value arguments
+        self.assertTrue(
+            any("user@example.com" in arg for arg in create_cmd),
+            "user email must appear in the config create command",
+        )
+        self.assertTrue(
+            any("OBSCURED_PASS" in arg for arg in create_cmd),
+            "obscured password must appear in the config create command",
+        )
+
+    def test_create_mega_remote_returns_false_when_obscure_fails(self):
+        """create_mega_remote() must return (False, msg) if rclone obscure fails."""
+        def fake_run(cmd, **kwargs):
+            result = MagicMock()
+            result.returncode = 1
+            result.stdout = ""
+            result.stderr = "obscure error detail"
+            return result
+
+        with patch("subprocess.run", side_effect=fake_run):
+            ok, err = self.rclone.create_mega_remote("megasvc2", "user@example.com", "badpass")
+
+        self.assertFalse(ok, "create_mega_remote should return False when rclone obscure fails")
+        self.assertIn("obscure error detail", err, "Error message should include rclone output")
+
+    def test_create_mega_remote_returns_false_when_config_create_fails(self):
+        """create_mega_remote() must return (False, msg) if rclone config create fails."""
+        def fake_run(cmd, **kwargs):
+            result = MagicMock()
+            if "obscure" in cmd:
+                result.returncode = 0
+                result.stdout = "OBSCURED\n"
+                result.stderr = ""
+            else:
+                result.returncode = 1
+                result.stdout = ""
+                result.stderr = "config create error detail"
+            return result
+
+        with patch("subprocess.run", side_effect=fake_run):
+            ok, err = self.rclone.create_mega_remote("megasvc3", "u@e.com", "pw")
+
+        self.assertFalse(ok, "create_mega_remote should return False when rclone config create fails")
+        self.assertIn("config create error detail", err, "Error message should include rclone output")
+
+    def test_create_mega_remote_returns_false_on_oserror(self):
+        """create_mega_remote() must return (False, msg) if rclone is not found."""
+        with patch("subprocess.run", side_effect=OSError("rclone not found")):
+            ok, err = self.rclone.create_mega_remote("megasvc4", "u@e.com", "pw")
+
+        self.assertFalse(ok)
+        self.assertIn("rclone no encontrado", err)
+
+    # ------------------------------------------------------------------
+    # Mount service tests
+    # ------------------------------------------------------------------
+
+    def test_is_mounted_false_initially(self):
+        """is_mounted() should return False before start_mount() is called."""
+        self.assertFalse(self.rclone.is_mounted("any_service"))
+
+    def test_stop_mount_is_noop_when_not_mounted(self):
+        """stop_mount() should not raise if the service was never mounted."""
+        self.rclone.stop_mount("never_mounted")
+
+    def test_start_all_mounts_with_no_services(self):
+        """start_all_mounts() should complete without error when no services exist."""
+        self.rclone.start_all_mounts()  # Should not raise
+
+    def test_start_all_mounts_skips_disabled_services(self):
+        """start_all_mounts() should not attempt to mount services with mount_enabled=False."""
+        self.config.add_service("NoMount", "onedrive", "/tmp/nomount")
+        # mount_enabled defaults to False
+        self.rclone.start_all_mounts()
+        self.assertFalse(self.rclone.is_mounted("NoMount"))
+
+    def test_start_mount_returns_false_without_mount_path(self):
+        """start_mount() should return False and log an error when mount_path is empty."""
+        self.config.add_service("MountSvc", "onedrive", "/tmp/mount_test")
+        self.config.update_service("MountSvc", {"mount_enabled": True, "mount_path": ""})
+        errors = []
+        self.rclone.on_error = lambda name, msg: errors.append(msg)
+        result = self.rclone.start_mount("MountSvc")
+        self.assertFalse(result)
+        self.assertTrue(any("[MOUNT]" in e for e in errors))
+
+    def test_start_mount_returns_false_when_disabled(self):
+        """start_mount() should return False when mount_enabled is False."""
+        self.config.add_service("DisabledMount", "onedrive", "/tmp/disabled_mount")
+        self.config.update_service("DisabledMount", {
+            "mount_enabled": False,
+            "mount_path": "/tmp/mnt_disabled",
+        })
+        result = self.rclone.start_mount("DisabledMount")
+        self.assertFalse(result)
+
+    def test_stop_all_mounts_clears_procs(self):
+        """stop_all_mounts() should terminate all tracked mount processes."""
+        # Inject a fake Popen that is 'running' (poll returns None)
+        class FakeProc:
+            def __init__(self):
+                self.returncode = None
+                self._terminated = False
+            def poll(self): return None
+            def terminate(self): self._terminated = True
+            def wait(self, timeout=None): pass
+
+        fake = FakeProc()
+        self.rclone._mount_procs["FakeMount"] = fake
+        self.rclone.stop_all_mounts()
+        self.assertTrue(fake._terminated)
+        self.assertEqual(len(self.rclone._mount_procs), 0)
+
+    def test_do_bisync_resync_uses_resync_mode(self):
+        """_do_bisync() retry command should include --resync-mode from service config."""
+        self.config.add_service("RMSvc", "onedrive", "/tmp/rm_test")
+        self.config.update_service("RMSvc", {"resync_mode": "newer"})
+        logged = []
+        self.rclone.on_error = lambda name, msg: logged.append((name, msg))
+
+        def fake_run_rclone(cmd, service_name, svc, is_retry=False):
+            return False  # Always fail to trigger the resync retry
+
+        self.rclone._run_rclone = fake_run_rclone
+        svc = self.config.get_service("RMSvc")
+        with patch("src.rclone.rclone_manager._rclone_supports_resync_mode", return_value=True):
+            self.rclone._do_bisync(svc)
+
+        cmd_entries = [m for _, m in logged if m.startswith("[CMD]")]
+        self.assertEqual(len(cmd_entries), 2)
+        # The retry command must include both --resync and --resync-mode newer
+        self.assertIn("--resync", cmd_entries[1])
+        self.assertIn("--resync-mode", cmd_entries[1])
+        self.assertIn("newer", cmd_entries[1])
+
+    def test_do_bisync_resync_omits_resync_mode_on_old_rclone(self):
+        """_do_bisync() retry must NOT add --resync-mode when rclone < v1.64.
+
+        Older rclone versions respond with 'Fatal error: unknown flag: --resync-mode'
+        so we must skip the flag when the version check returns False.
+        """
+        self.config.add_service("OldSvc", "onedrive", "/tmp/old_test")
+        self.config.update_service("OldSvc", {"resync_mode": "newer"})
+        logged = []
+        self.rclone.on_error = lambda name, msg: logged.append((name, msg))
+
+        def fake_run_rclone(cmd, service_name, svc, is_retry=False):
+            return False  # Always fail to trigger the resync retry
+
+        self.rclone._run_rclone = fake_run_rclone
+        svc = self.config.get_service("OldSvc")
+        with patch("src.rclone.rclone_manager._rclone_supports_resync_mode", return_value=False):
+            self.rclone._do_bisync(svc)
+
+        cmd_entries = [m for _, m in logged if m.startswith("[CMD]")]
+        self.assertEqual(len(cmd_entries), 2)
+        # --resync must still be present but --resync-mode must be absent
+        self.assertIn("--resync", cmd_entries[1])
+        self.assertNotIn("--resync-mode", cmd_entries[1])
+
+    def test_do_bisync_includes_verbose_when_enabled(self):
+        """_do_bisync() should include --verbose in the command when verbose_sync=True."""
+        self.config.add_service("VerbSvc", "onedrive", "/tmp/verb_test")
+        self.config.update_service("VerbSvc", {"verbose_sync": True})
+        captured_cmds = []
+
+        def fake_run_rclone(cmd, service_name, svc, is_retry=False):
+            captured_cmds.append(cmd)
+            return True
+
+        self.rclone._run_rclone = fake_run_rclone
+        svc = self.config.get_service("VerbSvc")
+        self.rclone._do_bisync(svc)
+
+        self.assertTrue(len(captured_cmds) > 0)
+        self.assertIn("--verbose", captured_cmds[0])
+
+    def test_do_bisync_excludes_verbose_when_disabled(self):
+        """_do_bisync() should NOT include --verbose when verbose_sync=False."""
+        self.config.add_service("NoVerbSvc", "onedrive", "/tmp/noverb_test")
+        self.config.update_service("NoVerbSvc", {"verbose_sync": False})
+        captured_cmds = []
+
+        def fake_run_rclone(cmd, service_name, svc, is_retry=False):
+            captured_cmds.append(cmd)
+            return True
+
+        self.rclone._run_rclone = fake_run_rclone
+        svc = self.config.get_service("NoVerbSvc")
+        self.rclone._do_bisync(svc)
+
+        self.assertTrue(len(captured_cmds) > 0)
+        self.assertNotIn("--verbose", captured_cmds[0])
+
+    # ------------------------------------------------------------------
+    # Config field tests for new mount fields
+    # ------------------------------------------------------------------
+
+    def test_new_service_has_mount_fields(self):
+        """New services should include mount_enabled, mount_path, and chunk size fields."""
+        svc = self.config.add_service("MountFieldSvc", "onedrive", "/tmp/mf")
+        self.assertIn("mount_enabled", svc)
+        self.assertFalse(svc["mount_enabled"])
+        self.assertIn("mount_path", svc)
+        self.assertEqual(svc["mount_path"], "")
+        self.assertIn("vfs_read_chunk_size", svc)
+        self.assertEqual(svc["vfs_read_chunk_size"], "10M")
+        self.assertIn("vfs_read_chunk_size_limit", svc)
+        self.assertEqual(svc["vfs_read_chunk_size_limit"], "100M")
+        # VFS cache mode default must be "writes" (not the invalid "on_demand")
+        self.assertEqual(svc.get("vfs_cache_mode"), "writes")
+
+    def test_new_service_has_bisync_flags(self):
+        """New services should include resync_mode and verbose_sync fields."""
+        svc = self.config.add_service("BisyncFlagSvc", "onedrive", "/tmp/bf")
+        self.assertIn("resync_mode", svc)
+        self.assertEqual(svc["resync_mode"], "newer")
+        self.assertIn("verbose_sync", svc)
+        self.assertFalse(svc["verbose_sync"])
+
+    def test_import_remote_success(self):
+        """import_remote() writes the remote section to the rclone config and returns (True, '')."""
+        ok, err = self.rclone.import_remote(
+            remote_name="mygdrive",
+            new_name="MyGoogleDrive",
+            remote_data={"type": "drive", "client_id": "abc123", "token": '{"access_token":"tok"}'},
+        )
+
+        self.assertTrue(ok)
+        self.assertEqual(err, "")
+
+        # Verify the section was actually written to the rclone config file
+        parser = configparser.RawConfigParser()
+        parser.read(str(self.config.rclone_config_path()), encoding="utf-8")
+        self.assertIn("MyGoogleDrive", parser.sections())
+        self.assertEqual(parser.get("MyGoogleDrive", "type"), "drive")
+        self.assertEqual(parser.get("MyGoogleDrive", "client_id"), "abc123")
+
+    def test_import_remote_missing_type_returns_error(self):
+        """import_remote() should return (False, ...) when the remote has no type."""
+        ok, err = self.rclone.import_remote(
+            remote_name="badremote",
+            new_name="BadRemote",
+            remote_data={"client_id": "abc"},  # no 'type' key
+        )
+        self.assertFalse(ok)
+        self.assertIn("type", err)
+
+    def test_import_remote_overwrites_existing_section(self):
+        """import_remote() should overwrite a section that already exists."""
+        # First import
+        self.rclone.import_remote(
+            remote_name="r",
+            new_name="MyRemote",
+            remote_data={"type": "s3", "provider": "AWS"},
+        )
+        # Second import with different provider
+        ok, err = self.rclone.import_remote(
+            remote_name="r2",
+            new_name="MyRemote",
+            remote_data={"type": "s3", "provider": "Minio"},
+        )
+        self.assertTrue(ok)
+        parser = configparser.RawConfigParser()
+        parser.read(str(self.config.rclone_config_path()), encoding="utf-8")
+        self.assertEqual(parser.get("MyRemote", "provider"), "Minio")
+
+    def test_import_remote_preserves_token(self):
+        """import_remote() must write the token field unchanged (no re-auth)."""
+        token_json = '{"access_token":"mytoken","expiry":"2099-01-01T00:00:00Z"}'
+        ok, _ = self.rclone.import_remote(
+            remote_name="src",
+            new_name="dst",
+            remote_data={"type": "onedrive", "token": token_json},
+        )
+        self.assertTrue(ok)
+        parser = configparser.RawConfigParser()
+        parser.read(str(self.config.rclone_config_path()), encoding="utf-8")
+        self.assertEqual(parser.get("dst", "token"), token_json)
+
+
+class TestBisyncLockCleanup(unittest.TestCase):
+    """Tests for the bisync stale-lock-file detection and cleanup helpers."""
+
+    def setUp(self):
+        self._tmpdir = tempfile.mkdtemp()
+        import src.config.config_manager as cm_mod
+        self._original_get_config_dir = cm_mod.get_config_dir
+        cm_mod.get_config_dir = lambda: Path(self._tmpdir)
+        self.config = ConfigManager()
+        self.rclone = RcloneManager(self.config)
+
+    def tearDown(self):
+        import src.config.config_manager as cm_mod
+        cm_mod.get_config_dir = self._original_get_config_dir
+        import shutil
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+
+    # ------------------------------------------------------------------
+    # _bisync_cache_dir()
+    # ------------------------------------------------------------------
+
+    def test_bisync_cache_dir_returns_path_ending_in_rclone_bisync(self):
+        """_bisync_cache_dir() should end with 'rclone/bisync' on all platforms."""
+        cache_dir = _bisync_cache_dir()
+        self.assertIsInstance(cache_dir, Path)
+        # The last two parts of the path must always be rclone/bisync
+        self.assertEqual(cache_dir.parts[-1], "bisync")
+        self.assertEqual(cache_dir.parts[-2], "rclone")
+
+    # ------------------------------------------------------------------
+    # _clear_bisync_stale_files()
+    # ------------------------------------------------------------------
+
+    def test_clear_removes_matching_lck_file(self):
+        """_clear_bisync_stale_files() should delete *.lck files for the remote."""
+        cache_dir = Path(self._tmpdir) / "bisync"
+        cache_dir.mkdir()
+        lock = cache_dir / "myremote_..mnt_data.lck"
+        lock.write_text("pid")
+
+        msgs = []
+        count = _clear_bisync_stale_files("myremote", cache_dir, msgs.append)
+
+        self.assertEqual(count, 1)
+        self.assertFalse(lock.exists(), "Lock file should have been deleted")
+        self.assertTrue(any("[LOCK]" in m for m in msgs), "Should log the removal")
+
+    def test_clear_removes_matching_lst_new_file(self):
+        """_clear_bisync_stale_files() should also delete *.lst-new files."""
+        cache_dir = Path(self._tmpdir) / "bisync"
+        cache_dir.mkdir()
+        lst_new = cache_dir / "myremote_..mnt_data.path1.lst-new"
+        lst_new.write_text("data")
+
+        count = _clear_bisync_stale_files("myremote", cache_dir, lambda m: None)
+
+        self.assertEqual(count, 1)
+        self.assertFalse(lst_new.exists())
+
+    def test_clear_does_not_remove_unrelated_files(self):
+        """_clear_bisync_stale_files() must NOT remove files for other remotes."""
+        cache_dir = Path(self._tmpdir) / "bisync"
+        cache_dir.mkdir()
+        other_lock = cache_dir / "otherremote_..mnt_data.lck"
+        other_lock.write_text("pid")
+
+        count = _clear_bisync_stale_files("myremote", cache_dir, lambda m: None)
+
+        self.assertEqual(count, 0)
+        self.assertTrue(other_lock.exists(), "File for other remote must be preserved")
+
+    def test_clear_returns_zero_when_cache_dir_missing(self):
+        """_clear_bisync_stale_files() should return 0 if cache dir does not exist."""
+        missing_dir = Path(self._tmpdir) / "nonexistent_cache"
+        count = _clear_bisync_stale_files("myremote", missing_dir, lambda m: None)
+        self.assertEqual(count, 0)
+
+    def test_clear_multiple_files(self):
+        """_clear_bisync_stale_files() should delete all matching files."""
+        cache_dir = Path(self._tmpdir) / "bisync"
+        cache_dir.mkdir()
+        files = [
+            "myremote_..mnt_a.lck",
+            "myremote_..mnt_a.path1.lst-new",
+            "myremote_..mnt_a.path2.lst-new",
+        ]
+        for fname in files:
+            (cache_dir / fname).write_text("data")
+
+        count = _clear_bisync_stale_files("myremote", cache_dir, lambda m: None)
+        self.assertEqual(count, 3)
+        for fname in files:
+            self.assertFalse((cache_dir / fname).exists())
+
+    def test_clear_empty_remote_name_does_not_delete_all(self):
+        """An empty remote_name must not match every file in the cache dir."""
+        cache_dir = Path(self._tmpdir) / "bisync"
+        cache_dir.mkdir()
+        lock = cache_dir / "someremote_..path.lck"
+        lock.write_text("pid")
+
+        # All file names start with "" (empty string), so this is a degenerate
+        # case - we still only delete files whose names literally start with "".
+        # In practice every non-empty filename satisfies startswith(""), so to
+        # avoid accidentally nuking the entire cache we skip deletion when
+        # remote_name is empty.
+        count = _clear_bisync_stale_files("", cache_dir, lambda m: None)
+        # Empty remote name: no files should be touched (guard against rm-all)
+        self.assertEqual(count, 0)
+        self.assertTrue(lock.exists(), "Files must not be removed for empty remote_name")
+
+    # ------------------------------------------------------------------
+    # RcloneManager.clear_bisync_locks()
+    # ------------------------------------------------------------------
+
+    def test_clear_bisync_locks_returns_zero_for_unknown_service(self):
+        """clear_bisync_locks() should return 0 for a service that does not exist."""
+        self.assertEqual(self.rclone.clear_bisync_locks("nonexistent"), 0)
+
+    def test_clear_bisync_locks_removes_files_for_service(self):
+        """clear_bisync_locks() should remove lock files matching the service remote."""
+        self.config.add_service("LockSvc", "onedrive", "/tmp/lock_test")
+        self.config.update_service("LockSvc", {"remote_name": "lockremote"})
+
+        # Create a fake lock file in a temp cache dir
+        fake_cache = Path(self._tmpdir) / "fake_bisync_cache"
+        fake_cache.mkdir()
+        lock = fake_cache / "lockremote_..tmp_lock_test.lck"
+        lock.write_text("pid")
+
+        errors = []
+        self.rclone.on_error = lambda name, msg: errors.append(msg)
+
+        with patch("src.rclone.rclone_manager._bisync_cache_dir", return_value=fake_cache):
+            count = self.rclone.clear_bisync_locks("LockSvc")
+
+        self.assertEqual(count, 1)
+        self.assertFalse(lock.exists())
+        self.assertTrue(any("[LOCK]" in e for e in errors))
+
+    # ------------------------------------------------------------------
+    # _do_bisync() integration: lock cleanup runs before bisync
+    # ------------------------------------------------------------------
+
+    def test_do_bisync_clears_lock_files_before_running(self):
+        """_do_bisync() should remove stale lock files before the first bisync call."""
+        self.config.add_service("PreCleanSvc", "onedrive", "/tmp/preclean_test")
+        self.config.update_service("PreCleanSvc", {"remote_name": "preclean"})
+
+        fake_cache = Path(self._tmpdir) / "fake_cache_preclean"
+        fake_cache.mkdir()
+        lock = fake_cache / "preclean_..tmp_preclean_test.lck"
+        lock.write_text("pid")
+
+        # Track call order: cleanup must happen before bisync runs
+        call_order = []
+
+        def fake_run_rclone(cmd, service_name, svc, is_retry=False):
+            call_order.append("bisync")
+            return True
+
+        def fake_clear(remote_name, cache_dir, emit_fn):
+            call_order.append("clear")
+            # Delegate to real implementation to actually remove the file
+            return _clear_bisync_stale_files(remote_name, cache_dir, emit_fn)
+
+        self.rclone._run_rclone = fake_run_rclone
+        svc = self.config.get_service("PreCleanSvc")
+
+        with patch("src.rclone.rclone_manager._bisync_cache_dir", return_value=fake_cache):
+            with patch("src.rclone.rclone_manager._clear_bisync_stale_files", side_effect=fake_clear):
+                self.rclone._do_bisync(svc)
+
+        # Cleanup must be called before bisync
+        self.assertIn("clear", call_order)
+        self.assertIn("bisync", call_order)
+        self.assertLess(call_order.index("clear"), call_order.index("bisync"))
+
+    def test_do_bisync_clears_lock_files_before_resync_retry(self):
+        """_do_bisync() should remove stale lock files before the --resync retry.
+
+        If the first bisync attempt is killed or crashes, it may leave its own
+        lock file behind.  Without a second cleanup the --resync retry would
+        immediately fail with 'prior lock file found'.
+        """
+        self.config.add_service("RetrySvc", "onedrive", "/tmp/retry_test")
+        self.config.update_service("RetrySvc", {"remote_name": "retryremote"})
+
+        fake_cache = Path(self._tmpdir) / "fake_cache_retry"
+        fake_cache.mkdir()
+        lock = fake_cache / "retryremote_..tmp_retry_test.lck"
+
+        call_order = []
+
+        def fake_run_rclone(cmd, service_name, svc, is_retry=False):
+            call_order.append("bisync")
+            # Recreate the lock to simulate the first run leaving it behind
+            lock.write_text("pid")
+            return False  # Always fail to trigger the --resync retry
+
+        def fake_clear(remote_name, cache_dir, emit_fn):
+            call_order.append("clear")
+            return _clear_bisync_stale_files(remote_name, cache_dir, emit_fn)
+
+        self.rclone._run_rclone = fake_run_rclone
+        svc = self.config.get_service("RetrySvc")
+
+        with patch("src.rclone.rclone_manager._bisync_cache_dir", return_value=fake_cache):
+            with patch("src.rclone.rclone_manager._clear_bisync_stale_files", side_effect=fake_clear):
+                self.rclone._do_bisync(svc)
+
+        # cleanup must have been called at least twice (before first attempt
+        # and before the --resync retry)
+        clear_count = call_order.count("clear")
+        self.assertGreaterEqual(clear_count, 2,
+            "cleanup must run before both the initial bisync and the --resync retry")
+        # Verify ordering: first call is clear, then bisync, then clear again
+        self.assertEqual(call_order[0], "clear")
+        self.assertEqual(call_order[1], "bisync")
+        self.assertEqual(call_order[2], "clear")
+
+
+class TestErrorLogger(unittest.TestCase):
+    """Tests for the ErrorLogger class."""
+
+    def setUp(self):
+        self._tmpdir = tempfile.mkdtemp()
+        import src.config.config_manager as cm_mod
+        self._original_get_config_dir = cm_mod.get_config_dir
+        cm_mod.get_config_dir = lambda: Path(self._tmpdir)
+
+        import src.gui.error_logger as el_mod
+        self._original_log_path = el_mod._log_file_path
+        el_mod._log_file_path = lambda: os.path.join(self._tmpdir, "errors.txt")
+
+        from src.gui.error_logger import ErrorLogger
+        self.logger = ErrorLogger()
+
+    def tearDown(self):
+        import src.config.config_manager as cm_mod
+        cm_mod.get_config_dir = self._original_get_config_dir
+        import src.gui.error_logger as el_mod
+        el_mod._log_file_path = self._original_log_path
+        import shutil
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+
+    def test_initial_state_empty(self):
+        """A fresh ErrorLogger with no log file should have no entries."""
+        self.assertEqual(self.logger.get_all_entries(), [])
+
+    def test_log_adds_entry(self):
+        """log() should add a formatted entry."""
+        self.logger.log("TestSvc", "Something went wrong")
+        entries = self.logger.get_all_entries()
+        self.assertEqual(len(entries), 1)
+        self.assertIn("TestSvc", entries[0])
+        self.assertIn("Something went wrong", entries[0])
+
+    def test_newest_entry_is_first(self):
+        """Entries should be ordered newest-first."""
+        self.logger.log("Svc", "First error")
+        self.logger.log("Svc", "Second error")
+        entries = self.logger.get_all_entries()
+        self.assertIn("Second error", entries[0])
+        self.assertIn("First error", entries[1])
+
+    def test_save_and_reload(self):
+        """Entries saved to disk should be reloaded on next instantiation."""
+        self.logger.log("Svc", "Persistent error")
+        self.logger.save_to_file()
+
+        from src.gui.error_logger import ErrorLogger
+        logger2 = ErrorLogger()
+        text = logger2.get_all_text()
+        self.assertIn("Persistent error", text)
+
+    def test_get_all_text_empty_when_no_errors(self):
+        """get_all_text() should return an empty string when no errors exist."""
+        self.assertEqual(self.logger.get_all_text(), "")
+
+    def test_clear_removes_entries(self):
+        """clear() should remove all in-memory entries."""
+        self.logger.log("Svc", "Error 1")
+        self.logger.clear()
+        self.assertEqual(self.logger.get_all_entries(), [])
+
+
+class TestElementaryIndicator(unittest.TestCase):
+    """Tests for the Elementary OS Wingpanel indicator helpers."""
+
+    def test_is_elementary_os_true(self):
+        """is_elementary_os() returns True when /etc/os-release contains ID=elementary."""
+        from src.gui.elementary_indicator import is_elementary_os
+
+        fake_release = "ID=elementary\nNAME=elementary OS\nVERSION=7\n"
+        with patch("builtins.open", unittest.mock.mock_open(read_data=fake_release)):
+            self.assertTrue(is_elementary_os())
+
+    def test_is_elementary_os_false_ubuntu(self):
+        """is_elementary_os() returns False for a non-elementary /etc/os-release."""
+        from src.gui.elementary_indicator import is_elementary_os
+
+        fake_release = "ID=ubuntu\nNAME=Ubuntu\nVERSION_ID=24.04\n"
+        with patch("builtins.open", unittest.mock.mock_open(read_data=fake_release)):
+            self.assertFalse(is_elementary_os())
+
+    def test_is_elementary_os_false_on_ioerror(self):
+        """is_elementary_os() returns False when /etc/os-release cannot be read."""
+        from src.gui.elementary_indicator import is_elementary_os
+
+        with patch("builtins.open", side_effect=OSError("no such file")):
+            self.assertFalse(is_elementary_os())
+
+    def test_indicator_not_available_non_elementary(self):
+        """ElementaryIndicator.is_available() returns False on non-Elementary OS."""
+        from src.gui.elementary_indicator import ElementaryIndicator, is_elementary_os
+
+        ind = ElementaryIndicator()
+        with patch("src.gui.elementary_indicator.is_elementary_os", return_value=False):
+            self.assertFalse(ind.is_available())
+
+    def test_indicator_not_available_missing_library(self):
+        """ElementaryIndicator.is_available() returns False when AppIndicator3 is absent."""
+        from src.gui.elementary_indicator import ElementaryIndicator
+
+        with (
+            patch("src.gui.elementary_indicator.is_elementary_os", return_value=True),
+            patch("src.gui.elementary_indicator._import_app_indicator", return_value=None),
+        ):
+            ind = ElementaryIndicator()
+            self.assertFalse(ind.is_available())
+
+    def test_indicator_available_when_library_present(self):
+        """ElementaryIndicator.is_available() returns True on Elementary with AppIndicator3."""
+        from src.gui.elementary_indicator import ElementaryIndicator
+
+        mock_ai = MagicMock()
+        with (
+            patch("src.gui.elementary_indicator.is_elementary_os", return_value=True),
+            patch("src.gui.elementary_indicator._import_app_indicator", return_value=mock_ai),
+        ):
+            ind = ElementaryIndicator()
+            self.assertTrue(ind.is_available())
+
+    def test_start_does_nothing_when_library_absent(self):
+        """ElementaryIndicator.start() should not raise when AppIndicator3 is absent."""
+        from src.gui.elementary_indicator import ElementaryIndicator
+
+        with patch("src.gui.elementary_indicator._import_app_indicator", return_value=None):
+            ind = ElementaryIndicator()
+            ind.start()  # must not raise
+            self.assertFalse(ind._running)
+
+    def test_stop_does_nothing_when_not_started(self):
+        """ElementaryIndicator.stop() should be safe to call when not running."""
+        from src.gui.elementary_indicator import ElementaryIndicator
+
+        ind = ElementaryIndicator()
+        ind.stop()  # must not raise
+        self.assertFalse(ind._running)
+
+    def test_on_show_callback_invoked(self):
+        """The _on_show_clicked handler must invoke the on_show callback."""
+        from src.gui.elementary_indicator import ElementaryIndicator
+
+        called = []
+        ind = ElementaryIndicator(on_show=lambda: called.append(True))
+        ind._on_show_clicked(None)
+        self.assertEqual(called, [True])
+
+    def test_on_quit_callback_invoked(self):
+        """The _on_quit_clicked handler must invoke the on_quit callback."""
+        from src.gui.elementary_indicator import ElementaryIndicator
+
+        called = []
+        with patch.object(ElementaryIndicator, "stop"):
+            ind = ElementaryIndicator(on_quit=lambda: called.append(True))
+            ind._on_quit_clicked(None)
+        self.assertEqual(called, [True])
+
+    def test_update_tooltip_no_error_when_not_started(self):
+        """update_tooltip() should be a no-op when the indicator is not running."""
+        from src.gui.elementary_indicator import ElementaryIndicator
+
+        ind = ElementaryIndicator()
+        ind.update_tooltip("Some tooltip")  # must not raise
 
 
 if __name__ == "__main__":

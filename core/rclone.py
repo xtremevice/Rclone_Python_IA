@@ -323,16 +323,25 @@ class SyncManager:
         """
         Detiene la sincronización del servicio.
         Termina el proceso rclone si está corriendo.
+
+        La terminación del proceso se realiza en un hilo secundario para no
+        bloquear el hilo de la interfaz gráfica mientras se espera al proceso.
         """
         self.is_running = False
 
-        # Terminar proceso rclone si existe
-        if self.process and self.process.poll() is None:
-            self.process.terminate()
-            try:
-                self.process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                self.process.kill()
+        # Capture the current process reference and clear self.process so that
+        # a subsequent start() cannot accidentally re-terminate the same instance.
+        process = self.process
+        self.process = None
+        if process and process.poll() is None:
+            def _terminate():
+                try:
+                    process.terminate()
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+
+            threading.Thread(target=_terminate, daemon=True).start()
 
         self.service.is_syncing = False
 
@@ -434,6 +443,52 @@ class SyncManager:
                         self.service.service_id, file_entry
                     )
                 break
+
+
+def get_remote_storage_info(service: Service) -> Optional[str]:
+    """
+    Obtiene información de cuota del almacenamiento remoto usando ``rclone about``.
+
+    Retorna una cadena legible con Total, Usado y Libre, por ejemplo:
+    ``"Total: 1.024 TiB  |  Usado: 125.3 GiB  |  Libre: 898.7 GiB"``.
+
+    Retorna ``None`` si el servicio no soporta ``about`` (ej. S3, SFTP) o si
+    rclone no está disponible.
+    """
+    rclone_exe = get_rclone_executable()
+    rclone_config = get_rclone_config_path()
+    remote_name = service.get_rclone_remote_name()
+
+    try:
+        result = subprocess.run(
+            [rclone_exe, "--config", rclone_config, "about", f"{remote_name}:"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+
+        if result.returncode != 0:
+            return None
+
+        # Parse output lines like "Total:   1.024 TiB", "Used:    125.3 GiB"
+        info: dict = {}
+        for line in result.stdout.strip().splitlines():
+            if ":" in line:
+                key, _, value = line.partition(":")
+                info[key.strip().lower()] = value.strip()
+
+        parts = []
+        if "total" in info:
+            parts.append(f"Total: {info['total']}")
+        if "used" in info:
+            parts.append(f"Usado: {info['used']}")
+        if "free" in info:
+            parts.append(f"Libre: {info['free']}")
+
+        return "  |  ".join(parts) if parts else None
+
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return None
 
 
 def get_remote_folders(service: Service) -> List[dict]:

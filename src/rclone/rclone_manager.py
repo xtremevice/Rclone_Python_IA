@@ -5,8 +5,11 @@ Provides methods to configure remotes, run bisync, check mount status,
 and stream output from rclone operations.
 """
 
+import configparser
 import os
 import platform
+import re
+import shlex
 import subprocess
 import threading
 from pathlib import Path
@@ -15,9 +18,99 @@ from typing import Callable, Dict, List, Optional
 from src.config.config_manager import ConfigManager, get_rclone_config_path, PERSONAL_VAULT_PATTERN
 
 
+def _bisync_cache_dir() -> Path:
+    """Return the platform-appropriate directory where rclone stores bisync state.
+
+    rclone writes lock files (``*.lck``) and partial listing files
+    (``*.lst-new``) here.  A stale lock from an interrupted sync prevents the
+    next run from proceeding, so we clean up these files before each bisync.
+
+    Paths by platform:
+        Linux  : ``~/.cache/rclone/bisync/``
+        macOS  : ``~/Library/Caches/rclone/bisync/``
+        Windows: ``%LOCALAPPDATA%\\rclone\\bisync\\``
+    """
+    system = platform.system()
+    if system == "Windows":
+        base = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
+    elif system == "Darwin":
+        base = Path.home() / "Library" / "Caches"
+    else:
+        base = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
+    return base / "rclone" / "bisync"
+
+
+def _clear_bisync_stale_files(
+    remote_name: str,
+    cache_dir: Path,
+    emit_fn: Callable[[str], None],
+) -> int:
+    """Remove stale rclone bisync lock and partial-listing files for *remote_name*.
+
+    Only files whose names begin with *remote_name* (case-sensitive) are
+    removed, so we never accidentally delete state that belongs to a
+    different remote.  Both ``*.lck`` and ``*.lst-new`` files are targeted.
+
+    Args:
+        remote_name: The rclone remote identifier (e.g. ``"duexy"``).
+        cache_dir: Path to the rclone bisync cache directory.
+        emit_fn: Callable that accepts a single log-message string.
+
+    Returns:
+        The number of files that were successfully deleted.
+    """
+    if not cache_dir.is_dir():
+        return 0
+
+    # An empty remote_name would match every file in the directory; skip.
+    if not remote_name:
+        return 0
+
+    removed = 0
+    for pattern in ("*.lck", "*.lst-new"):
+        for stale in cache_dir.glob(pattern):
+            if not stale.name.startswith(remote_name):
+                continue
+            try:
+                stale.unlink()
+                emit_fn(f"[LOCK] Archivo de bloqueo eliminado: {stale.name}")
+                removed += 1
+            except OSError as exc:
+                emit_fn(f"[LOCK] No se pudo eliminar {stale.name}: {exc}")
+    return removed
+
+
+# Keywords that indicate an error or fatal condition in rclone output lines.
+# rclone writes "ERROR : ..." and "FATAL : ..." to stderr (merged into stdout).
+_RCLONE_ERROR_KEYWORDS = ("ERROR", "FATAL", "Fatal error", "error:")
+
+# Phrase emitted by rclone when a OneDrive/SharePoint remote is missing the
+# drive_id and drive_type fields that newer rclone versions require.  This
+# happens when an existing remote was configured with an older rclone version
+# that did not write those fields to rclone.conf.  Bisync fails immediately
+# and retrying with --resync would fail in the same way because the problem is
+# in the stored configuration, not in the sync state.
+_DRIVE_ID_MISSING_PHRASE = "unable to get drive_id and drive_type"
+
+
 def _rclone_base_args(config_manager: ConfigManager) -> List[str]:
     """Return the common rclone arguments including --config path."""
     return ["rclone", "--config", str(config_manager.rclone_config_path())]
+
+
+def _rclone_supports_resync_mode(config_manager: ConfigManager) -> bool:
+    """Return True if the installed rclone version supports --resync-mode (v1.64+).
+
+    ``--resync-mode`` was introduced in rclone v1.64.  On earlier versions the
+    flag is unknown and causes a fatal error.  When the version cannot be
+    determined we return False so the flag is safely omitted.
+    """
+    version_str = config_manager.get_rclone_version()
+    match = re.search(r"v(\d+)\.(\d+)", version_str)
+    if not match:
+        return False
+    major, minor = int(match.group(1)), int(match.group(2))
+    return (major, minor) >= (1, 64)
 
 
 class RcloneManager:
@@ -37,10 +130,26 @@ class RcloneManager:
         self._stop_events: Dict[str, threading.Event] = {}
         # Map of service_name → current sync status string
         self._status: Dict[str, str] = {}
+        # Map of service_name → active rclone mount Popen process
+        self._mount_procs: Dict[str, subprocess.Popen] = {}
+        # Map of service_name → currently-running rclone bisync Popen process.
+        # Used to terminate a long-running bisync immediately when stop_service
+        # is called, without waiting for the process to finish naturally.
+        self._running_procs: Dict[str, subprocess.Popen] = {}
+        # Services whose last bisync failed due to a missing drive_id/drive_type
+        # configuration error.  _do_bisync checks this before retrying with
+        # --resync to avoid a pointless retry for what is a config problem.
+        self._config_error_services: set = set()
         # Optional callback(service_name, status_str) called on status changes
         self.on_status_change: Optional[Callable[[str, str], None]] = None
         # Optional callback(service_name, file_path, synced) for history updates
         self.on_file_synced: Optional[Callable[[str, str, bool], None]] = None
+        # Optional callback(service_name, error_message) called on sync errors
+        self.on_error: Optional[Callable[[str, str], None]] = None
+        # Optional callback(service_name) fired when a drive_id/drive_type
+        # configuration error is detected in bisync output.  The UI registers
+        # this to surface an in-tab "fix now" action for the user.
+        self.on_drive_id_error: Optional[Callable[[str], None]] = None
 
     # ------------------------------------------------------------------
     # Public API
@@ -67,10 +176,25 @@ class RcloneManager:
         thread.start()
 
     def stop_service(self, service_name: str) -> None:
-        """Signal the background sync loop for this service to stop."""
+        """Signal the background sync loop for this service to stop.
+
+        In addition to setting the stop event (which interrupts the inter-cycle
+        wait), any rclone bisync process that is actively running for this
+        service is terminated immediately so the UI reflects the stopped state
+        without delay.
+        """
         event = self._stop_events.get(service_name)
         if event:
             event.set()
+        # Terminate the running rclone process if present so the stop takes
+        # effect immediately rather than waiting for the current bisync to finish.
+        proc = self._running_procs.get(service_name)
+        if proc and proc.poll() is None:
+            try:
+                proc.terminate()
+            except OSError:
+                # Process may have exited between poll() and terminate()
+                pass
 
     def is_running(self, service_name: str) -> bool:
         """Return True if the sync thread for this service is alive."""
@@ -88,9 +212,113 @@ class RcloneManager:
                 self.start_service(svc["name"])
 
     def stop_all(self) -> None:
-        """Stop all running sync loops."""
+        """Stop all running sync loops and mounts."""
         for name in list(self._sync_threads.keys()):
             self.stop_service(name)
+        self.stop_all_mounts()
+
+    def start_mount(self, service_name: str) -> bool:
+        """
+        Start a persistent rclone mount process for the given service.
+
+        The mount path is taken from ``svc['mount_path']``.  Does nothing and
+        returns False if the service is already mounted, mount is disabled, or
+        no mount_path is configured.
+
+        Returns True if the mount process was successfully launched.
+        """
+        if self.is_mounted(service_name):
+            return True
+
+        svc = self._config.get_service(service_name)
+        if svc is None or not svc.get("mount_enabled", False):
+            return False
+
+        mount_path = svc.get("mount_path", "").strip()
+        if not mount_path:
+            self._emit_error(service_name, "[MOUNT] No se ha configurado la ruta de montaje")
+            return False
+
+        remote = f"{svc['remote_name']}:{svc.get('remote_path', '/')}"
+
+        # Shared VFS cache options
+        vfs_cache_mode = svc.get("vfs_cache_mode", "writes")
+        vfs_cache_max_size = svc.get("vfs_cache_max_size", "10G")
+        vfs_cache_dir = svc.get("vfs_cache_dir", "").strip()
+
+        # Mount-specific VFS options
+        vfs_read_chunk_size = svc.get("vfs_read_chunk_size", "10M")
+        vfs_read_chunk_size_limit = svc.get("vfs_read_chunk_size_limit", "100M")
+
+        # Ensure the mount directory exists
+        try:
+            Path(mount_path).mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            self._emit_error(service_name, f"[MOUNT] No se pudo crear el directorio de montaje: {exc}")
+            return False
+
+        cmd = _rclone_base_args(self._config) + [
+            "mount",
+            remote,
+            mount_path,
+            "--vfs-cache-mode", vfs_cache_mode,
+            "--vfs-cache-max-size", vfs_cache_max_size,
+            "--vfs-read-chunk-size", vfs_read_chunk_size,
+            "--vfs-read-chunk-size-limit", vfs_read_chunk_size_limit,
+        ]
+        if vfs_cache_dir:
+            cmd += ["--cache-dir", vfs_cache_dir]
+
+        # Log the command for reference
+        self._emit_error(service_name, "[MOUNT CMD] " + shlex.join(cmd))
+
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+            self._mount_procs[service_name] = proc
+            # Background thread to forward mount error output
+            threading.Thread(
+                target=self._read_mount_output,
+                args=(service_name, proc),
+                daemon=True,
+                name=f"mount-{service_name}",
+            ).start()
+            return True
+        except (OSError, subprocess.SubprocessError) as exc:
+            self._emit_error(service_name, f"[MOUNT] Error al iniciar montaje: {exc}")
+            return False
+
+    def stop_mount(self, service_name: str) -> None:
+        """Terminate the rclone mount process for the given service."""
+        proc = self._mount_procs.pop(service_name, None)
+        if proc is None:
+            return
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+
+    def is_mounted(self, service_name: str) -> bool:
+        """Return True if the mount process for this service is alive."""
+        proc = self._mount_procs.get(service_name)
+        return proc is not None and proc.poll() is None
+
+    def start_all_mounts(self) -> None:
+        """Start mount processes for all services that have mount_enabled=True."""
+        for svc in self._config.get_services():
+            if svc.get("mount_enabled", False):
+                self.start_mount(svc["name"])
+
+    def stop_all_mounts(self) -> None:
+        """Terminate all running mount processes."""
+        for name in list(self._mount_procs.keys()):
+            self.stop_mount(name)
 
     def run_bisync_once(self, service_name: str) -> bool:
         """
@@ -103,12 +331,38 @@ class RcloneManager:
             return False
         return self._do_bisync(svc)
 
+    def clear_bisync_locks(self, service_name: str) -> int:
+        """
+        Remove stale rclone bisync lock and partial-listing files for the
+        given service.
+
+        This is useful when a previous bisync was interrupted and left a
+        ``*.lck`` or ``*.lst-new`` file in the rclone cache directory that
+        blocks the next run.  Any removed files are reported via the
+        ``on_error`` callback.
+
+        Returns the number of files that were deleted.
+        """
+        svc = self._config.get_service(service_name)
+        if svc is None:
+            return 0
+        remote_name = svc.get("remote_name", "")
+        cache_dir = _bisync_cache_dir()
+        return _clear_bisync_stale_files(
+            remote_name,
+            cache_dir,
+            lambda msg: self._emit_error(service_name, msg),
+        )
+
     def open_browser_auth(self, remote_name: str, platform_type: str) -> subprocess.Popen:
         """
         Launch 'rclone config create' in an interactive subprocess so that
         rclone opens the browser for OAuth authentication.
 
         Returns the Popen object so the caller can wait on it.
+        stdin is closed (DEVNULL) so that any post-OAuth interactive prompts
+        (e.g. OneDrive drive selection) receive EOF and rclone falls back to
+        the built-in defaults instead of blocking indefinitely.
         """
         args = _rclone_base_args(self._config) + [
             "config",
@@ -119,11 +373,159 @@ class RcloneManager:
         ]
         proc = subprocess.Popen(
             args,
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
         )
         return proc
+
+    def remote_has_token(
+        self, remote_name: str, extra_required_keys: "tuple[str, ...]" = ()
+    ) -> bool:
+        """Return True if *remote_name* exists in rclone.conf with an OAuth token
+        and all *extra_required_keys*.
+
+        Used to detect a completed OAuth flow even when ``rclone config create``
+        is still running (e.g. hung on a post-OAuth drive-selection prompt).
+
+        Pass ``extra_required_keys=("drive_id",)`` for OneDrive remotes so that
+        the poll loop waits until rclone has also written the drive configuration
+        (drive_id, drive_type) — not just the bare OAuth token.  Without those
+        keys ``rclone bisync`` immediately fails with exit-code 1.
+        """
+        config_path = self._config.rclone_config_path()
+        try:
+            parser = configparser.RawConfigParser()
+            parser.read(str(config_path), encoding="utf-8")
+            if not parser.has_section(remote_name):
+                return False
+            if not parser.has_option(remote_name, "token"):
+                return False
+            for key in extra_required_keys:
+                if not parser.has_option(remote_name, key):
+                    return False
+            return True
+        except Exception:
+            return False
+
+    def create_mega_remote(
+        self, remote_name: str, user: str, password: str
+    ) -> "tuple[bool, str]":
+        """
+        Create a Mega remote in the rclone config using username/password
+        credentials.
+
+        Mega does not use OAuth; rclone requires the user's email address and
+        an *obscured* version of their password.  This method first calls
+        ``rclone obscure`` to encode the plain-text password, then calls
+        ``rclone config create`` with the result.
+
+        Returns a ``(success, error_message)`` tuple.  On success the error
+        message is an empty string.  On failure it contains the relevant output
+        from rclone so it can be shown to the user.
+        """
+        base = _rclone_base_args(self._config)
+
+        # Step 1: obscure the plain-text password so it can be stored safely.
+        try:
+            obscure_result = subprocess.run(
+                ["rclone", "obscure", password],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+        except OSError as exc:
+            return False, f"rclone no encontrado: {exc}"
+        except subprocess.TimeoutExpired:
+            return False, "rclone obscure superó el tiempo de espera."
+        if obscure_result.returncode != 0:
+            detail = obscure_result.stderr.strip() or obscure_result.stdout.strip()
+            return False, detail or f"rclone obscure falló (código {obscure_result.returncode})."
+        obscured = obscure_result.stdout.strip()
+
+        # Step 2: create the Mega remote with the obscured credentials.
+        try:
+            create_result = subprocess.run(
+                base + [
+                    "config", "create",
+                    remote_name, "mega",
+                    f"user={user}",
+                    f"pass={obscured}",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        except OSError as exc:
+            return False, f"rclone no encontrado: {exc}"
+        except subprocess.TimeoutExpired:
+            return False, "rclone config create superó el tiempo de espera."
+        if create_result.returncode != 0:
+            detail = create_result.stderr.strip() or create_result.stdout.strip()
+            return False, detail or f"rclone config create falló (código {create_result.returncode})."
+        return True, ""
+
+    def import_remote(
+        self,
+        remote_name: str,
+        new_name: str,
+        remote_data: Dict[str, str],
+    ) -> "tuple[bool, str]":
+        """
+        Import a remote from an external rclone config into the app's own config.
+
+        Credentials (tokens, client_id, etc.) are written **directly** into the
+        app's rclone.conf via ``configparser`` so that already-authenticated
+        remotes keep their stored tokens without triggering a new OAuth browser
+        flow.
+
+        Parameters
+        ----------
+        remote_name:
+            Original name of the remote in the source config (used only for
+            error messages).
+        new_name:
+            Section name to register in the app's own rclone config.
+        remote_data:
+            ``{key: value}`` pairs from the remote's INI section, **including**
+            the mandatory ``type`` key.
+
+        Returns
+        -------
+        ``(True, "")`` on success; ``(False, error_message)`` on failure.
+        """
+        remote_type = remote_data.get("type", "").strip()
+        if not remote_type:
+            return False, f"El remote '{remote_name}' no tiene un campo 'type' válido."
+
+        dest_path = self._config.rclone_config_path()
+
+        try:
+            # Load existing config (creates an empty parser if the file is new)
+            parser = configparser.RawConfigParser()
+            if dest_path.exists():
+                parser.read(str(dest_path), encoding="utf-8")
+
+            # Overwrite or add the target section
+            if parser.has_section(new_name):
+                parser.remove_section(new_name)
+            parser.add_section(new_name)
+            for key, value in remote_data.items():
+                parser.set(new_name, key, value)
+
+            # Ensure the parent directory exists
+            dest_path.parent.mkdir(parents=True, exist_ok=True)
+
+            # Write atomically: write to a temp file then rename
+            tmp_path = dest_path.with_suffix(".conf.tmp")
+            with tmp_path.open("w", encoding="utf-8") as fh:
+                parser.write(fh)
+            tmp_path.replace(dest_path)
+        except OSError as exc:
+            return False, f"No se pudo escribir la configuración: {exc}"
+
+        return True, ""
 
     def delete_remote(self, remote_name: str) -> bool:
         """
@@ -137,6 +539,181 @@ class RcloneManager:
             return result.returncode == 0
         except (OSError, subprocess.TimeoutExpired):
             return False
+
+    # ── Drive-ID quick-fix helpers ───────────────────────────────────────
+
+    @staticmethod
+    def _candidate_rclone_configs() -> List[Path]:
+        """Return a list of well-known rclone config paths to search for drive_id.
+
+        Includes:
+          - The standard rclone default config (~/.config/rclone/rclone.conf)
+          - Flatpak sandboxes for popular GUI rclone front-ends
+          - Any extra locations from the RCLONE_CONFIG environment variable
+        """
+        home = Path.home()
+        candidates: List[Path] = [
+            # Standard rclone location
+            home / ".config" / "rclone" / "rclone.conf",
+            # Flatpak: rclone-manager (io.github.zarestia_dev.rclone-manager)
+            home / ".var" / "app" / "io.github.zarestia_dev.rclone-manager"
+                  / "config" / "rclone" / "rclone.conf",
+            # Flatpak: RcloneUI (com.rcloneui.RcloneUI)
+            home / ".var" / "app" / "com.rcloneui.RcloneUI"
+                  / "data" / "com.rclone.ui" / "configs" / "default" / "rclone.conf",
+            # RCX / other common GUI tools
+            home / ".config" / "rcx" / "rclone.conf",
+            home / ".config" / "rclone-browser" / "rclone.conf",
+        ]
+        # Also honour the RCLONE_CONFIG environment variable if set
+        env_config = os.environ.get("RCLONE_CONFIG", "")
+        if env_config:
+            candidates.insert(0, Path(env_config))
+        return candidates
+
+    def find_drive_id_in_known_configs(
+        self, remote_name: str
+    ) -> "List[Dict[str, str]]":
+        """Search well-known rclone config files for ``drive_id`` / ``drive_type``.
+
+        Looks at each candidate config file for **any** remote section that:
+
+          * has a ``drive_id`` value, and
+          * has a ``drive_type`` value, and
+          * is **not** the same file as the app's own ``rclone.conf``.
+
+        Sections in the same file as the app config are excluded because they
+        are precisely the ones that are broken.
+
+        Returns
+        -------
+        A list of dicts, each with keys:
+            ``source_file``, ``section``, ``drive_id``, ``drive_type``.
+        The list is empty when nothing is found.
+        """
+        own_config = self._config.rclone_config_path().resolve()
+        results: List[Dict[str, str]] = []
+
+        for candidate in self._candidate_rclone_configs():
+            try:
+                resolved = candidate.resolve()
+            except OSError:
+                continue
+            if resolved == own_config:
+                continue
+            if not candidate.exists():
+                continue
+            try:
+                parser = configparser.RawConfigParser()
+                parser.read(str(candidate), encoding="utf-8")
+            except Exception:
+                continue
+            for section in parser.sections():
+                drive_id = parser.get(section, "drive_id", fallback="").strip()
+                drive_type = parser.get(section, "drive_type", fallback="").strip()
+                if drive_id and drive_type:
+                    results.append(
+                        {
+                            "source_file": str(candidate),
+                            "section": section,
+                            "drive_id": drive_id,
+                            "drive_type": drive_type,
+                        }
+                    )
+        return results
+
+    def patch_remote_drive_fields(
+        self, remote_name: str, drive_id: str, drive_type: str
+    ) -> "tuple[bool, str]":
+        """Write ``drive_id`` and ``drive_type`` directly into the app's rclone.conf.
+
+        This is the *quick-fix* path for a remote that was created with an older
+        rclone version and therefore lacks these fields.  It avoids the full
+        OAuth re-authentication flow when the correct values can be recovered
+        from another existing config file.
+
+        The write is atomic (write to a temporary file, then ``os.replace``).
+
+        Returns
+        -------
+        ``(True, "")`` on success; ``(False, error_message)`` on failure.
+        """
+        config_path = self._config.rclone_config_path()
+        try:
+            parser = configparser.RawConfigParser()
+            if config_path.exists():
+                parser.read(str(config_path), encoding="utf-8")
+            if not parser.has_section(remote_name):
+                # Only include the first 64 characters of remote_name in the
+                # message so an unusually long or unusual section name does not
+                # produce a confusing or very long error string for the user.
+                safe_name = remote_name[:64]
+                return False, f"La sección '[{safe_name}]' no existe en rclone.conf."
+            parser.set(remote_name, "drive_id", drive_id)
+            parser.set(remote_name, "drive_type", drive_type)
+            config_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path = config_path.with_suffix(".conf.tmp")
+            with tmp_path.open("w", encoding="utf-8") as fh:
+                parser.write(fh)
+            tmp_path.replace(config_path)
+        except OSError as exc:
+            return False, f"No se pudo actualizar la configuración: {exc}"
+        return True, ""
+
+    # Terminal emulators tried in preference order when launching an interactive
+    # rclone configuration session.  Each tuple is (executable, argument-flag)
+    # where the flag precedes the shell command string.
+    _TERMINAL_CANDIDATES: "List[tuple[str, str]]" = [
+        ("xterm", "-e"),
+        ("gnome-terminal", "--"),
+        ("xfce4-terminal", "--command"),
+        ("konsole", "-e"),
+        ("lxterminal", "-e"),
+        ("rxvt", "-e"),
+    ]
+
+    def open_terminal_reconnect(self, remote_name: str) -> "tuple[bool, str]":
+        """Launch ``rclone config reconnect <remote>:`` inside a terminal emulator.
+
+        ``rclone config reconnect`` is the recommended way to fix a remote
+        that was created with an older rclone version and therefore lacks the
+        ``drive_id`` / ``drive_type`` fields required by newer releases.
+        Unlike ``rclone config create --auto-confirm``, *reconnect* presents
+        the full OAuth flow **including** the post-auth drive-selection
+        prompt, so ``drive_id`` is properly populated after the user
+        completes the authentication.
+
+        This method tries the terminal emulators listed in
+        ``_TERMINAL_CANDIDATES`` in order.  If none is found it returns the
+        shell command so the caller can display it to the user as a manual
+        step.
+
+        Returns
+        -------
+        ``(True, "")``
+            A terminal was launched successfully.
+        ``(False, cmd)``
+            No terminal emulator was available; ``cmd`` is the shell
+            command the user should run in their own terminal.
+        """
+        config_path = self._config.rclone_config_path()
+        cmd = (
+            f"rclone --config {shlex.quote(str(config_path))} "
+            f"config reconnect {shlex.quote(remote_name)}:"
+        )
+        for exe, flag in self._TERMINAL_CANDIDATES:
+            try:
+                subprocess.Popen(
+                    [exe, flag, cmd],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    close_fds=True,
+                )
+                return True, ""
+            except (FileNotFoundError, OSError):
+                continue
+        return False, cmd
 
     def get_disk_usage(self, service_name: str) -> str:
         """
@@ -226,6 +803,55 @@ class RcloneManager:
             pass
         return []
 
+    def get_storage_info(self, service_name: str) -> Optional[str]:
+        """
+        Query the remote storage quota using ``rclone about remote:``.
+
+        Returns a human-readable summary such as
+        ``"Total: 1.024 TiB  |  Usado: 125.3 GiB  |  Libre: 898.7 GiB"``
+        or ``None`` when the command fails (e.g. the service does not support
+        ``about``, rclone is not installed, or the service is not configured).
+
+        Supported platforms: OneDrive, Google Drive, Dropbox, Box, pCloud.
+        Unsupported (returns None): Amazon S3, Backblaze B2, SFTP, FTP, etc.
+        """
+        svc = self._config.get_service(service_name)
+        if svc is None:
+            return None
+        remote_name = svc.get("remote_name", "")
+        if not remote_name:
+            return None
+
+        cmd = _rclone_base_args(self._config) + ["about", f"{remote_name}:"]
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            if result.returncode != 0:
+                return None
+
+            # Parse output lines such as "Total:   1.024 TiB", "Used:    125.3 GiB"
+            info: dict = {}
+            for line in result.stdout.strip().splitlines():
+                if ":" in line:
+                    key, _, value = line.partition(":")
+                    info[key.strip().lower()] = value.strip()
+
+            parts: List[str] = []
+            if "total" in info:
+                parts.append(f"Total: {info['total']}")
+            if "used" in info:
+                parts.append(f"Usado: {info['used']}")
+            if "free" in info:
+                parts.append(f"Libre: {info['free']}")
+
+            return "  |  ".join(parts) if parts else None
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
@@ -250,6 +876,7 @@ class RcloneManager:
                 self._set_status(service_name, "Actualizado")
             else:
                 self._set_status(service_name, "Error en sincronización")
+                self._emit_error(service_name, "Fallo en el ciclo de sincronización")
 
             # Wait for the configured interval (or stop early if signalled)
             interval = svc.get("sync_interval", 900)
@@ -268,6 +895,14 @@ class RcloneManager:
         local = svc.get("local_path", "")
         name = svc.get("name", "?")
 
+        # Clear any stale lock / partial-listing files left by a previous
+        # interrupted bisync before attempting to run again.
+        _clear_bisync_stale_files(
+            svc.get("remote_name", ""),
+            _bisync_cache_dir(),
+            lambda msg: self._emit_error(name, msg),
+        )
+
         # Build the exclusion flags
         exclude_args: List[str] = []
         # Apply the default OneDrive Personal Vault exclusion if configured
@@ -279,26 +914,87 @@ class RcloneManager:
             if pattern != PERSONAL_VAULT_PATTERN:
                 exclude_args += ["--exclude", pattern]
 
-        # Performance options
+        # Performance options.
+        # Note: VFS cache flags (--vfs-cache-mode, --vfs-cache-max-size, etc.) are
+        # NOT valid for bisync; they belong exclusively to the mount command and are
+        # applied in start_mount() instead.
+        #
+        # --transfers and --checkers default to 16/32 but are overridable per-service
+        # so users can reduce them to avoid Google Drive API quota errors.
+        transfers = str(svc.get("transfers", 16))
+        checkers = str(svc.get("checkers", 32))
         perf_args = [
-            "--transfers", "16",
-            "--checkers", "32",
+            "--transfers", transfers,
+            "--checkers", checkers,
             "--drive-chunk-size", "128M",
             "--buffer-size", "64M",
             "-P",
         ]
+        # --tpslimit throttles API calls per second.  When set to a positive value
+        # it prevents Google Drive 403 "Quota exceeded for 'Queries per minute'"
+        # errors caused by rclone making too many API requests in a short burst.
+        # A value of 0 (default) means no limit.
+        try:
+            tpslimit_f = float(svc.get("tpslimit", 0))
+        except (TypeError, ValueError):
+            tpslimit_f = 0.0
+        if tpslimit_f > 0:
+            perf_args += ["--tpslimit", str(tpslimit_f)]
+        # Google Drive may flag some files as malware/spam and return HTTP 403
+        # (cannotDownloadAbusiveFile).  This flag tells rclone to acknowledge
+        # the warning and download the file anyway, preventing bisync from
+        # failing due to files outside the user's control.
+        if svc.get("platform") == "drive":
+            perf_args.append("--drive-acknowledge-abuse")
+        # Optional verbose output
+        if svc.get("verbose_sync", False):
+            perf_args.append("--verbose")
+
+        # Conflict resolution mode used during --resync retries
+        resync_mode = svc.get("resync_mode", "newer")
 
         base = _rclone_base_args(self._config)
         Path(local).mkdir(parents=True, exist_ok=True)
 
         # First attempt: standard bisync
         cmd = base + ["bisync", remote, local] + perf_args + exclude_args
+        # Log the exact command being run so it appears in the error log as reference
+        self._emit_error(name, "[CMD] " + shlex.join(cmd))
         success = self._run_rclone(cmd, name, svc)
 
-        # Second attempt: bisync --resync if first attempt failed
+        # Second attempt: bisync --resync if first attempt failed.
+        # Skip the retry if a stop was explicitly requested (the process was
+        # terminated on purpose, not due to a real error).
+        # Clean stale lock files again before retrying: the first attempt may
+        # have created a lock that it never released (e.g. if the process was
+        # killed), which would cause the retry to fail immediately with
+        # "prior lock file found".
         if not success:
+            stop_ev = self._stop_events.get(name)
+            if stop_ev and stop_ev.is_set():
+                # Service is being stopped; don't retry or log spurious errors
+                return False
+            # If the failure was caused by a missing drive_id/drive_type config
+            # error, skip the --resync retry: the problem is in the stored
+            # remote configuration, not in the bisync state, so retrying with
+            # --resync would fail in the same way.  The actionable message was
+            # already emitted by _run_rclone.
+            if name in self._config_error_services:
+                self._config_error_services.discard(name)
+                return False
+            _clear_bisync_stale_files(
+                svc.get("remote_name", ""),
+                _bisync_cache_dir(),
+                lambda msg: self._emit_error(name, msg),
+            )
             cmd_resync = cmd + ["--resync"]
+            if _rclone_supports_resync_mode(self._config):
+                cmd_resync += ["--resync-mode", resync_mode]
+            self._emit_error(name, "[CMD] " + shlex.join(cmd_resync))
             success = self._run_rclone(cmd_resync, name, svc, is_retry=True)
+
+        if not success:
+            self._emit_error(name, f"La sincronización falló (remoto: {remote})")
 
         return success
 
@@ -322,11 +1018,40 @@ class RcloneManager:
                 stderr=subprocess.STDOUT,
                 text=True,
             )
-            # Read output line-by-line to detect file changes
+            # Track the running process so stop_service() can terminate it
+            # immediately without waiting for the current bisync to finish.
+            self._running_procs[service_name] = proc
+            # Read output line-by-line to detect file changes and errors
             for raw_line in proc.stdout or []:
                 line = raw_line.strip()
                 if not line:
                     continue
+                # Detect the drive_id/drive_type config error.  rclone emits
+                # this when a remote was configured with an older rclone version
+                # that did not write those fields to rclone.conf.  The line may
+                # not contain a standard ERROR/FATAL keyword on all rclone
+                # versions, so we check for it explicitly before the general
+                # keyword scan to guarantee it is always logged.
+                if _DRIVE_ID_MISSING_PHRASE in line:
+                    # Always emit the raw rclone line so the user can see it.
+                    if not any(kw in line for kw in _RCLONE_ERROR_KEYWORDS):
+                        self._emit_error(service_name, line)
+                    # Mark this service so _do_bisync can skip the --resync retry.
+                    self._config_error_services.add(service_name)
+                    self._emit_error(
+                        service_name,
+                        "⚠️ La configuración del remoto está desactualizada: "
+                        "faltan los campos drive_id y drive_type. "
+                        "Ve a Configuración → panel de información → "
+                        "'Reconectar' para abrir un terminal con el comando "
+                        "de reconfiguración, o usa '🔎 Buscar drive_id' si ya "
+                        "tienes el valor en otro archivo de configuración.",
+                    )
+                    # Notify the UI so it can surface an in-tab "fix" action.
+                    self._emit_drive_id_error(service_name)
+                # Forward any rclone error / fatal output to the error log
+                if any(kw in line for kw in _RCLONE_ERROR_KEYWORDS):
+                    self._emit_error(service_name, line)
                 # rclone -P outputs lines like: "Transferred: <path>"
                 # or lines starting with a file path
                 file_path = _extract_file_path(line)
@@ -336,8 +1061,19 @@ class RcloneManager:
                     self._config.add_sync_history_entry(service_name, file_path, True)
 
             proc.wait()
+            self._running_procs.pop(service_name, None)
+            if proc.returncode != 0:
+                # Don't log a spurious error when we stopped the process on purpose
+                stop_ev = self._stop_events.get(service_name)
+                if not (stop_ev and stop_ev.is_set()):
+                    self._emit_error(
+                        service_name,
+                        f"rclone terminó con código {proc.returncode}",
+                    )
             return proc.returncode == 0
-        except (OSError, subprocess.SubprocessError):
+        except (OSError, subprocess.SubprocessError) as exc:
+            self._running_procs.pop(service_name, None)
+            self._emit_error(service_name, f"Error al ejecutar rclone: {exc}")
             return False
 
     def _set_status(self, service_name: str, status: str) -> None:
@@ -348,6 +1084,44 @@ class RcloneManager:
                 self.on_status_change(service_name, status)
             except Exception:
                 pass
+
+    def _emit_error(self, service_name: str, message: str) -> None:
+        """Fire the on_error callback if registered."""
+        if self.on_error:
+            try:
+                self.on_error(service_name, message)
+            except Exception:
+                pass
+
+    def _emit_drive_id_error(self, service_name: str) -> None:
+        """Fire the on_drive_id_error callback if registered."""
+        if self.on_drive_id_error:
+            try:
+                self.on_drive_id_error(service_name)
+            except Exception:
+                pass
+
+    def _read_mount_output(self, service_name: str, proc: subprocess.Popen) -> None:
+        """
+        Background thread: read mount process output and forward error lines.
+
+        Called automatically by start_mount().
+        """
+        if proc.stdout:
+            for raw_line in proc.stdout:
+                line = raw_line.strip()
+                if not line:
+                    continue
+                if any(kw in line for kw in _RCLONE_ERROR_KEYWORDS):
+                    self._emit_error(service_name, f"[MOUNT] {line}")
+        proc.wait()
+        rc = proc.returncode
+        # -15 = SIGTERM (normal shutdown), -9 = SIGKILL, 0 = clean exit
+        if rc is not None and rc not in (0, -15, -9):
+            self._emit_error(
+                service_name,
+                f"[MOUNT] El proceso de montaje terminó inesperadamente con código {rc}",
+            )
 
 
 # ------------------------------------------------------------------

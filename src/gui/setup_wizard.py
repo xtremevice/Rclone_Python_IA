@@ -12,12 +12,16 @@ Window size: 70 % of screen height × 30 % of screen width.
 import os
 import subprocess
 import threading
+import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
 from typing import Callable, Optional
 
 from src.config.config_manager import PLATFORM_LABELS, SUPPORTED_PLATFORMS, ConfigManager
 from src.rclone.rclone_manager import RcloneManager
+
+# Maximum seconds to wait for OAuth to complete (browser login + token write).
+_OAUTH_TIMEOUT_SECONDS = 120
 
 
 class SetupWizard:
@@ -269,7 +273,18 @@ class SetupWizard:
     # ------------------------------------------------------------------
 
     def _show_step3(self) -> None:
-        """Render step 3: launch OAuth browser session and wait for token."""
+        """Render step 3: authenticate with the cloud provider.
+
+        For Mega the authentication is credential-based (email + password).
+        For every other platform it is OAuth via the system browser.
+        """
+        if self._platform == "mega":
+            self._show_step3_mega()
+        else:
+            self._show_step3_oauth()
+
+    def _show_step3_oauth(self) -> None:
+        """Render step 3 for OAuth-based platforms (Google Drive, OneDrive, …)."""
         self._clear_frame()
 
         platform_label = PLATFORM_LABELS.get(self._platform, self._platform)
@@ -323,6 +338,116 @@ class SetupWizard:
         )
         self._sync_btn.pack(side=tk.RIGHT)
 
+    def _show_step3_mega(self) -> None:
+        """Render step 3 for Mega: collect email and password credentials."""
+        self._clear_frame()
+
+        tk.Label(
+            self._frame,
+            text="Paso 3 de 3 – Credenciales de Mega",
+            font=("Segoe UI", 14, "bold"),
+        ).pack(anchor="w", pady=(0, 10))
+
+        tk.Label(
+            self._frame,
+            text=(
+                "Mega requiere tu dirección de correo electrónico y contraseña "
+                "para acceder a tu cuenta. Estos datos se almacenan de forma "
+                "segura en el fichero de configuración local de rclone."
+            ),
+            wraplength=550,
+            justify="left",
+        ).pack(anchor="w", pady=(0, 15))
+
+        # Summary box
+        summary_frame = tk.LabelFrame(self._frame, text="Resumen de configuración", padx=10, pady=10)
+        summary_frame.pack(fill=tk.X, pady=10)
+
+        tk.Label(summary_frame, text=f"Nombre: {self._service_name}", anchor="w").pack(anchor="w")
+        tk.Label(summary_frame, text="Plataforma: Mega", anchor="w").pack(anchor="w")
+        tk.Label(summary_frame, text=f"Carpeta local: {self._local_path}", anchor="w", wraplength=500).pack(anchor="w")
+
+        # Credentials form
+        creds_frame = tk.Frame(self._frame)
+        creds_frame.pack(fill=tk.X, pady=(15, 0))
+
+        tk.Label(creds_frame, text="Correo electrónico (usuario):", anchor="w").grid(
+            row=0, column=0, sticky="w", pady=(0, 5)
+        )
+        self._mega_user_var = tk.StringVar()
+        tk.Entry(creds_frame, textvariable=self._mega_user_var, width=40).grid(
+            row=0, column=1, sticky="ew", padx=(8, 0), pady=(0, 5)
+        )
+
+        tk.Label(creds_frame, text="Contraseña:", anchor="w").grid(
+            row=1, column=0, sticky="w"
+        )
+        self._mega_pass_var = tk.StringVar()
+        tk.Entry(creds_frame, textvariable=self._mega_pass_var, show="*", width=40).grid(
+            row=1, column=1, sticky="ew", padx=(8, 0)
+        )
+        creds_frame.columnconfigure(1, weight=1)
+
+        # Status label — wraplength allows long rclone error lines to wrap.
+        self._auth_status_var = tk.StringVar(value="")
+        tk.Label(
+            self._frame,
+            textvariable=self._auth_status_var,
+            fg="gray",
+            font=("Segoe UI", 10, "italic"),
+            wraplength=550,
+            justify="left",
+        ).pack(anchor="w", pady=(10, 0))
+
+        nav = tk.Frame(self._frame)
+        nav.pack(side=tk.BOTTOM, fill=tk.X, pady=(20, 0))
+
+        tk.Button(nav, text="← Atrás", command=self._show_step2).pack(side=tk.LEFT)
+
+        self._sync_btn = tk.Button(
+            nav,
+            text="✅ Crear configuración",
+            command=self._start_mega_auth,
+            bg="#d4003f",
+            fg="white",
+            font=("Segoe UI", 10, "bold"),
+        )
+        self._sync_btn.pack(side=tk.RIGHT)
+
+    def _start_mega_auth(self) -> None:
+        """Validate credentials and create the Mega rclone remote."""
+        user = self._mega_user_var.get().strip()
+        password = self._mega_pass_var.get()
+
+        if not user:
+            messagebox.showwarning(
+                "Campo requerido",
+                "Por favor escribe tu dirección de correo electrónico.",
+                parent=self._root,
+            )
+            return
+        if not password:
+            messagebox.showwarning(
+                "Campo requerido",
+                "Por favor escribe tu contraseña.",
+                parent=self._root,
+            )
+            return
+
+        self._sync_btn.configure(state=tk.DISABLED, text="Configurando…")
+        self._auth_status_var.set("Estado: creando configuración de Mega…")
+
+        remote_name = self._service_name.lower().replace(" ", "_")
+
+        def run_create() -> None:
+            ok, error_msg = self._rclone.create_mega_remote(remote_name, user, password)
+            if ok:
+                self._root.after(0, self._auth_success, remote_name)
+            else:
+                self._root.after(0, self._mega_auth_failed, error_msg)
+
+        threading.Thread(target=run_create, daemon=True).start()
+
     def _start_auth(self) -> None:
         """Launch rclone auth in a background thread, opening the browser."""
         self._sync_btn.configure(state=tk.DISABLED, text="Autenticando…")
@@ -331,11 +456,49 @@ class SetupWizard:
         remote_name = self._service_name.lower().replace(" ", "_")
 
         def run_auth() -> None:
-            # Run rclone config create which opens the browser for OAuth
             proc = self._rclone.open_browser_auth(remote_name, self._platform)
-            proc.wait()
-            if proc.returncode == 0:
-                # Schedule success handling on the main thread
+
+            # Keys that must be present in rclone.conf before we consider auth
+            # complete.  OneDrive requires drive_id (written after token) so
+            # that bisync has a fully-configured remote and does not fail with
+            # exit-code 1 due to a missing drive_id/drive_type.
+            extra_keys: "tuple[str, ...]" = (
+                ("drive_id",) if self._platform == "onedrive" else ()
+            )
+
+            # Wait up to _OAUTH_TIMEOUT_SECONDS for either:
+            #   a) rclone to exit on its own (normal case), or
+            #   b) the token (plus any provider-specific extra keys) to appear in
+            #      rclone.conf (handles OneDrive where rclone can hang on a
+            #      post-OAuth drive-selection prompt even after the browser shows
+            #      "success").
+            deadline = time.monotonic() + _OAUTH_TIMEOUT_SECONDS
+            success = False
+            while time.monotonic() < deadline:
+                ret = proc.poll()
+                if ret is not None:
+                    success = ret == 0
+                    break
+                if self._rclone.remote_has_token(remote_name, extra_required_keys=extra_keys):
+                    # OAuth token (and required extra keys) already written —
+                    # give rclone a brief moment to flush/close the config file
+                    # before terminating.
+                    time.sleep(0.5)
+                    try:
+                        proc.terminate()
+                    except OSError:
+                        pass
+                    success = True
+                    break
+                time.sleep(1)
+            else:
+                # Timed out — kill the stalled process.
+                try:
+                    proc.terminate()
+                except OSError:
+                    pass
+
+            if success:
                 self._root.after(0, self._auth_success, remote_name)
             else:
                 self._root.after(0, self._auth_failed)
@@ -349,9 +512,15 @@ class SetupWizard:
         self._root.after(1500, lambda: self._finish(remote_name))
 
     def _auth_failed(self) -> None:
-        """Called on the main thread if authentication failed."""
+        """Called on the main thread if OAuth authentication failed."""
         self._auth_status_var.set("❌ La autenticación falló. Intenta de nuevo.")
         self._sync_btn.configure(state=tk.NORMAL, text="🔑 Sincronizar sesión")
+
+    def _mega_auth_failed(self, error_msg: str) -> None:
+        """Called on the main thread if Mega credential setup failed."""
+        display = f"❌ Error: {error_msg}" if error_msg else "❌ La configuración falló. Intenta de nuevo."
+        self._auth_status_var.set(display)
+        self._sync_btn.configure(state=tk.NORMAL, text="✅ Crear configuración")
 
     def _finish(self, remote_name: str) -> None:
         """Save the new service and close the wizard."""

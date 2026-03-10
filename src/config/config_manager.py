@@ -39,8 +39,12 @@ DEFAULT_RCLONE_OPTS = {
     "checkers": 32,
     "drive_chunk_size": "128M",
     "buffer_size": "64M",
-    "vfs_cache_mode": "on_demand",
+    "vfs_cache_mode": "writes",
     "vfs_cache_max_size": "10G",
+    # Maximum API transactions per second (0 = unlimited).  Set to a low value
+    # (e.g. 5) to avoid Google Drive "Quota exceeded for 'Queries per minute'"
+    # 403 errors when bisync generates too many API calls in a short window.
+    "tpslimit": 0,
 }
 
 # Exclusion pattern for the OneDrive Personal Vault folder
@@ -49,32 +53,112 @@ PERSONAL_VAULT_PATTERN = "/Almacén personal/**"
 # Default exclusion rules applied to every service
 DEFAULT_EXCLUSIONS = [PERSONAL_VAULT_PATTERN]
 
-# Platforms supported by rclone that are offered in the wizard
+# Platforms supported by rclone that are offered in the wizard.
+# The first section lists the most commonly used cloud drives that were
+# already supported.  The remainder of the list mirrors the full set of
+# backends reported by `rclone config providers` and is kept in the same
+# order as that output so it is easy to audit against a fresh rclone build.
 SUPPORTED_PLATFORMS = [
-    "onedrive",
-    "drive",       # Google Drive
+    # ── Popular cloud drives (original list, most frequently used) ─────────
+    "onedrive",           # Microsoft OneDrive
+    "drive",              # Google Drive
     "dropbox",
     "box",
-    "s3",
-    "sftp",
+    "s3",                 # Amazon S3 and compatible (AWS, Wasabi, Minio…)
+    "sftp",               # SSH/SFTP
     "ftp",
-    "mega",
+    "mega",               # Mega (email + password auth)
     "pcloud",
-    "yandex",
+    "yandex",             # Yandex Disk
+    # ── Additional rclone backends (alphabetical by rclone type) ──────────
+    "amazon cloud drive", # Amazon Drive (service discontinued, may not work)
+    "azureblob",          # Microsoft Azure Blob Storage
+    "b2",                 # Backblaze B2
+    "cache",              # Cache a remote (deprecated in recent rclone; use VFS instead)
+    "chunker",            # Transparently chunk/split large files
+    "combine",            # Combine several remotes into one
+    "compress",           # Compress a remote
+    "crypt",              # Encrypt / Decrypt a remote
+    "fichier",            # 1Fichier
+    "filefabric",         # Enterprise File Fabric
+    "google cloud storage",
+    "google photos",
+    "hasher",             # Better checksums for other remotes
+    "hdfs",               # Hadoop distributed file system
+    "hidrive",            # HiDrive
+    "http",               # HTTP (read-only remote)
+    "internetarchive",    # Internet Archive
+    "jottacloud",
+    "koofr",              # Koofr, Digi Storage and compatible
+    "local",              # Local Disk
+    "mailru",             # Mail.ru Cloud
+    "memory",             # In-memory object storage
+    "netstorage",         # Akamai NetStorage
+    "opendrive",          # OpenDrive
+    "premiumizeme",       # premiumize.me
+    "putio",              # Put.io
+    "sharefile",          # Citrix Sharefile
+    "sia",                # Sia Decentralized Cloud
+    "smb",                # SMB / CIFS
+    "sugarsync",          # Sugarsync
+    "swift",              # OpenStack Swift (Rackspace, OVH…)
+    "union",              # Union merges the contents of several upstream fs
+    "uptobox",            # Uptobox
+    "webdav",             # WebDAV
+    "zoho",               # Zoho
+    "alias",              # Alias for an existing remote
 ]
 
-# Human-readable labels for each platform
+# Human-readable labels for each platform (shown in the wizard listbox)
 PLATFORM_LABELS = {
-    "onedrive": "Microsoft OneDrive",
-    "drive": "Google Drive",
-    "dropbox": "Dropbox",
-    "box": "Box",
-    "s3": "Amazon S3",
-    "sftp": "SFTP / SSH",
-    "ftp": "FTP",
-    "mega": "Mega",
-    "pcloud": "pCloud",
-    "yandex": "Yandex Disk",
+    # ── Popular cloud drives ───────────────────────────────────────────────
+    "onedrive":           "Microsoft OneDrive",
+    "drive":              "Google Drive",
+    "dropbox":            "Dropbox",
+    "box":                "Box",
+    "s3":                 "Amazon S3",
+    "sftp":               "SFTP / SSH",
+    "ftp":                "FTP",
+    "mega":               "Mega",
+    "pcloud":             "pCloud",
+    "yandex":             "Yandex Disk",
+    # ── Additional rclone backends ─────────────────────────────────────────
+    "amazon cloud drive": "Amazon Drive (discontinued)",
+    "azureblob":          "Microsoft Azure Blob Storage",
+    "b2":                 "Backblaze B2",
+    "cache":              "Cache a remote (deprecated)",
+    "chunker":            "Chunker (split large files)",
+    "combine":            "Combine several remotes",
+    "compress":           "Compress a remote",
+    "crypt":              "Encrypt / Decrypt a remote",
+    "fichier":            "1Fichier",
+    "filefabric":         "Enterprise File Fabric",
+    "google cloud storage": "Google Cloud Storage",
+    "google photos":      "Google Photos",
+    "hasher":             "Better checksums (Hasher)",
+    "hdfs":               "Hadoop Distributed File System",
+    "hidrive":            "HiDrive",
+    "http":               "HTTP",
+    "internetarchive":    "Internet Archive",
+    "jottacloud":         "Jottacloud",
+    "koofr":              "Koofr / Digi Storage",
+    "local":              "Local Disk",
+    "mailru":             "Mail.ru Cloud",
+    "memory":             "In-memory object storage",
+    "netstorage":         "Akamai NetStorage",
+    "opendrive":          "OpenDrive",
+    "premiumizeme":       "premiumize.me",
+    "putio":              "Put.io",
+    "sharefile":          "Citrix Sharefile",
+    "sia":                "Sia Decentralized Cloud",
+    "smb":                "SMB / CIFS",
+    "sugarsync":          "Sugarsync",
+    "swift":              "OpenStack Swift",
+    "union":              "Union (merge several remotes)",
+    "uptobox":            "Uptobox",
+    "webdav":             "WebDAV",
+    "zoho":               "Zoho",
+    "alias":              "Alias for an existing remote",
 }
 
 
@@ -155,9 +239,24 @@ class ConfigManager:
             "exclusions": list(DEFAULT_EXCLUSIONS),
             # Whether to exclude "Almacén personal" (OneDrive Personal Vault)
             "exclude_personal_vault": True,
-            # rclone VFS cache settings
-            "vfs_cache_mode": "on_demand",
+            # rclone VFS cache settings (used by the mount command only;
+            # bisync does not accept VFS cache flags)
+            "vfs_cache_mode": "writes",
             "vfs_cache_max_size": "10G",
+            # Custom cache directory (empty = rclone default)
+            "vfs_cache_dir": "",
+            # bisync: conflict resolution mode used during --resync
+            "resync_mode": "newer",
+            # bisync: emit verbose output (--verbose flag)
+            "verbose_sync": False,
+            # rclone mount: whether to run a persistent mount process
+            "mount_enabled": False,
+            # rclone mount: local directory used as the mount point
+            "mount_path": "",
+            # rclone mount: VFS read chunk size (streamed reads)
+            "vfs_read_chunk_size": "10M",
+            # rclone mount: maximum VFS read chunk size
+            "vfs_read_chunk_size_limit": "100M",
             # Recent file sync history (list of dicts)
             "sync_history": [],
         }
