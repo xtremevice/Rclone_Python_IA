@@ -152,8 +152,10 @@ def _parse_rclone_mtime(s: str) -> Optional[float]:
     from datetime import datetime, timezone as _tz
 
     # Normalise any fractional seconds to exactly _MICROSECOND_PRECISION digits
-    # then strip trailing Z.  This handles nanoseconds (9 digits), short
-    # fractions (< 6 digits), and timestamps with no fractional part at all.
+    # then strip trailing Z.  The regex matches the fractional-seconds part of
+    # the timestamp (e.g. ".123456789"), pads short fractions with trailing
+    # zeros, and truncates long fractions (like nanoseconds) to exactly 6 digits
+    # — the maximum Python's strptime ``%f`` directive understands.
     _pad = "0" * _MICROSECOND_PRECISION
     normalised = re.sub(
         r"\.(\d+)",

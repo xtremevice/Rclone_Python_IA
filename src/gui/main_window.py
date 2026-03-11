@@ -30,6 +30,19 @@ from src.rclone.rclone_manager import RcloneManager
 # Status string emitted by RcloneManager when no sync is running
 _STATUS_STOPPED = "Detenido"
 
+# ── Tree color scheme ────────────────────────────────────────────────────────
+# Colors used for the sync-status file tree.  Items are colored by the side
+# on which they exist, matching the legend shown in the status column:
+#   🔵 local_only  – exists only on the local disk
+#   🟠 remote_only – exists only on the remote (web)
+#   🟢 synced/both – present on both sides
+#   ⚠️ diff        – on both sides but contents differ
+_TREE_COLOR_LOCAL_ONLY  = "#0078d4"   # blue
+_TREE_COLOR_REMOTE_ONLY = "#cc6600"   # orange
+_TREE_COLOR_SYNCED      = "#007700"   # green
+_TREE_COLOR_DIFF        = "#cc6600"   # orange (same as remote_only — warning shade)
+_TREE_COLOR_UNKNOWN     = "#888888"   # gray
+
 
 def _center_window(window: tk.Wm, height_pct: float, width_pct: float) -> None:
     """Resize and center a Tk / Toplevel window on screen."""
@@ -356,12 +369,16 @@ class MainWindow:
         sync_tree.heading("status", text="Estado", anchor="center")
         sync_tree.column("#0", stretch=True, minwidth=120)
         sync_tree.column("status", width=100, anchor="center", stretch=False)
-        sync_tree.tag_configure("synced", foreground="#007700")
-        sync_tree.tag_configure("pending", foreground="#cc6600")
-        sync_tree.tag_configure("diff", foreground="#cc6600")
-        sync_tree.tag_configure("remote_only", foreground="#0078d4")
-        sync_tree.tag_configure("local_only", foreground="#7b3fa0")
-        sync_tree.tag_configure("unknown", foreground="#888888")
+        sync_tree.tag_configure("synced",      foreground=_TREE_COLOR_SYNCED)
+        sync_tree.tag_configure("pending",     foreground=_TREE_COLOR_DIFF)
+        sync_tree.tag_configure("diff",        foreground=_TREE_COLOR_DIFF)
+        # Color coding by file/folder origin:
+        #   remote_only → orange  (exists only on the remote/web)
+        #   local_only  → blue    (exists only on the local disk)
+        #   synced/both → green   (exists on both sides)
+        sync_tree.tag_configure("remote_only", foreground=_TREE_COLOR_REMOTE_ONLY)
+        sync_tree.tag_configure("local_only",  foreground=_TREE_COLOR_LOCAL_ONLY)
+        sync_tree.tag_configure("unknown",     foreground=_TREE_COLOR_UNKNOWN)
         sync_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         sb_tree_y.config(command=sync_tree.yview)
         sb_tree_x.config(command=sync_tree.xview)
@@ -931,10 +948,10 @@ _MAX_TREE_ITEMS = TREE_FILE_THRESHOLD
 _MIN_REFRESH_INTERVAL_SECS = 30
 
 _TREE_STATUS_LABELS: Dict[str, str] = {
-    "synced":       "✅ Sí",
+    "synced":       "🟢 Ambos",
     "diff":         "⚠️ Diferente",
-    "remote_only":  "⬇ Solo remoto",
-    "local_only":   "⬆ Solo local",
+    "remote_only":  "🟠 Solo remoto",
+    "local_only":   "🔵 Solo local",
     "pending":      "⏳ Pendiente",
     "unknown":      "❓",
 }
@@ -946,6 +963,62 @@ _TREE_STATUS_TAGS: Dict[str, tuple] = {
     "pending":      ("pending",),
     "unknown":      ("unknown",),
 }
+
+
+def _propagate_dir_status(items: List[Dict]) -> None:
+    """Update each directory node's status based on the statuses of its descendant files.
+
+    Directory nodes created by :func:`_build_check_tree` (and
+    :func:`_scan_local_tree`) are initially assigned the ``"unknown"`` status
+    because only file entries carry meaningful origin information.  This
+    function performs a post-processing pass to colour directories using the
+    same rules the user sees for individual files:
+
+    * 🔵 ``"local_only"``  – every descendant file exists only on the local disk.
+    * 🟠 ``"remote_only"`` – every descendant file exists only on the remote.
+    * 🟢 ``"synced"``      – all descendant files are present on both sides
+                             (whether identical or differing in mtime/content).
+    * ⚠️ ``"diff"``        – at least one descendant file differs between sides.
+    * ❓ ``"unknown"``     – the directory contains no files (empty or not scanned).
+
+    The function modifies *items* **in-place** and returns ``None``.
+    """
+    # Map dir_rel → set of descendant FILE statuses (collected in first pass)
+    dir_child_statuses: Dict[str, set] = {}
+
+    for item in items:
+        if item["is_dir"]:
+            # Ensure every directory has an entry even if it has no files
+            if item["rel"] not in dir_child_statuses:
+                dir_child_statuses[item["rel"]] = set()
+        else:
+            # Propagate each file's status up to all of its ancestor directories
+            parts = item["rel"].split("/")
+            for depth in range(1, len(parts)):
+                dir_rel = "/".join(parts[:depth])
+                if dir_rel not in dir_child_statuses:
+                    dir_child_statuses[dir_rel] = set()
+                dir_child_statuses[dir_rel].add(item["status"])
+
+    # Second pass: set each directory's status from accumulated child statuses
+    for item in items:
+        if not item["is_dir"]:
+            continue
+        statuses = dir_child_statuses.get(item["rel"], set())
+        if not statuses:
+            item["status"] = "unknown"
+        elif statuses <= {"local_only"}:
+            item["status"] = "local_only"
+        elif statuses <= {"remote_only"}:
+            item["status"] = "remote_only"
+        elif "diff" in statuses:
+            item["status"] = "diff"
+        else:
+            # This directory contains files from both sides (e.g. synced +
+            # local_only, or synced + remote_only, or a mix of all statuses
+            # except "diff").  Mark it as "synced" so it appears green —
+            # indicating that at least some content is present on both sides.
+            item["status"] = "synced"
 
 
 def _build_check_tree(check_items: List[Dict]) -> List[Dict]:
@@ -999,6 +1072,8 @@ def _build_check_tree(check_items: List[Dict]) -> List[Dict]:
             "status": item.get("status", "unknown"),
         })
 
+    # Colour each synthesised directory node based on its descendant files
+    _propagate_dir_status(result)
     return result
 
 
@@ -1077,6 +1152,8 @@ def _scan_local_tree(
                 counter[0] += 1
 
     _walk(base, "")
+    # Colour each directory node based on its descendant files
+    _propagate_dir_status(result)
     return result
 
 

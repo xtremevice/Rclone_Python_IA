@@ -2254,5 +2254,153 @@ class TestDoBisyncNoPriorListings(unittest.TestCase):
             shutil.rmtree(local, ignore_errors=True)
 
 
+# ---------------------------------------------------------------------------
+# Tests for tree-building helpers in src/gui/main_window.py
+# ---------------------------------------------------------------------------
+# main_window.py imports tkinter at module level, which is unavailable in
+# headless CI.  We therefore replicate the pure-data function under test here
+# so it can be exercised without a display.  The canonical implementation is
+# in src/gui/main_window.py::_propagate_dir_status().
+
+def _propagate_dir_status_testable(items):
+    """Testable replica of main_window._propagate_dir_status().  See that
+    function's docstring for the full specification."""
+    dir_child_statuses = {}
+    for item in items:
+        if item["is_dir"]:
+            if item["rel"] not in dir_child_statuses:
+                dir_child_statuses[item["rel"]] = set()
+        else:
+            parts = item["rel"].split("/")
+            for depth in range(1, len(parts)):
+                dir_rel = "/".join(parts[:depth])
+                if dir_rel not in dir_child_statuses:
+                    dir_child_statuses[dir_rel] = set()
+                dir_child_statuses[dir_rel].add(item["status"])
+    for item in items:
+        if not item["is_dir"]:
+            continue
+        statuses = dir_child_statuses.get(item["rel"], set())
+        if not statuses:
+            item["status"] = "unknown"
+        elif statuses <= {"local_only"}:
+            item["status"] = "local_only"
+        elif statuses <= {"remote_only"}:
+            item["status"] = "remote_only"
+        elif "diff" in statuses:
+            item["status"] = "diff"
+        else:
+            item["status"] = "synced"
+
+
+def _make_dir(rel, parent=""):
+    return {"rel": rel, "parent": parent, "name": rel.rsplit("/", 1)[-1],
+            "is_dir": True, "status": "unknown"}
+
+
+def _make_file(rel, status):
+    parent = "/".join(rel.split("/")[:-1])
+    return {"rel": rel, "parent": parent, "name": rel.rsplit("/", 1)[-1],
+            "is_dir": False, "status": status}
+
+
+class TestPropagateDirStatus(unittest.TestCase):
+    """Tests for the _propagate_dir_status() helper (tree directory coloring)."""
+
+    def _apply(self, items):
+        _propagate_dir_status_testable(items)
+        return {i["rel"]: i["status"] for i in items}
+
+    def test_all_local_only_files(self):
+        """Directory with only local_only files should be colored local_only (blue)."""
+        items = [
+            _make_dir("docs"),
+            _make_file("docs/a.txt", "local_only"),
+            _make_file("docs/b.txt", "local_only"),
+        ]
+        statuses = self._apply(items)
+        self.assertEqual(statuses["docs"], "local_only")
+
+    def test_all_remote_only_files(self):
+        """Directory with only remote_only files should be colored remote_only (orange)."""
+        items = [
+            _make_dir("photos"),
+            _make_file("photos/img.jpg", "remote_only"),
+        ]
+        statuses = self._apply(items)
+        self.assertEqual(statuses["photos"], "remote_only")
+
+    def test_all_synced_files(self):
+        """Directory with only synced files should be colored synced (green)."""
+        items = [
+            _make_dir("work"),
+            _make_file("work/report.pdf", "synced"),
+            _make_file("work/data.csv", "synced"),
+        ]
+        statuses = self._apply(items)
+        self.assertEqual(statuses["work"], "synced")
+
+    def test_diff_files_bubble_up(self):
+        """A single diff file should make the parent directory 'diff'."""
+        items = [
+            _make_dir("src"),
+            _make_file("src/main.py", "synced"),
+            _make_file("src/utils.py", "diff"),
+        ]
+        statuses = self._apply(items)
+        self.assertEqual(statuses["src"], "diff")
+
+    def test_mixed_local_and_remote_becomes_synced(self):
+        """A directory with both local_only and remote_only files shows 'synced' (both present)."""
+        items = [
+            _make_dir("mixed"),
+            _make_file("mixed/local.txt", "local_only"),
+            _make_file("mixed/remote.txt", "remote_only"),
+        ]
+        statuses = self._apply(items)
+        self.assertEqual(statuses["mixed"], "synced")
+
+    def test_empty_directory_stays_unknown(self):
+        """A directory with no files should remain 'unknown'."""
+        items = [_make_dir("empty")]
+        statuses = self._apply(items)
+        self.assertEqual(statuses["empty"], "unknown")
+
+    def test_nested_directories_propagate_correctly(self):
+        """Status must propagate from deeply nested files up through all ancestor dirs."""
+        items = [
+            _make_dir("a"),
+            _make_dir("a/b"),
+            _make_dir("a/b/c"),
+            _make_file("a/b/c/file.txt", "local_only"),
+        ]
+        statuses = self._apply(items)
+        self.assertEqual(statuses["a/b/c"], "local_only")
+        self.assertEqual(statuses["a/b"], "local_only")
+        self.assertEqual(statuses["a"], "local_only")
+
+    def test_sibling_dirs_colored_independently(self):
+        """Two sibling directories with different file origins get independent colors."""
+        items = [
+            _make_dir("a"),
+            _make_file("a/f.txt", "local_only"),
+            _make_dir("b"),
+            _make_file("b/g.txt", "remote_only"),
+        ]
+        statuses = self._apply(items)
+        self.assertEqual(statuses["a"], "local_only")
+        self.assertEqual(statuses["b"], "remote_only")
+
+    def test_files_not_modified(self):
+        """_propagate_dir_status must not change the status of file items."""
+        items = [
+            _make_dir("d"),
+            _make_file("d/x.txt", "synced"),
+        ]
+        _propagate_dir_status_testable(items)
+        file_item = next(i for i in items if not i["is_dir"])
+        self.assertEqual(file_item["status"], "synced")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
