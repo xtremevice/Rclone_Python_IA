@@ -443,13 +443,19 @@ class MainWindow:
         tree: ttk.Treeview,
         svc: Dict,
     ) -> None:
-        """Show a loading indicator and start a background rclone check for the tree.
+        """Show a loading indicator and start a background status check for the tree.
 
         On the first call (tab creation) we show a placeholder row so the user
-        knows the tree is loading.  The background check then runs
-        ``rclone check --combined -`` and fills in accurate sync status for
-        every file.  If rclone check is unavailable or times out, we fall back
-        to a local filesystem scan combined with ``sync_history`` data.
+        knows the tree is loading.  The background worker tries three strategies
+        in order:
+
+        1. **mtime comparison** (fast): ``rclone lsjson --recursive`` fetches
+           remote file metadata and compares modification dates against local
+           files via :func:`os.stat`.
+        2. **rclone check** (accurate): ``rclone check --combined -`` verifies
+           file content via checksums — slower but more thorough.
+        3. **local filesystem scan** (offline): reads local files and uses
+           the persisted ``sync_history`` to infer status without remote access.
 
         After the tree is populated an automatic re-check is scheduled
         according to the service's configured ``tree_refresh_small_secs`` /
@@ -500,17 +506,30 @@ class MainWindow:
     def _build_tree_items_from_check(
         self, service_name: str, svc: Optional[Dict]
     ) -> List[Dict]:
-        """Run rclone check for *service_name* and return tree node dicts.
+        """Determine sync status for each file and return tree node dicts.
 
-        Falls back to a local filesystem scan (with ``sync_history`` status)
-        when rclone check is unavailable or returns None.
+        Strategy (fastest to slowest, in order of preference):
+
+        1. **mtime comparison** – ``rclone lsjson --recursive`` fetches only
+           file metadata (names + modification times); local mtimes are read
+           with :func:`os.stat`.  No data is transferred.
+        2. **rclone check** – ``rclone check --combined -`` computes checksums
+           and is more accurate but significantly slower.
+        3. **local filesystem scan** – offline fallback that uses the persisted
+           ``sync_history`` to mark files as synced/pending.  Works without
+           remote access but may be stale.
         """
         if svc is None:
             return []
+        # Stage 1: mtime-based comparison (fast — metadata only)
+        mtime_results = self._rclone.check_sync_status_mtime(service_name)
+        if mtime_results is not None:
+            return _build_check_tree(mtime_results)
+        # Stage 2: rclone check (accurate but slower — uses checksums)
         check_results = self._rclone.check_sync_status(service_name)
         if check_results is not None:
             return _build_check_tree(check_results)
-        # Fallback: local filesystem scan
+        # Stage 3: local filesystem scan (offline fallback)
         local_path = svc.get("local_path", "")
         sync_history = svc.get("sync_history", [])
         synced_set = {e.get("file", "") for e in sync_history if e.get("synced") is True}
@@ -1022,18 +1041,16 @@ def _scan_local_tree(
             raw = list(dir_path.iterdir())
             # Pre-compute is_dir() once per entry to avoid redundant stat calls
             # during sort comparisons.
-            entries = sorted(
-                raw,
-                key=lambda p: (not p.is_dir(), p.name.lower()),
-            )
+            entries_with_dir = [(p, p.is_dir()) for p in raw]
+            entries_with_dir.sort(key=lambda t: (not t[1], t[0].name.lower()))
         except (PermissionError, OSError):
             return
 
-        for entry in entries:
+        for entry, entry_is_dir in entries_with_dir:
             if counter[0] >= max_items:
                 break
             rel = entry.relative_to(base).as_posix()
-            if entry.is_dir():
+            if entry_is_dir:
                 result.append({
                     "rel": rel,
                     "parent": parent_rel,

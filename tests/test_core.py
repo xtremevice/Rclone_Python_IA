@@ -34,6 +34,9 @@ from src.rclone.rclone_manager import (
     _bisync_cache_dir,
     _clear_bisync_stale_files,
     _DRIVE_ID_MISSING_PHRASE,
+    _parse_rclone_mtime,
+    _scan_local_mtimes,
+    _MTIME_TOLERANCE_SECS,
 )
 
 
@@ -1724,6 +1727,285 @@ class TestElementaryIndicator(unittest.TestCase):
 
         ind = ElementaryIndicator()
         ind.update_tooltip("Some tooltip")  # must not raise
+
+
+
+
+class TestParseRcloneMtime(unittest.TestCase):
+    """Tests for the _parse_rclone_mtime() helper."""
+
+    def test_nanosecond_format(self):
+        """Should parse rclone's nanosecond-precision format correctly."""
+        # 2024-01-15T10:30:00Z = 1705314600 UTC
+        ts = _parse_rclone_mtime("2024-01-15T10:30:00.123456789Z")
+        self.assertIsNotNone(ts)
+        self.assertAlmostEqual(ts, 1705314600.123456, places=3)
+
+    def test_microsecond_format(self):
+        """Should parse a 6-digit fractional seconds string."""
+        ts = _parse_rclone_mtime("2024-01-15T10:30:00.123456Z")
+        self.assertIsNotNone(ts)
+        self.assertAlmostEqual(ts, 1705314600.123456, places=3)
+
+    def test_no_fraction_format(self):
+        """Should parse a timestamp without fractional seconds."""
+        ts = _parse_rclone_mtime("2024-01-15T10:30:00Z")
+        self.assertIsNotNone(ts)
+        self.assertAlmostEqual(ts, 1705314600.0, places=1)
+
+    def test_invalid_string_returns_none(self):
+        """Should return None for an unparseable string."""
+        self.assertIsNone(_parse_rclone_mtime("not-a-date"))
+
+    def test_empty_string_returns_none(self):
+        """Should return None for an empty string."""
+        self.assertIsNone(_parse_rclone_mtime(""))
+
+    def test_date_only_string_returns_none(self):
+        """A date-only string without a time component should return None."""
+        self.assertIsNone(_parse_rclone_mtime("2024-01-15"))
+
+
+class TestScanLocalMtimes(unittest.TestCase):
+    """Tests for the _scan_local_mtimes() helper."""
+
+    def setUp(self):
+        self._tmpdir = tempfile.mkdtemp()
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+
+    def test_empty_directory(self):
+        """An empty directory should return an empty dict."""
+        result = _scan_local_mtimes(self._tmpdir)
+        self.assertEqual(result, {})
+
+    def test_nonexistent_path(self):
+        """A path that does not exist should return an empty dict."""
+        result = _scan_local_mtimes("/nonexistent/path/xyz")
+        self.assertEqual(result, {})
+
+    def test_single_file(self):
+        """A directory with one file should return one entry."""
+        p = os.path.join(self._tmpdir, "file.txt")
+        with open(p, "w") as fh:
+            fh.write("hello")
+        result = _scan_local_mtimes(self._tmpdir)
+        self.assertIn("file.txt", result)
+        self.assertIsInstance(result["file.txt"], float)
+
+    def test_nested_file_uses_posix_rel_path(self):
+        """Nested files should use forward-slash relative paths."""
+        subdir = os.path.join(self._tmpdir, "sub")
+        os.makedirs(subdir)
+        with open(os.path.join(subdir, "nested.txt"), "w") as fh:
+            fh.write("x")
+        result = _scan_local_mtimes(self._tmpdir)
+        self.assertIn("sub/nested.txt", result)
+
+    def test_mtime_matches_os_stat(self):
+        """Returned mtime should match os.stat().st_mtime for the same file."""
+        p = os.path.join(self._tmpdir, "check.txt")
+        with open(p, "w") as fh:
+            fh.write("data")
+        expected = os.stat(p).st_mtime
+        result = _scan_local_mtimes(self._tmpdir)
+        self.assertAlmostEqual(result["check.txt"], expected, places=3)
+
+
+class TestCheckSyncStatusMtime(unittest.TestCase):
+    """Tests for RcloneManager.check_sync_status_mtime()."""
+
+    def setUp(self):
+        self._tmpdir = tempfile.mkdtemp()
+        import src.config.config_manager as cm_mod
+        self._original_get_config_dir = cm_mod.get_config_dir
+        cm_mod.get_config_dir = lambda: Path(self._tmpdir)
+        self.config = ConfigManager()
+        self.rclone = RcloneManager(self.config)
+
+    def tearDown(self):
+        import src.config.config_manager as cm_mod
+        cm_mod.get_config_dir = self._original_get_config_dir
+        import shutil
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+
+    def test_returns_none_for_unknown_service(self):
+        """Should return None when the service does not exist."""
+        result = self.rclone.check_sync_status_mtime("no_such_service")
+        self.assertIsNone(result)
+
+    def test_returns_none_when_rclone_absent(self):
+        """Should return None when rclone is not installed (subprocess fails)."""
+        local = tempfile.mkdtemp()
+        try:
+            self.config.add_service("S1", "onedrive", local)
+            # rclone is not installed in CI, so this should return None
+            result = self.rclone.check_sync_status_mtime("S1")
+            self.assertIsNone(result)
+        finally:
+            import shutil
+            shutil.rmtree(local, ignore_errors=True)
+
+    def _make_service_with_local(self, name: str) -> str:
+        """Helper: create service with a temp local dir, return the local dir path."""
+        local = tempfile.mkdtemp()
+        self.config.add_service(name, "onedrive", local)
+        return local
+
+    def test_synced_files_detected(self):
+        """Files with matching mtimes should be reported as 'synced'."""
+        local = self._make_service_with_local("SyncSvc")
+        try:
+            # Write a local file
+            local_file = os.path.join(local, "readme.txt")
+            with open(local_file, "w") as fh:
+                fh.write("hello")
+            local_mtime = os.stat(local_file).st_mtime
+
+            # Compute a matching rclone mtime string (same second, UTC)
+            from datetime import datetime, timezone
+            remote_dt = datetime.fromtimestamp(local_mtime, tz=timezone.utc)
+            mtime_str = remote_dt.strftime("%Y-%m-%dT%H:%M:%S.000000Z")
+
+            # Patch subprocess.run to return JSON listing matching this file
+            import json
+            fake_json = json.dumps([{"Path": "readme.txt", "ModTime": mtime_str}])
+
+            with patch("subprocess.run") as mock_run:
+                mock_run.return_value = MagicMock(
+                    returncode=0, stdout=fake_json, stderr=""
+                )
+                result = self.rclone.check_sync_status_mtime("SyncSvc")
+
+            self.assertIsNotNone(result)
+            self.assertEqual(len(result), 1)
+            self.assertEqual(result[0]["rel"], "readme.txt")
+            self.assertEqual(result[0]["status"], "synced")
+        finally:
+            import shutil
+            shutil.rmtree(local, ignore_errors=True)
+
+    def test_diff_files_detected(self):
+        """Files whose mtimes differ by more than tolerance should be 'diff'."""
+        local = self._make_service_with_local("DiffSvc")
+        try:
+            local_file = os.path.join(local, "doc.pdf")
+            with open(local_file, "w") as fh:
+                fh.write("content")
+
+            # Remote mtime is 1 hour ahead of local
+            from datetime import datetime, timezone
+            local_mtime = os.stat(local_file).st_mtime
+            remote_ts = local_mtime + 3600
+            remote_dt = datetime.fromtimestamp(remote_ts, tz=timezone.utc)
+            mtime_str = remote_dt.strftime("%Y-%m-%dT%H:%M:%S.000000Z")
+
+            import json
+            fake_json = json.dumps([{"Path": "doc.pdf", "ModTime": mtime_str}])
+
+            with patch("subprocess.run") as mock_run:
+                mock_run.return_value = MagicMock(
+                    returncode=0, stdout=fake_json, stderr=""
+                )
+                result = self.rclone.check_sync_status_mtime("DiffSvc")
+
+            self.assertIsNotNone(result)
+            self.assertEqual(result[0]["status"], "diff")
+        finally:
+            import shutil
+            shutil.rmtree(local, ignore_errors=True)
+
+    def test_remote_only_files_detected(self):
+        """Files present on the remote but not locally should be 'remote_only'."""
+        local = self._make_service_with_local("RemoteSvc")
+        try:
+            # No local files; remote has one file
+            import json
+            fake_json = json.dumps([
+                {"Path": "remote_only.txt", "ModTime": "2024-06-01T12:00:00Z"}
+            ])
+
+            with patch("subprocess.run") as mock_run:
+                mock_run.return_value = MagicMock(
+                    returncode=0, stdout=fake_json, stderr=""
+                )
+                result = self.rclone.check_sync_status_mtime("RemoteSvc")
+
+            self.assertIsNotNone(result)
+            statuses = {item["rel"]: item["status"] for item in result}
+            self.assertEqual(statuses.get("remote_only.txt"), "remote_only")
+        finally:
+            import shutil
+            shutil.rmtree(local, ignore_errors=True)
+
+    def test_local_only_files_detected(self):
+        """Files present locally but not on the remote should be 'local_only'."""
+        local = self._make_service_with_local("LocalSvc")
+        try:
+            with open(os.path.join(local, "local_only.txt"), "w") as fh:
+                fh.write("data")
+            # Remote listing is empty
+            import json
+            fake_json = json.dumps([])
+
+            with patch("subprocess.run") as mock_run:
+                mock_run.return_value = MagicMock(
+                    returncode=0, stdout=fake_json, stderr=""
+                )
+                result = self.rclone.check_sync_status_mtime("LocalSvc")
+
+            self.assertIsNotNone(result)
+            statuses = {item["rel"]: item["status"] for item in result}
+            self.assertEqual(statuses.get("local_only.txt"), "local_only")
+        finally:
+            import shutil
+            shutil.rmtree(local, ignore_errors=True)
+
+    def test_returns_none_on_nonzero_returncode(self):
+        """Should return None when rclone lsjson exits with a non-zero code."""
+        local = self._make_service_with_local("FailSvc")
+        try:
+            with patch("subprocess.run") as mock_run:
+                mock_run.return_value = MagicMock(
+                    returncode=1, stdout="", stderr="error"
+                )
+                result = self.rclone.check_sync_status_mtime("FailSvc")
+            self.assertIsNone(result)
+        finally:
+            import shutil
+            shutil.rmtree(local, ignore_errors=True)
+
+    def test_mtime_tolerance_boundary(self):
+        """A mtime difference exactly at the tolerance boundary should be 'synced'."""
+        local = self._make_service_with_local("TolSvc")
+        try:
+            local_file = os.path.join(local, "edge.txt")
+            with open(local_file, "w") as fh:
+                fh.write("edge")
+
+            from datetime import datetime, timezone
+            local_mtime = os.stat(local_file).st_mtime
+            # Remote mtime is exactly _MTIME_TOLERANCE_SECS away
+            remote_ts = local_mtime + _MTIME_TOLERANCE_SECS
+            remote_dt = datetime.fromtimestamp(remote_ts, tz=timezone.utc)
+            mtime_str = remote_dt.strftime("%Y-%m-%dT%H:%M:%S.000000Z")
+
+            import json
+            fake_json = json.dumps([{"Path": "edge.txt", "ModTime": mtime_str}])
+
+            with patch("subprocess.run") as mock_run:
+                mock_run.return_value = MagicMock(
+                    returncode=0, stdout=fake_json, stderr=""
+                )
+                result = self.rclone.check_sync_status_mtime("TolSvc")
+
+            self.assertIsNotNone(result)
+            self.assertEqual(result[0]["status"], "synced")
+        finally:
+            import shutil
+            shutil.rmtree(local, ignore_errors=True)
 
 
 if __name__ == "__main__":

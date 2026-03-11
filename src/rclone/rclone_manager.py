@@ -92,6 +92,63 @@ _RCLONE_ERROR_KEYWORDS = ("ERROR", "FATAL", "Fatal error", "error:")
 # in the stored configuration, not in the sync state.
 _DRIVE_ID_MISSING_PHRASE = "unable to get drive_id and drive_type"
 
+# Tolerance (seconds) for comparing local vs remote file modification times.
+# FAT32 filesystems store mtimes with 2-second precision; some cloud providers
+# also round timestamps.  Using a 2 s window avoids false "diff" reports.
+_MTIME_TOLERANCE_SECS: float = 2.0
+
+
+def _parse_rclone_mtime(s: str) -> Optional[float]:
+    """Parse an rclone ISO-8601 ModTime string to a UTC Unix timestamp.
+
+    rclone returns timestamps with nanosecond precision, e.g.
+    ``"2024-01-15T10:30:00.123456789Z"``.  Python's
+    :func:`datetime.strptime` only supports up to 6 fractional digits, so
+    any extra digits are truncated before parsing.
+
+    Returns the timestamp as a ``float`` (seconds since the Unix epoch,
+    UTC), or ``None`` when the string cannot be parsed.
+    """
+    from datetime import datetime, timezone as _tz
+
+    # Normalise any fractional seconds to exactly 6 digits (microseconds) then
+    # strip trailing Z.  This handles nanoseconds (9 digits), short fractions
+    # (< 6 digits), and timestamps with no fractional part at all.
+    normalised = re.sub(
+        r"\.(\d+)",
+        lambda m: "." + (m.group(1) + "000000")[:6],
+        s,
+    ).rstrip("Z")
+    for fmt in ("%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S"):
+        try:
+            dt = datetime.strptime(normalised, fmt)
+            return dt.replace(tzinfo=_tz.utc).timestamp()
+        except ValueError:
+            continue
+    return None
+
+
+def _scan_local_mtimes(local_path: str) -> Dict[str, float]:
+    """Walk *local_path* and return ``{rel_posix_path: mtime_utc_secs}`` for every file.
+
+    Paths are relative to *local_path* and use forward slashes (POSIX style)
+    so they can be compared directly against rclone remote paths.
+    Unreadable files are silently skipped.
+    """
+    result: Dict[str, float] = {}
+    if not os.path.isdir(local_path):
+        return result
+    base = Path(local_path)
+    for dirpath, _dirs, filenames in os.walk(local_path):
+        for name in filenames:
+            full = os.path.join(dirpath, name)
+            try:
+                rel = str(Path(full).relative_to(base)).replace("\\", "/")
+                result[rel] = os.stat(full).st_mtime
+            except (OSError, ValueError):
+                pass
+    return result
+
 
 def _rclone_base_args(config_manager: ConfigManager) -> List[str]:
     """Return the common rclone arguments including --config path."""
@@ -851,6 +908,91 @@ class RcloneManager:
             return "  |  ".join(parts) if parts else None
         except (OSError, subprocess.TimeoutExpired):
             return None
+
+    def check_sync_status_mtime(self, service_name: str) -> Optional[List[Dict]]:
+        """Compare remote vs local files using modification timestamps.
+
+        Faster than :meth:`check_sync_status` because it only fetches file
+        metadata (names and modification times) via ``rclone lsjson
+        --recursive --files-only`` rather than computing checksums.  Local
+        modification times are read with :func:`os.stat`.
+
+        Status values returned in each dict's ``status`` key:
+
+            ``synced``      – local mtime ≈ remote mtime (within
+                              :data:`_MTIME_TOLERANCE_SECS`)
+            ``diff``        – file exists on both sides but mtimes differ
+            ``remote_only`` – file exists on the remote but not locally
+            ``local_only``  – file exists locally but not on the remote
+
+        Returns a list of ``{"rel": str, "status": str}`` dicts on success,
+        or ``None`` when rclone is unavailable, the service is not fully
+        configured, or the remote listing times out.
+        """
+        import json as _json
+
+        svc = self._config.get_service(service_name)
+        if svc is None:
+            return None
+        remote_name = svc.get("remote_name", "")
+        remote_path = svc.get("remote_path", "/")
+        local_path = svc.get("local_path", "")
+        if not remote_name or not local_path:
+            return None
+
+        exclusions = svc.get("exclusions", [])
+        remote = f"{remote_name}:{remote_path}"
+        cmd = _rclone_base_args(self._config) + [
+            "lsjson",
+            "--recursive",
+            "--files-only",
+            "--no-mimetype",
+            remote,
+        ]
+        for exc in exclusions:
+            cmd += ["--exclude", exc]
+
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            if result.returncode != 0:
+                return None
+            remote_items = _json.loads(result.stdout or "[]")
+        except (OSError, subprocess.TimeoutExpired, ValueError):
+            return None
+
+        # Build remote mtime map: rel_path → UTC unix timestamp
+        remote_mtimes: Dict[str, float] = {}
+        for item in remote_items:
+            rel = item.get("Path", "").replace("\\", "/").strip("/")
+            mtime_str = item.get("ModTime", "")
+            if rel:
+                ts = _parse_rclone_mtime(mtime_str)
+                if ts is not None:
+                    remote_mtimes[rel] = ts
+
+        # Build local mtime map: rel_path → UTC unix timestamp
+        local_mtimes: Dict[str, float] = _scan_local_mtimes(local_path)
+
+        # Compare both maps to produce sync-status items
+        all_paths = set(remote_mtimes) | set(local_mtimes)
+        items: List[Dict] = []
+        for rel in sorted(all_paths):
+            r_ts = remote_mtimes.get(rel)
+            l_ts = local_mtimes.get(rel)
+            if r_ts is not None and l_ts is not None:
+                status = "synced" if abs(r_ts - l_ts) <= _MTIME_TOLERANCE_SECS else "diff"
+            elif r_ts is not None:
+                status = "remote_only"
+            else:
+                status = "local_only"
+            items.append({"rel": rel, "status": status})
+
+        return items
 
     def check_sync_status(self, service_name: str) -> Optional[List[Dict]]:
         """Compare the remote path against the local path using ``rclone check``.
