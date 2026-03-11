@@ -92,10 +92,50 @@ _RCLONE_ERROR_KEYWORDS = ("ERROR", "FATAL", "Fatal error", "error:")
 # in the stored configuration, not in the sync state.
 _DRIVE_ID_MISSING_PHRASE = "unable to get drive_id and drive_type"
 
+# Phrase emitted by rclone when bisync state files (snapshots) do not exist.
+# This happens on the very first bisync run, or when a previous run terminated
+# abnormally before it could write the snapshot.  Unlike a real bisync failure,
+# the correct recovery is to run with --resync to initialise the state.
+_BISYNC_NO_PRIOR_PHRASE = "cannot find prior Path1 or Path2 listings"
+
+# Minimum free disk space (bytes) required before starting a bisync run.
+# When the local filesystem has less than this amount of free space the sync
+# is aborted with an informational message to prevent filling the disk.
+# 10 GiB = 10 * 1024^3 bytes.
+_MIN_FREE_SPACE_GIB: int = 10
+_MIN_FREE_SPACE_BYTES: int = _MIN_FREE_SPACE_GIB * 1024 ** 3
+
 # Tolerance (seconds) for comparing local vs remote file modification times.
 # FAT32 filesystems store mtimes with 2-second precision; some cloud providers
 # also round timestamps.  Using a 2 s window avoids false "diff" reports.
 _MTIME_TOLERANCE_SECS: float = 2.0
+
+# Number of fractional-second digits (microseconds) that Python's strptime
+# understands.  rclone returns nanoseconds (9 digits); we normalise to this
+# precision before parsing.
+_MICROSECOND_PRECISION: int = 6
+
+
+def _check_local_free_space(local_path: str) -> int:
+    """Return the number of free bytes on the filesystem containing *local_path*.
+
+    Uses :func:`shutil.disk_usage` so it works on Linux, macOS, and Windows
+    without requiring any external command.  Returns 0 when *local_path* does
+    not exist or the query fails.
+    """
+    import shutil as _shutil
+
+    try:
+        # If the path does not yet exist, walk up to the first existing ancestor
+        # so we can still query the filesystem it would be created on.
+        p = Path(local_path)
+        while p != p.parent and not p.exists():
+            p = p.parent
+        if not p.exists():
+            return 0
+        return _shutil.disk_usage(str(p)).free
+    except OSError:
+        return 0
 
 
 def _parse_rclone_mtime(s: str) -> Optional[float]:
@@ -111,12 +151,13 @@ def _parse_rclone_mtime(s: str) -> Optional[float]:
     """
     from datetime import datetime, timezone as _tz
 
-    # Normalise any fractional seconds to exactly 6 digits (microseconds) then
-    # strip trailing Z.  This handles nanoseconds (9 digits), short fractions
-    # (< 6 digits), and timestamps with no fractional part at all.
+    # Normalise any fractional seconds to exactly _MICROSECOND_PRECISION digits
+    # then strip trailing Z.  This handles nanoseconds (9 digits), short
+    # fractions (< 6 digits), and timestamps with no fractional part at all.
+    _pad = "0" * _MICROSECOND_PRECISION
     normalised = re.sub(
         r"\.(\d+)",
-        lambda m: "." + (m.group(1) + "000000")[:6],
+        lambda m: "." + (m.group(1) + _pad)[:_MICROSECOND_PRECISION],
         s,
     ).rstrip("Z")
     for fmt in ("%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S"):
@@ -197,6 +238,11 @@ class RcloneManager:
         # configuration error.  _do_bisync checks this before retrying with
         # --resync to avoid a pointless retry for what is a config problem.
         self._config_error_services: set = set()
+        # Services whose last bisync run failed because there were no prior
+        # bisync state files (first run, or state lost after a crash).  Unlike
+        # a real failure, the correct recovery is --resync, which is handled
+        # automatically by _do_bisync.
+        self._no_prior_listing_services: set = set()
         # Optional callback(service_name, status_str) called on status changes
         self.on_status_change: Optional[Callable[[str, str], None]] = None
         # Optional callback(service_name, file_path, synced) for history updates
@@ -1094,12 +1140,36 @@ class RcloneManager:
         """
         Run rclone bisync for a single service dictionary.
 
-        Attempts bisync first; if it fails, retries with --resync.
+        Performs a disk-space check before attempting bisync: if the local
+        filesystem has less than :data:`_MIN_FREE_SPACE_BYTES` (10 GiB) free,
+        the sync is aborted with a clear error message.
+
+        On the first bisync run, or after an abnormal termination, rclone may
+        fail with "cannot find prior Path1 or Path2 listings".  This condition
+        is detected automatically and a ``--resync`` run is performed to
+        (re)initialise the bisync state without treating it as an unexpected
+        failure.
+
         Returns True on success.
         """
         remote = f"{svc['remote_name']}:{svc.get('remote_path', '/')}"
         local = svc.get("local_path", "")
         name = svc.get("name", "?")
+
+        # --- Disk space guard -------------------------------------------
+        # Abort early if the local filesystem is critically full.  This
+        # prevents bisync from filling the disk and corrupting the state.
+        free_bytes = _check_local_free_space(local)
+        if free_bytes < _MIN_FREE_SPACE_BYTES:
+            free_gb = free_bytes / (1024 ** 3)
+            self._emit_error(
+                name,
+                f"⛔ Sincronización cancelada: espacio libre insuficiente en el disco "
+                f"({free_gb:.1f} GiB disponibles; se requieren al menos "
+                f"{_MIN_FREE_SPACE_GIB} GiB). "
+                "Libera espacio y vuelve a intentarlo.",
+            )
+            return False
 
         # Clear any stale lock / partial-listing files left by a previous
         # interrupted bisync before attempting to run again.
@@ -1188,6 +1258,20 @@ class RcloneManager:
             if name in self._config_error_services:
                 self._config_error_services.discard(name)
                 return False
+            # If the failure was caused by missing bisync state files ("cannot
+            # find prior Path1 or Path2 listings"), emit an informational message
+            # explaining what happened, then fall through to the --resync retry.
+            # This is not an unexpected error — it is the expected first-run or
+            # post-crash condition; --resync initialises the state safely.
+            is_no_prior = name in self._no_prior_listing_services
+            if is_no_prior:
+                self._no_prior_listing_services.discard(name)
+                self._emit_error(
+                    name,
+                    "ℹ️ No se encontraron archivos de estado previos de bisync "
+                    "(primera ejecución o estado perdido). "
+                    "Iniciando sincronización inicial con --resync…",
+                )
             _clear_bisync_stale_files(
                 svc.get("remote_name", ""),
                 _bisync_cache_dir(),
@@ -1255,6 +1339,12 @@ class RcloneManager:
                     )
                     # Notify the UI so it can surface an in-tab "fix" action.
                     self._emit_drive_id_error(service_name)
+                # Detect missing bisync state files ("no prior listings").  This
+                # is the normal first-run or post-crash condition.  Flag the
+                # service so _do_bisync knows to treat the retry as an expected
+                # --resync initialisation, not an unexpected failure.
+                if _BISYNC_NO_PRIOR_PHRASE in line:
+                    self._no_prior_listing_services.add(service_name)
                 # Forward any rclone error / fatal output to the error log
                 if any(kw in line for kw in _RCLONE_ERROR_KEYWORDS):
                     self._emit_error(service_name, line)

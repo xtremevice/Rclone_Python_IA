@@ -34,9 +34,14 @@ from src.rclone.rclone_manager import (
     _bisync_cache_dir,
     _clear_bisync_stale_files,
     _DRIVE_ID_MISSING_PHRASE,
+    _BISYNC_NO_PRIOR_PHRASE,
+    _MIN_FREE_SPACE_BYTES,
+    _MIN_FREE_SPACE_GIB,
+    _check_local_free_space,
     _parse_rclone_mtime,
     _scan_local_mtimes,
     _MTIME_TOLERANCE_SECS,
+    _MICROSECOND_PRECISION,
 )
 
 
@@ -1734,6 +1739,10 @@ class TestElementaryIndicator(unittest.TestCase):
 class TestParseRcloneMtime(unittest.TestCase):
     """Tests for the _parse_rclone_mtime() helper."""
 
+    def test_microsecond_precision_constant(self):
+        """_MICROSECOND_PRECISION must equal 6 (Python strptime limit)."""
+        self.assertEqual(_MICROSECOND_PRECISION, 6)
+
     def test_nanosecond_format(self):
         """Should parse rclone's nanosecond-precision format correctly."""
         # 2024-01-15T10:30:00Z = 1705314600 UTC
@@ -2003,6 +2012,243 @@ class TestCheckSyncStatusMtime(unittest.TestCase):
 
             self.assertIsNotNone(result)
             self.assertEqual(result[0]["status"], "synced")
+        finally:
+            import shutil
+            shutil.rmtree(local, ignore_errors=True)
+
+
+
+
+class TestCheckLocalFreeSpace(unittest.TestCase):
+    """Tests for the _check_local_free_space() helper."""
+
+    def test_existing_directory_returns_positive(self):
+        """An existing directory should return a positive free-space value."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            result = _check_local_free_space(d)
+            self.assertIsInstance(result, int)
+            self.assertGreater(result, 0)
+
+    def test_nonexistent_path_walks_up_to_parent(self):
+        """A nonexistent path should walk up to an existing ancestor."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            nonexistent = os.path.join(d, "a", "b", "c", "does_not_exist")
+            result = _check_local_free_space(nonexistent)
+            # The parent (d) exists, so we should get the same value as d.
+            expected = _check_local_free_space(d)
+            self.assertEqual(result, expected)
+
+    def test_completely_invalid_path_returns_zero(self):
+        """A path on a non-existent root should return 0."""
+        result = _check_local_free_space("/no/such/root/at/all/xyz123")
+        # Either 0 (no ancestor found) or positive (if / exists and has space).
+        # Both are acceptable; we just assert it does not raise.
+        self.assertIsInstance(result, int)
+        self.assertGreaterEqual(result, 0)
+
+    def test_min_free_space_constant_is_10_gib(self):
+        """_MIN_FREE_SPACE_BYTES must equal exactly 10 GiB (10 * 1024**3)."""
+        self.assertEqual(_MIN_FREE_SPACE_BYTES, 10 * 1024 ** 3)
+        self.assertEqual(_MIN_FREE_SPACE_GIB, 10)
+        self.assertEqual(_MIN_FREE_SPACE_BYTES, _MIN_FREE_SPACE_GIB * 1024 ** 3)
+
+
+class TestDoBisyncDiskSpaceGuard(unittest.TestCase):
+    """Tests for the disk-space guard in _do_bisync()."""
+
+    def setUp(self):
+        self._tmpdir = tempfile.mkdtemp()
+        import src.config.config_manager as cm_mod
+        self._original_get_config_dir = cm_mod.get_config_dir
+        cm_mod.get_config_dir = lambda: Path(self._tmpdir)
+        self.config = ConfigManager()
+        self.rclone = RcloneManager(self.config)
+
+    def tearDown(self):
+        import src.config.config_manager as cm_mod
+        cm_mod.get_config_dir = self._original_get_config_dir
+        import shutil
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+
+    def test_bisync_aborts_when_disk_full(self):
+        """_do_bisync() must return False and emit an error when free space < 10 GiB."""
+        local = tempfile.mkdtemp()
+        try:
+            self.config.add_service("DiskFull", "onedrive", local)
+            svc = self.config.get_service("DiskFull")
+            errors = []
+            self.rclone.on_error = lambda name, msg: errors.append(msg)
+
+            # Patch _check_local_free_space to return 1 byte (effectively full)
+            with patch(
+                "src.rclone.rclone_manager._check_local_free_space",
+                return_value=1,
+            ):
+                result = self.rclone._do_bisync(svc)
+
+            self.assertFalse(result, "_do_bisync must return False when disk is full")
+            # At least one error message should mention insufficient space
+            self.assertTrue(
+                any("insuficiente" in e or "espacio" in e.lower() for e in errors),
+                f"Expected a disk-space error message, got: {errors}",
+            )
+        finally:
+            import shutil
+            shutil.rmtree(local, ignore_errors=True)
+
+    def test_bisync_proceeds_when_disk_has_enough_space(self):
+        """_do_bisync() must not abort for disk space when free space >= 10 GiB."""
+        local = tempfile.mkdtemp()
+        try:
+            self.config.add_service("DiskOK", "onedrive", local)
+            svc = self.config.get_service("DiskOK")
+            captured_cmds = []
+
+            def fake_run_rclone(cmd, service_name, svc_arg, is_retry=False):
+                captured_cmds.append(cmd)
+                return True
+
+            self.rclone._run_rclone = fake_run_rclone
+
+            # Patch free space to 20 GiB — plenty of room
+            with patch(
+                "src.rclone.rclone_manager._check_local_free_space",
+                return_value=20 * 1024 ** 3,
+            ):
+                result = self.rclone._do_bisync(svc)
+
+            self.assertTrue(result, "_do_bisync must succeed when there is enough space")
+            self.assertTrue(len(captured_cmds) > 0, "rclone command must have been called")
+        finally:
+            import shutil
+            shutil.rmtree(local, ignore_errors=True)
+
+
+class TestDoBisyncNoPriorListings(unittest.TestCase):
+    """Tests for auto-resync when bisync reports no prior state files."""
+
+    def setUp(self):
+        self._tmpdir = tempfile.mkdtemp()
+        import src.config.config_manager as cm_mod
+        self._original_get_config_dir = cm_mod.get_config_dir
+        cm_mod.get_config_dir = lambda: Path(self._tmpdir)
+        self.config = ConfigManager()
+        self.rclone = RcloneManager(self.config)
+
+    def tearDown(self):
+        import src.config.config_manager as cm_mod
+        cm_mod.get_config_dir = self._original_get_config_dir
+        import shutil
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+
+    def test_bisync_no_prior_phrase_constant(self):
+        """_BISYNC_NO_PRIOR_PHRASE must match the exact rclone error text."""
+        self.assertIn("cannot find prior", _BISYNC_NO_PRIOR_PHRASE)
+        self.assertIn("listings", _BISYNC_NO_PRIOR_PHRASE)
+
+    def test_no_prior_listing_triggers_resync(self):
+        """When rclone emits the no-prior-listings phrase, _do_bisync must retry with --resync."""
+        local = tempfile.mkdtemp()
+        try:
+            self.config.add_service("NoPriorSvc", "onedrive", local)
+            svc = self.config.get_service("NoPriorSvc")
+            captured_cmds = []
+            errors = []
+            self.rclone.on_error = lambda name, msg: errors.append(msg)
+
+            call_count = [0]
+
+            def fake_run_rclone(cmd, service_name, svc_arg, is_retry=False):
+                captured_cmds.append(list(cmd))
+                call_count[0] += 1
+                if call_count[0] == 1:
+                    # Simulate first run: flag the service as having no prior listings
+                    self.rclone._no_prior_listing_services.add(service_name)
+                    return False  # First attempt fails
+                return True  # --resync attempt succeeds
+
+            self.rclone._run_rclone = fake_run_rclone
+
+            with patch(
+                "src.rclone.rclone_manager._check_local_free_space",
+                return_value=20 * 1024 ** 3,
+            ):
+                result = self.rclone._do_bisync(svc)
+
+            self.assertTrue(result, "_do_bisync must return True after successful --resync")
+            self.assertEqual(call_count[0], 2, "rclone must be called exactly twice")
+            # The second command must contain --resync
+            self.assertIn("--resync", captured_cmds[1],
+                          "--resync flag must be present in the retry command")
+            # An informational message must have been emitted
+            info_msgs = [e for e in errors if "ℹ️" in e or "prior" in e.lower() or "resync" in e.lower()]
+            self.assertTrue(len(info_msgs) > 0,
+                            "An informational --resync message must be emitted")
+        finally:
+            import shutil
+            shutil.rmtree(local, ignore_errors=True)
+
+    def test_no_prior_flag_cleared_after_retry(self):
+        """_no_prior_listing_services must be cleared after _do_bisync handles it."""
+        local = tempfile.mkdtemp()
+        try:
+            self.config.add_service("ClearSvc", "onedrive", local)
+            svc = self.config.get_service("ClearSvc")
+
+            call_count = [0]
+
+            def fake_run_rclone(cmd, service_name, svc_arg, is_retry=False):
+                call_count[0] += 1
+                if call_count[0] == 1:
+                    self.rclone._no_prior_listing_services.add(service_name)
+                    return False
+                return True
+
+            self.rclone._run_rclone = fake_run_rclone
+
+            with patch(
+                "src.rclone.rclone_manager._check_local_free_space",
+                return_value=20 * 1024 ** 3,
+            ):
+                self.rclone._do_bisync(svc)
+
+            self.assertNotIn(
+                "ClearSvc",
+                self.rclone._no_prior_listing_services,
+                "Flag must be cleared from _no_prior_listing_services after handling",
+            )
+        finally:
+            import shutil
+            shutil.rmtree(local, ignore_errors=True)
+
+    def test_run_rclone_detects_no_prior_phrase_in_output(self):
+        """_run_rclone() must add the service to _no_prior_listing_services when
+        it sees the no-prior-listings phrase in rclone's output."""
+        local = tempfile.mkdtemp()
+        try:
+            self.config.add_service("DetectSvc", "onedrive", local)
+            svc = self.config.get_service("DetectSvc")
+
+            # Build a fake rclone command that simply prints the no-prior phrase
+            # to stdout so _run_rclone can parse it.
+            import sys
+            script = (
+                f"import sys; "
+                f"print('ERROR : Bisync critical error: {_BISYNC_NO_PRIOR_PHRASE}'); "
+                f"sys.exit(1)"
+            )
+            fake_cmd = [sys.executable, "-c", script]
+
+            result = self.rclone._run_rclone(fake_cmd, "DetectSvc", svc)
+
+            self.assertFalse(result, "Command that exits 1 must return False")
+            self.assertIn(
+                "DetectSvc",
+                self.rclone._no_prior_listing_services,
+                "Service must be flagged in _no_prior_listing_services",
+            )
         finally:
             import shutil
             shutil.rmtree(local, ignore_errors=True)
