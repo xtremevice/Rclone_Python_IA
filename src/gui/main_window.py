@@ -65,12 +65,12 @@ class MainWindow:
         # Root Tk window
         self._root = tk.Tk()
         self._root.title("Rclone Manager")
-        self._root.resizable(False, False)
+        self._root.resizable(True, True)
 
         # Remove maximize button on supported platforms
         _remove_maximize_button(self._root)
 
-        _center_window(self._root, height_pct=0.60, width_pct=0.20)
+        _center_window(self._root, height_pct=0.60, width_pct=0.55)
 
         # On Elementary OS, use a Wingpanel indicator (AppIndicator3) that is
         # always visible while the app is running.  For all other systems, fall
@@ -112,6 +112,8 @@ class MainWindow:
         # Per-service drive_id error banner frames (shown when bisync detects
         # a missing drive_id/drive_type in rclone.conf)
         self._drive_id_banners: Dict[str, tk.Frame] = {}
+        # Per-service Treeview widgets for the sync-file tree (right panel)
+        self._file_trees: Dict[str, ttk.Treeview] = {}
         # Whether the pystray tray icon has been started (non-Elementary only)
         self._tray_started = False
 
@@ -274,15 +276,24 @@ class MainWindow:
         ).pack(side=tk.RIGHT, padx=8, pady=6)
         self._drive_id_banners[name] = drive_id_banner
 
-        # ── File change list (60 % of window height) ──────────────────
-        list_frame = tk.Frame(tab_frame)
-        list_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        # ── Content area: left=activity list | right=sync tree ────────
+        content_pane = tk.PanedWindow(
+            tab_frame,
+            orient=tk.HORIZONTAL,
+            sashrelief=tk.FLAT,
+            sashwidth=4,
+        )
+        content_pane.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
 
-        sb = tk.Scrollbar(list_frame)
+        # ── Left panel: recent activity list ──────────────────────────
+        left_frame = tk.Frame(content_pane)
+        content_pane.add(left_frame, minsize=120)
+
+        sb = tk.Scrollbar(left_frame)
         sb.pack(side=tk.RIGHT, fill=tk.Y)
 
         listbox = tk.Listbox(
-            list_frame,
+            left_frame,
             yscrollcommand=sb.set,
             font=("Courier", 9),
             selectmode=tk.BROWSE,
@@ -298,6 +309,50 @@ class MainWindow:
             ts = entry.get("timestamp", "")
             fp = entry.get("file", "")
             listbox.insert(tk.END, f"{icon} [{ts}]  {fp}")
+
+        # ── Right panel: sync tree view ────────────────────────────────
+        right_frame = tk.Frame(content_pane)
+        content_pane.add(right_frame, minsize=150)
+
+        tk.Label(
+            right_frame,
+            text="🗂 Archivos a sincronizar",
+            font=("Segoe UI", 9, "bold"),
+            anchor="w",
+            padx=4,
+            pady=2,
+        ).pack(fill=tk.X)
+
+        tree_outer = tk.Frame(right_frame)
+        tree_outer.pack(fill=tk.BOTH, expand=True)
+
+        sb_tree_y = tk.Scrollbar(tree_outer, orient=tk.VERTICAL)
+        sb_tree_y.pack(side=tk.RIGHT, fill=tk.Y)
+        sb_tree_x = tk.Scrollbar(tree_outer, orient=tk.HORIZONTAL)
+        sb_tree_x.pack(side=tk.BOTTOM, fill=tk.X)
+
+        sync_tree = ttk.Treeview(
+            tree_outer,
+            columns=("status",),
+            displaycolumns=("status",),
+            yscrollcommand=sb_tree_y.set,
+            xscrollcommand=sb_tree_x.set,
+            selectmode="browse",
+        )
+        sync_tree.heading("#0", text="Archivo / Carpeta", anchor="w")
+        sync_tree.heading("status", text="Estado", anchor="center")
+        sync_tree.column("#0", stretch=True, minwidth=120)
+        sync_tree.column("status", width=100, anchor="center", stretch=False)
+        sync_tree.tag_configure("synced", foreground="#007700")
+        sync_tree.tag_configure("pending", foreground="#cc6600")
+        sync_tree.tag_configure("unknown", foreground="#888888")
+        sync_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        sb_tree_y.config(command=sync_tree.yview)
+        sb_tree_x.config(command=sync_tree.xview)
+
+        self._file_trees[name] = sync_tree
+        # Populate the tree asynchronously so the UI is not blocked
+        self._populate_sync_tree_async(name, sync_tree, svc)
 
         # ── Bottom action buttons (5 % of window height) ──────────────
         btn_frame = tk.Frame(tab_frame, bg="#e0e0e0")
@@ -364,6 +419,40 @@ class MainWindow:
             target=_worker,
             daemon=True,
             name=f"about-{service_name}",
+        ).start()
+
+    def _populate_sync_tree_async(
+        self,
+        service_name: str,
+        tree: ttk.Treeview,
+        svc: Dict,
+    ) -> None:
+        """Walk the service's local directory in a background thread and
+        populate the right-side sync tree view with the results.
+
+        Sync status for each file is determined by cross-referencing the
+        persisted *sync_history*:
+          - ✅  file appears in history with ``synced=True``
+          - ⏳  file appears in history with ``synced=False``
+          - ❓  file has no history entry (status unknown)
+
+        Folders are shown with ❓ status because their sync state is
+        inferred from their children.
+        """
+        local_path = svc.get("local_path", "")
+        sync_history = svc.get("sync_history", [])
+
+        synced_set: set = {e.get("file", "") for e in sync_history if e.get("synced") is True}
+        pending_set: set = {e.get("file", "") for e in sync_history if e.get("synced") is False}
+
+        def _worker() -> None:
+            items = _scan_local_tree(local_path, synced_set, pending_set)
+            self._root.after(0, lambda: _fill_sync_tree(tree, items))
+
+        threading.Thread(
+            target=_worker,
+            daemon=True,
+            name=f"scan-{service_name}",
         ).start()
 
     # ------------------------------------------------------------------
@@ -635,7 +724,8 @@ class MainWindow:
             pass
 
     def _add_file_entry(self, service_name: str, file_path: str, synced: bool) -> None:
-        """Insert a new file entry into the service's Listbox (max 50 items)."""
+        """Insert a new file entry into the service's Listbox (max 50 items)
+        and update the corresponding node in the sync tree if it exists."""
         import datetime
 
         listbox = self._file_lists.get(service_name)
@@ -647,6 +737,10 @@ class MainWindow:
         # Enforce 50-item limit
         if listbox.size() > 50:
             listbox.delete(50, tk.END)
+        # Reflect the new sync status in the right-side tree view
+        tree = self._file_trees.get(service_name)
+        if tree is not None:
+            _update_tree_status(tree, file_path, "synced" if synced else "pending")
 
     # ------------------------------------------------------------------
     # Tab refresh helpers
@@ -666,6 +760,7 @@ class MainWindow:
         # Banner widgets are destroyed along with their parent frames above;
         # clear the dict so _add_service_tab can repopulate it with fresh widgets.
         self._drive_id_banners.clear()
+        self._file_trees.clear()
         self._build_ui()
 
     def _on_service_added(self, service_name: str) -> None:
@@ -691,6 +786,162 @@ class MainWindow:
 # ------------------------------------------------------------------
 # Helpers
 # ------------------------------------------------------------------
+
+# Maximum number of nodes rendered in the sync tree.  Scanning very large
+# sync directories (tens of thousands of files) would freeze the UI and
+# produce an unreadable tree.  When the cap is reached the remaining items are
+# silently omitted — the tree still provides a useful overview of the top
+# portion of the directory hierarchy.
+_MAX_TREE_ITEMS = 500
+
+_TREE_STATUS_LABELS: Dict[str, str] = {
+    "synced":  "✅ Sí",
+    "pending": "⏳ Pendiente",
+    "unknown": "❓",
+}
+_TREE_STATUS_TAGS: Dict[str, tuple] = {
+    "synced":  ("synced",),
+    "pending": ("pending",),
+    "unknown": ("unknown",),
+}
+
+
+def _scan_local_tree(
+    local_path: str,
+    synced_set: set,
+    pending_set: set,
+    max_items: int = _MAX_TREE_ITEMS,
+) -> List[Dict]:
+    """Walk *local_path* and return a flat list of node dicts for the sync tree.
+
+    Each dict contains:
+        rel    – POSIX-style path relative to *local_path* (used as Treeview iid)
+        parent – parent ``rel`` value ("" for root-level items)
+        name   – file or directory base name
+        is_dir – bool
+        status – "synced" | "pending" | "unknown"
+
+    Items are ordered depth-first (parent always before children) so they can
+    be inserted into a :class:`ttk.Treeview` in a single forward pass.
+    Directories and files with a ``hidden`` prefix (``'.'``) are still shown
+    because rclone does not exclude them by default.
+
+    The walk is capped at *max_items* to prevent the UI from becoming
+    unresponsive on very large sync directories.
+    """
+    from pathlib import Path
+
+    result: List[Dict] = []
+    if not local_path or not os.path.isdir(local_path):
+        return result
+
+    base = Path(local_path)
+    counter = [0]  # mutable so the nested function can increment it
+
+    def _walk(dir_path: Path, parent_rel: str) -> None:
+        if counter[0] >= max_items:
+            return
+        try:
+            raw = list(dir_path.iterdir())
+            # Pre-compute is_dir() once per entry to avoid redundant stat calls
+            # during sort comparisons.
+            entries = sorted(
+                raw,
+                key=lambda p: (not p.is_dir(), p.name.lower()),
+            )
+        except (PermissionError, OSError):
+            return
+
+        for entry in entries:
+            if counter[0] >= max_items:
+                break
+            rel = entry.relative_to(base).as_posix()
+            if entry.is_dir():
+                result.append({
+                    "rel": rel,
+                    "parent": parent_rel,
+                    "name": entry.name,
+                    "is_dir": True,
+                    "status": "unknown",
+                })
+                counter[0] += 1
+                _walk(entry, rel)
+            else:
+                if rel in synced_set:
+                    status = "synced"
+                elif rel in pending_set:
+                    status = "pending"
+                else:
+                    status = "unknown"
+                result.append({
+                    "rel": rel,
+                    "parent": parent_rel,
+                    "name": entry.name,
+                    "is_dir": False,
+                    "status": status,
+                })
+                counter[0] += 1
+
+    _walk(base, "")
+    return result
+
+
+def _fill_sync_tree(tree: ttk.Treeview, items: List[Dict]) -> None:
+    """Clear *tree* and insert *items*.
+
+    Must be called on the Tkinter main thread.  *items* must be ordered so
+    that every parent appears before its children (which ``_scan_local_tree``
+    guarantees via its depth-first traversal).
+    """
+    # Remove all existing nodes
+    try:
+        tree.delete(*tree.get_children())
+    except tk.TclError:
+        return
+
+    for item in items:
+        rel    = item["rel"]
+        parent = item["parent"]
+        name   = item["name"]
+        is_dir = item["is_dir"]
+        status = item["status"]
+
+        icon  = "📁 " if is_dir else "📄 "
+        label = _TREE_STATUS_LABELS.get(status, "❓")
+        tags  = _TREE_STATUS_TAGS.get(status, ("unknown",))
+        # Auto-open top-level directories so the user immediately sees content
+        open_node = is_dir and parent == ""
+
+        try:
+            tree.insert(
+                parent,
+                "end",
+                iid=rel,
+                text=icon + name,
+                values=(label,),
+                tags=tags,
+                open=open_node,
+            )
+        except tk.TclError:
+            pass  # skip if the item already exists
+
+
+def _update_tree_status(tree: ttk.Treeview, rel_path: str, status: str) -> None:
+    """Update the status column of the tree node identified by *rel_path*.
+
+    Safe to call even when the node does not exist (e.g. if the background
+    scan has not finished yet) — the call is simply a no-op in that case.
+    """
+    label = _TREE_STATUS_LABELS.get(status, "❓")
+    tags  = _TREE_STATUS_TAGS.get(status, ("unknown",))
+    try:
+        if tree.exists(rel_path):
+            tree.set(rel_path, "status", label)
+            tree.item(rel_path, tags=tags)
+    except tk.TclError:
+        pass
+
+
 
 def _remove_maximize_button(root: tk.Tk) -> None:
     """
