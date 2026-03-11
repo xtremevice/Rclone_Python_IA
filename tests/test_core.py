@@ -2402,5 +2402,203 @@ class TestPropagateDirStatus(unittest.TestCase):
         self.assertEqual(file_item["status"], "synced")
 
 
+# ---------------------------------------------------------------------------
+# Testable replica of _build_check_tree cap logic
+# (canonical: src/gui/main_window.py::_build_check_tree)
+# ---------------------------------------------------------------------------
+
+def _build_check_tree_testable(check_items, max_files, max_dirs):
+    """Replica of main_window._build_check_tree with configurable caps."""
+    result = []
+    seen_dirs = set()
+    file_count = 0
+    dir_count = 0
+
+    for item in sorted(check_items, key=lambda x: x.get("rel", "").lower()):
+        rel = item.get("rel", "").strip("/").replace("\\", "/")
+        if not rel:
+            continue
+        parts = rel.split("/")
+        for i in range(1, len(parts)):
+            if dir_count >= max_dirs:
+                break
+            dir_rel = "/".join(parts[:i])
+            if dir_rel not in seen_dirs:
+                seen_dirs.add(dir_rel)
+                parent_rel = "/".join(parts[:i - 1]) if i > 1 else ""
+                result.append({
+                    "rel": dir_rel, "parent": parent_rel,
+                    "name": parts[i - 1], "is_dir": True, "status": "unknown",
+                })
+                dir_count += 1
+        if file_count < max_files:
+            parent_rel = "/".join(parts[:-1])
+            result.append({
+                "rel": rel, "parent": parent_rel,
+                "name": parts[-1], "is_dir": False,
+                "status": item.get("status", "unknown"),
+            })
+            file_count += 1
+
+    _propagate_dir_status_testable(result)
+    return result
+
+
+class TestBuildCheckTreeCap(unittest.TestCase):
+    """Tests for the file-cap / directory-visibility logic in _build_check_tree."""
+
+    def _make_check_items(self, prefix, n, status="synced"):
+        """Create *n* synthetic rclone check items under *prefix*/."""
+        return [{"rel": f"{prefix}/file{i:04d}.txt", "status": status} for i in range(n)]
+
+    def test_directories_visible_when_file_cap_hit(self):
+        """All root-level directories must appear even when the file cap is exhausted
+        by the first directory's files."""
+        # folder_a has 5 files, folder_b has 5 files, cap = 3 files
+        items = (
+            self._make_check_items("folder_a", 5, "synced") +
+            self._make_check_items("folder_b", 5, "remote_only")
+        )
+        result = _build_check_tree_testable(items, max_files=3, max_dirs=100)
+        rels = {i["rel"] for i in result}
+        # Both directories must always be visible
+        self.assertIn("folder_a", rels, "folder_a must appear even when file cap is hit")
+        self.assertIn("folder_b", rels, "folder_b must appear even when file cap is hit")
+
+    def test_file_cap_limits_files(self):
+        """The number of file nodes must not exceed max_files."""
+        items = (
+            self._make_check_items("a", 5, "synced") +
+            self._make_check_items("b", 5, "synced")
+        )
+        result = _build_check_tree_testable(items, max_files=4, max_dirs=100)
+        file_nodes = [i for i in result if not i["is_dir"]]
+        self.assertLessEqual(len(file_nodes), 4)
+
+    def test_all_files_shown_when_under_cap(self):
+        """When total files are below max_files, every file must appear."""
+        items = self._make_check_items("root", 3, "local_only")
+        result = _build_check_tree_testable(items, max_files=100, max_dirs=100)
+        file_nodes = [i for i in result if not i["is_dir"]]
+        self.assertEqual(len(file_nodes), 3)
+
+    def test_dir_color_propagated_after_cap(self):
+        """_propagate_dir_status must still run when the file cap fires mid-tree."""
+        # folder_a has 5 local_only files, cap = 2 → only 2 files shown
+        # but folder_a directory node must still be colored local_only
+        items = self._make_check_items("folder_a", 5, "local_only")
+        result = _build_check_tree_testable(items, max_files=2, max_dirs=100)
+        dir_node = next((i for i in result if i["is_dir"] and i["rel"] == "folder_a"), None)
+        self.assertIsNotNone(dir_node, "folder_a directory node must be present")
+        self.assertEqual(dir_node["status"], "local_only")
+
+    def test_dir_cap_limits_dirs(self):
+        """The number of directory nodes must not exceed max_dirs."""
+        # Create 5 files in 5 different root dirs
+        items = [{"rel": f"dir{i}/file.txt", "status": "synced"} for i in range(5)]
+        result = _build_check_tree_testable(items, max_files=100, max_dirs=3)
+        dir_nodes = [i for i in result if i["is_dir"]]
+        self.assertLessEqual(len(dir_nodes), 3)
+
+
+# ---------------------------------------------------------------------------
+# Tests for _scan_local_tree's file-only cap (replicated via filesystem)
+# ---------------------------------------------------------------------------
+
+class TestScanLocalTreeFileCap(unittest.TestCase):
+    """Tests that _scan_local_tree only counts files (not dirs) against the cap."""
+
+    def _scan(self, local_path, synced_set=None, pending_set=None, max_files=1000):
+        """Replicated _scan_local_tree logic for testing without tkinter."""
+        import os
+        from pathlib import Path
+
+        result = []
+        synced_set = synced_set or set()
+        pending_set = pending_set or set()
+        if not local_path or not os.path.isdir(local_path):
+            return result
+
+        base = Path(local_path)
+        file_counter = [0]
+        dir_counter = [0]
+        max_dirs = max_files * 10
+
+        def _walk(dir_path, parent_rel):
+            if dir_counter[0] >= max_dirs:
+                return
+            try:
+                raw = list(dir_path.iterdir())
+                entries_with_dir = [(p, p.is_dir()) for p in raw]
+                entries_with_dir.sort(key=lambda t: (not t[1], t[0].name.lower()))
+            except (PermissionError, OSError):
+                return
+            for entry, entry_is_dir in entries_with_dir:
+                rel = entry.relative_to(base).as_posix()
+                if entry_is_dir:
+                    if dir_counter[0] >= max_dirs:
+                        break
+                    result.append({"rel": rel, "parent": parent_rel,
+                                   "name": entry.name, "is_dir": True, "status": "unknown"})
+                    dir_counter[0] += 1
+                    _walk(entry, rel)
+                else:
+                    if file_counter[0] >= max_files:
+                        continue
+                    if rel in synced_set:
+                        status = "synced"
+                    elif rel in pending_set:
+                        status = "pending"
+                    else:
+                        status = "unknown"
+                    result.append({"rel": rel, "parent": parent_rel,
+                                   "name": entry.name, "is_dir": False, "status": status})
+                    file_counter[0] += 1
+
+        _walk(base, "")
+        _propagate_dir_status_testable(result)
+        return result
+
+    def test_all_root_dirs_visible_when_file_cap_hit(self):
+        """All sibling root-level directories must appear even when the file cap
+        is exhausted inside the first directory."""
+        import tempfile
+        import shutil
+
+        root = tempfile.mkdtemp()
+        try:
+            # dir_a: 5 files (will hit the cap of 3 before dir_b is processed)
+            os.makedirs(os.path.join(root, "dir_a"))
+            for i in range(5):
+                open(os.path.join(root, "dir_a", f"f{i}.txt"), "w").close()
+            # dir_b: 1 file
+            os.makedirs(os.path.join(root, "dir_b"))
+            open(os.path.join(root, "dir_b", "g.txt"), "w").close()
+
+            result = self._scan(root, max_files=3)
+            rels = {i["rel"] for i in result}
+            self.assertIn("dir_a", rels, "dir_a must be visible")
+            self.assertIn("dir_b", rels, "dir_b must be visible even when file cap fired in dir_a")
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+
+    def test_file_count_does_not_exceed_cap(self):
+        """Total file nodes must not exceed max_files."""
+        import tempfile
+        import shutil
+
+        root = tempfile.mkdtemp()
+        try:
+            os.makedirs(os.path.join(root, "d"))
+            for i in range(10):
+                open(os.path.join(root, "d", f"f{i}.txt"), "w").close()
+
+            result = self._scan(root, max_files=4)
+            file_nodes = [i for i in result if not i["is_dir"]]
+            self.assertLessEqual(len(file_nodes), 4)
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

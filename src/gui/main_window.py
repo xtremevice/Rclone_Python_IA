@@ -936,12 +936,18 @@ class MainWindow:
 # Helpers
 # ------------------------------------------------------------------
 
-# Maximum number of nodes rendered in the sync tree.  Set equal to
-# TREE_FILE_THRESHOLD so that all files are visible up to the point where
-# the "large" refresh interval kicks in.  On very large directories the
-# remaining items are silently omitted — the tree still provides a useful
-# overview of the top portion of the hierarchy.
-_MAX_TREE_ITEMS = TREE_FILE_THRESHOLD
+# Maximum number of *file* nodes rendered in the sync tree.  Directory nodes
+# are always synthesised regardless of this limit so that the full folder
+# structure is always visible.  This cap only limits how many file leaves are
+# shown in order to keep the UI responsive on very large sync directories.
+# Kept in sync with TREE_FILE_THRESHOLD so the refresh-interval logic and the
+# tree display agree on what counts as a "large" service.
+_MAX_TREE_FILES = TREE_FILE_THRESHOLD
+
+# Maximum number of *directory* nodes rendered.  Set much higher than
+# _MAX_TREE_FILES because directory nodes are cheap to render and the user
+# must always be able to see all of their sync folders.
+_MAX_TREE_DIRS = _MAX_TREE_FILES * 10
 
 # Minimum auto-refresh interval in seconds (hard floor to avoid hammering
 # the cloud API when a user sets an unreasonably low value).
@@ -1030,10 +1036,16 @@ def _build_check_tree(check_items: List[Dict]) -> List[Dict]:
 
     Items are ordered depth-first (parent always before its children) so they
     can be inserted into a :class:`ttk.Treeview` in a single forward pass.
-    The result is capped at ``_MAX_TREE_ITEMS`` total nodes.
+
+    **Cap behaviour**: directory nodes are capped at ``_MAX_TREE_DIRS`` and
+    file nodes are capped at ``_MAX_TREE_FILES``.  The two caps are intentionally
+    separate so that the full folder structure remains visible even when the file
+    count exceeds the file cap.
     """
     result: List[Dict] = []
     seen_dirs: set = set()
+    file_count = 0
+    dir_count = 0
 
     # Sort so that a directory path always precedes its children when the file
     # paths themselves are processed in alphabetical order.
@@ -1041,13 +1053,13 @@ def _build_check_tree(check_items: List[Dict]) -> List[Dict]:
         rel = item.get("rel", "").strip("/").replace("\\", "/")
         if not rel:
             continue
-        if len(result) >= _MAX_TREE_ITEMS:
-            break
 
         parts = rel.split("/")
 
-        # Synthesise parent directory nodes
+        # Synthesise parent directory nodes (always shown, up to _MAX_TREE_DIRS)
         for i in range(1, len(parts)):
+            if dir_count >= _MAX_TREE_DIRS:
+                break
             dir_rel = "/".join(parts[:i])
             if dir_rel not in seen_dirs:
                 seen_dirs.add(dir_rel)
@@ -1059,18 +1071,19 @@ def _build_check_tree(check_items: List[Dict]) -> List[Dict]:
                     "is_dir": True,
                     "status": "unknown",
                 })
-                if len(result) >= _MAX_TREE_ITEMS:
-                    return result
+                dir_count += 1
 
-        # File node
-        parent_rel = "/".join(parts[:-1])
-        result.append({
-            "rel": rel,
-            "parent": parent_rel,
-            "name": parts[-1],
-            "is_dir": False,
-            "status": item.get("status", "unknown"),
-        })
+        # File node (shown up to _MAX_TREE_FILES)
+        if file_count < _MAX_TREE_FILES:
+            parent_rel = "/".join(parts[:-1])
+            result.append({
+                "rel": rel,
+                "parent": parent_rel,
+                "name": parts[-1],
+                "is_dir": False,
+                "status": item.get("status", "unknown"),
+            })
+            file_count += 1
 
     # Colour each synthesised directory node based on its descendant files
     _propagate_dir_status(result)
@@ -1081,7 +1094,7 @@ def _scan_local_tree(
     local_path: str,
     synced_set: set,
     pending_set: set,
-    max_items: int = _MAX_TREE_ITEMS,
+    max_files: int = _MAX_TREE_FILES,
 ) -> List[Dict]:
     """Walk *local_path* and return a flat list of node dicts for the sync tree.
 
@@ -1097,8 +1110,9 @@ def _scan_local_tree(
     Directories and files with a ``hidden`` prefix (``'.'``) are still shown
     because rclone does not exclude them by default.
 
-    The walk is capped at *max_items* to prevent the UI from becoming
-    unresponsive on very large sync directories.
+    **Cap behaviour**: only *file* nodes are counted against *max_files*.
+    Directory nodes are always added (up to ``_MAX_TREE_DIRS``) so that the
+    full folder structure remains visible even when the file count is large.
     """
     from pathlib import Path
 
@@ -1107,10 +1121,13 @@ def _scan_local_tree(
         return result
 
     base = Path(local_path)
-    counter = [0]  # mutable so the nested function can increment it
+    # Separate counters for files and directories so directories are never
+    # silently omitted when the file cap fires.
+    file_counter = [0]
+    dir_counter = [0]
 
     def _walk(dir_path: Path, parent_rel: str) -> None:
-        if counter[0] >= max_items:
+        if dir_counter[0] >= _MAX_TREE_DIRS:
             return
         try:
             raw = list(dir_path.iterdir())
@@ -1122,10 +1139,10 @@ def _scan_local_tree(
             return
 
         for entry, entry_is_dir in entries_with_dir:
-            if counter[0] >= max_items:
-                break
             rel = entry.relative_to(base).as_posix()
             if entry_is_dir:
+                if dir_counter[0] >= _MAX_TREE_DIRS:
+                    break
                 result.append({
                     "rel": rel,
                     "parent": parent_rel,
@@ -1133,9 +1150,18 @@ def _scan_local_tree(
                     "is_dir": True,
                     "status": "unknown",
                 })
-                counter[0] += 1
+                dir_counter[0] += 1
                 _walk(entry, rel)
             else:
+                if file_counter[0] >= max_files:
+                    # File cap reached: skip adding this file node but do NOT
+                    # break or return — the loop must continue so that any
+                    # remaining *sibling directories* (entries later in the
+                    # sorted list) are still visited and added to the tree.
+                    # This is the key fix: previously a shared counter caused
+                    # sibling root-level folders to be silently omitted when the
+                    # first folder consumed the entire budget.
+                    continue
                 if rel in synced_set:
                     status = "synced"
                 elif rel in pending_set:
@@ -1149,7 +1175,7 @@ def _scan_local_tree(
                     "is_dir": False,
                     "status": status,
                 })
-                counter[0] += 1
+                file_counter[0] += 1
 
     _walk(base, "")
     # Colour each directory node based on its descendant files
