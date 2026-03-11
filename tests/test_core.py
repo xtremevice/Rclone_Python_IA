@@ -2600,5 +2600,152 @@ class TestScanLocalTreeFileCap(unittest.TestCase):
             shutil.rmtree(root, ignore_errors=True)
 
 
+# ---------------------------------------------------------------------------
+# Testable replicas of the tree-cache persistence helpers
+# (canonical implementations in src/gui/main_window.py)
+# ---------------------------------------------------------------------------
+
+import json as _json_mod
+import re as _re_mod
+import shutil as _shutil_mod
+import tempfile as _tempfile_mod
+from datetime import datetime as _datetime, timezone as _tz
+from pathlib import Path as _Path
+
+_UNSAFE_FILENAME_RE_T = _re_mod.compile(r'[<>:"/\\|?*\x00-\x1f]')
+
+
+def _tree_cache_path_testable(base_dir, service_name):
+    safe = _UNSAFE_FILENAME_RE_T.sub("_", service_name) or "default"
+    return _Path(base_dir) / f"{safe}.json"
+
+
+def _save_tree_cache_testable(base_dir, service_name, items):
+    if not items:
+        return
+    path = _tree_cache_path_testable(base_dir, service_name)
+    tmp = path.with_suffix(".json.tmp")
+    payload = {
+        "saved_at": _datetime.now(_tz.utc).isoformat(),
+        "items": items,
+    }
+    try:
+        tmp.write_text(_json_mod.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(path)
+    except OSError:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _load_tree_cache_testable(base_dir, service_name):
+    path = _tree_cache_path_testable(base_dir, service_name)
+    try:
+        payload = _json_mod.loads(path.read_text(encoding="utf-8"))
+        items = payload["items"]
+        saved_at_utc = _datetime.fromisoformat(payload["saved_at"])
+        saved_at_local = saved_at_utc.astimezone()
+        saved_at_str = saved_at_local.strftime("%d/%m/%Y %H:%M")
+        return items, saved_at_str
+    except (OSError, KeyError, ValueError, TypeError):
+        return None, None
+
+
+class TestTreeCachePersistence(unittest.TestCase):
+    """Tests for the tree-snapshot save/load helpers."""
+
+    def setUp(self):
+        self._tmpdir = _tempfile_mod.mkdtemp()
+
+    def tearDown(self):
+        _shutil_mod.rmtree(self._tmpdir, ignore_errors=True)
+
+    def _items(self):
+        return [
+            {"rel": "folder_a", "parent": "", "name": "folder_a",
+             "is_dir": True, "status": "synced"},
+            {"rel": "folder_a/file1.txt", "parent": "folder_a",
+             "name": "file1.txt", "is_dir": False, "status": "synced"},
+            {"rel": "folder_b", "parent": "", "name": "folder_b",
+             "is_dir": True, "status": "remote_only"},
+        ]
+
+    def test_round_trip_preserves_items(self):
+        """Saving and loading must return exactly the same items."""
+        original = self._items()
+        _save_tree_cache_testable(self._tmpdir, "my_service", original)
+        loaded, saved_at = _load_tree_cache_testable(self._tmpdir, "my_service")
+        self.assertEqual(loaded, original)
+        self.assertIsNotNone(saved_at)
+
+    def test_saved_at_is_human_readable(self):
+        """saved_at string must be a non-empty, slash-separated date/time."""
+        _save_tree_cache_testable(self._tmpdir, "svc", self._items())
+        _, saved_at = _load_tree_cache_testable(self._tmpdir, "svc")
+        self.assertIsNotNone(saved_at)
+        # Expect DD/MM/YYYY HH:MM format
+        self.assertRegex(saved_at, r"\d{2}/\d{2}/\d{4} \d{2}:\d{2}")
+
+    def test_empty_items_not_saved(self):
+        """Saving an empty list must not create a file (so a good cache is never overwritten)."""
+        path = _tree_cache_path_testable(self._tmpdir, "svc")
+        _save_tree_cache_testable(self._tmpdir, "svc", [])
+        self.assertFalse(path.exists(), "Cache file must not be created for empty items")
+
+    def test_empty_items_dont_overwrite_existing_cache(self):
+        """An empty result (failed scan) must leave the existing good cache intact."""
+        original = self._items()
+        _save_tree_cache_testable(self._tmpdir, "svc", original)
+        _save_tree_cache_testable(self._tmpdir, "svc", [])  # simulate failed scan
+        loaded, _ = _load_tree_cache_testable(self._tmpdir, "svc")
+        self.assertEqual(loaded, original, "Existing cache must not be overwritten by empty result")
+
+    def test_missing_cache_returns_none(self):
+        """Loading a non-existent cache must return (None, None)."""
+        items, saved_at = _load_tree_cache_testable(self._tmpdir, "nonexistent_svc")
+        self.assertIsNone(items)
+        self.assertIsNone(saved_at)
+
+    def test_corrupt_cache_returns_none(self):
+        """A corrupt (non-JSON) cache file must return (None, None) without raising."""
+        path = _tree_cache_path_testable(self._tmpdir, "svc")
+        path.write_text("not-valid-json", encoding="utf-8")
+        items, saved_at = _load_tree_cache_testable(self._tmpdir, "svc")
+        self.assertIsNone(items)
+        self.assertIsNone(saved_at)
+
+    def test_service_name_with_special_chars_sanitised(self):
+        """Service names with path-unsafe characters must be sanitised for the filename."""
+        svc_name = 'My Service/with:special*chars'
+        path = _tree_cache_path_testable(self._tmpdir, svc_name)
+        # Must not contain any of the forbidden characters
+        self.assertNotIn("/", path.name)
+        self.assertNotIn(":", path.name)
+        self.assertNotIn("*", path.name)
+
+    def test_multiple_services_use_separate_files(self):
+        """Each service must get its own cache file."""
+        items_a = [{"rel": "a", "parent": "", "name": "a",
+                    "is_dir": True, "status": "synced"}]
+        items_b = [{"rel": "b", "parent": "", "name": "b",
+                    "is_dir": True, "status": "remote_only"}]
+        _save_tree_cache_testable(self._tmpdir, "service_a", items_a)
+        _save_tree_cache_testable(self._tmpdir, "service_b", items_b)
+
+        loaded_a, _ = _load_tree_cache_testable(self._tmpdir, "service_a")
+        loaded_b, _ = _load_tree_cache_testable(self._tmpdir, "service_b")
+        self.assertEqual(loaded_a, items_a)
+        self.assertEqual(loaded_b, items_b)
+
+    def test_all_item_fields_preserved(self):
+        """All five item fields (rel, parent, name, is_dir, status) must survive round-trip."""
+        item = {"rel": "dir/file.txt", "parent": "dir",
+                "name": "file.txt", "is_dir": False, "status": "diff"}
+        _save_tree_cache_testable(self._tmpdir, "svc", [item])
+        loaded, _ = _load_tree_cache_testable(self._tmpdir, "svc")
+        self.assertEqual(loaded[0], item)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -13,15 +13,24 @@ Additional behaviours:
   - Window size: 60 % screen height × 20 % screen width.
 """
 
+import json
 import os
 import platform
+import re
 import subprocess
 import threading
 import tkinter as tk
+from datetime import datetime, timezone
+from pathlib import Path
 from tkinter import messagebox, ttk
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 
-from src.config.config_manager import PLATFORM_LABELS, TREE_FILE_THRESHOLD, ConfigManager
+from src.config.config_manager import (
+    PLATFORM_LABELS,
+    TREE_FILE_THRESHOLD,
+    ConfigManager,
+    get_config_dir,
+)
 from src.gui.tray_icon import TrayIcon
 from src.gui.elementary_indicator import ElementaryIndicator, is_elementary_os
 from src.gui.error_logger import ErrorLogger
@@ -462,9 +471,10 @@ class MainWindow:
     ) -> None:
         """Show a loading indicator and start a background status check for the tree.
 
-        On the first call (tab creation) we show a placeholder row so the user
-        knows the tree is loading.  The background worker tries three strategies
-        in order:
+        On the first call (tab creation) we immediately show any previously-saved
+        snapshot so the user always has data visible.  A "🔄 actualizando…" notice
+        row is then appended so the user knows a fresh scan is in progress.
+        The background worker tries three strategies in order:
 
         1. **mtime comparison** (fast): ``rclone lsjson --recursive`` fetches
            remote file metadata and compares modification dates against local
@@ -474,15 +484,31 @@ class MainWindow:
         3. **local filesystem scan** (offline): reads local files and uses
            the persisted ``sync_history`` to infer status without remote access.
 
+        When the fresh scan completes the snapshot is saved to disk so the next
+        startup (or refresh) can show it immediately again.
+
         After the tree is populated an automatic re-check is scheduled
         according to the service's configured ``tree_refresh_small_secs`` /
         ``tree_refresh_large_secs`` settings.
         """
-        # Show loading placeholder immediately
+        # Load any previously-saved snapshot and show it right away.
+        # This ensures the user always sees data immediately, even before the
+        # background rclone scan has finished.
+        cached_items, saved_at = _load_tree_cache(service_name)
         try:
             tree.delete(*tree.get_children())
-            tree.insert("", "end", iid="__loading__",
-                        text="🔄 Actualizando…", values=("",))
+            if cached_items:
+                _fill_sync_tree(tree, cached_items)
+                # Append a subtle notice so the user knows a refresh is running
+                notice = f"🔄 Actualizando… (datos del {saved_at})"
+                try:
+                    tree.insert("", "end", iid="__loading__",
+                                text=notice, values=("",))
+                except tk.TclError:
+                    pass
+            else:
+                tree.insert("", "end", iid="__loading__",
+                            text="🔄 Actualizando…", values=("",))
         except tk.TclError:
             pass
         self._start_tree_check(service_name)
@@ -556,12 +582,18 @@ class MainWindow:
     def _on_tree_check_done(self, service_name: str, items: List[Dict]) -> None:
         """Called on the main thread after a tree check completes.
 
-        Fills the tree widget and schedules the next automatic refresh.
+        Fills the tree widget, persists the snapshot to disk (so future
+        startups / refreshes can show it immediately), and schedules the next
+        automatic refresh.
         """
         tree = self._file_trees.get(service_name)
         if tree is None:
             return
         _fill_sync_tree(tree, items)
+        # Persist the fresh snapshot so the next startup shows data immediately.
+        # _save_tree_cache is a no-op when items is empty, so a failed scan
+        # never overwrites a good snapshot.
+        _save_tree_cache(service_name, items)
         self._schedule_tree_refresh(service_name, len(items))
 
     def _schedule_tree_refresh(self, service_name: str, item_count: int) -> None:
@@ -1181,6 +1213,72 @@ def _scan_local_tree(
     # Colour each directory node based on its descendant files
     _propagate_dir_status(result)
     return result
+
+
+# ---------------------------------------------------------------------------
+# Tree-snapshot persistence helpers
+# ---------------------------------------------------------------------------
+
+# Characters that are unsafe in filenames on Windows/Linux/macOS.
+_UNSAFE_FILENAME_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+
+
+def _tree_cache_dir() -> Path:
+    """Return (and create) the directory used to persist tree snapshots."""
+    d = get_config_dir() / "tree_cache"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _tree_cache_path(service_name: str) -> Path:
+    """Return the path of the JSON snapshot file for *service_name*."""
+    safe = _UNSAFE_FILENAME_RE.sub("_", service_name) or "default"
+    return _tree_cache_dir() / f"{safe}.json"
+
+
+def _save_tree_cache(service_name: str, items: List[Dict]) -> None:
+    """Persist *items* to disk as a JSON snapshot (atomic write).
+
+    Adds a ``saved_at`` ISO-8601 timestamp so the UI can display when the
+    data was last refreshed.  Only writes if *items* is non-empty so a failed
+    scan never overwrites a good snapshot.
+    """
+    if not items:
+        return
+    path = _tree_cache_path(service_name)
+    tmp = path.with_suffix(".json.tmp")
+    payload = {
+        "saved_at": datetime.now(timezone.utc).isoformat(),
+        "items": items,
+    }
+    try:
+        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(path)
+    except OSError:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _load_tree_cache(service_name: str) -> Tuple[Optional[List[Dict]], Optional[str]]:
+    """Load a previously-saved tree snapshot.
+
+    Returns ``(items, saved_at_str)`` on success, or ``(None, None)`` if no
+    snapshot exists or the file cannot be parsed.  *saved_at_str* is a
+    human-readable local date/time string.
+    """
+    path = _tree_cache_path(service_name)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        items: List[Dict] = payload["items"]
+        # Convert the UTC ISO timestamp to local time for display
+        saved_at_utc = datetime.fromisoformat(payload["saved_at"])
+        saved_at_local = saved_at_utc.astimezone()
+        saved_at_str = saved_at_local.strftime("%d/%m/%Y %H:%M")
+        return items, saved_at_str
+    except (OSError, KeyError, ValueError, TypeError):
+        return None, None
 
 
 def _fill_sync_tree(tree: ttk.Treeview, items: List[Dict]) -> None:
