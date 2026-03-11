@@ -852,6 +852,70 @@ class RcloneManager:
         except (OSError, subprocess.TimeoutExpired):
             return None
 
+    def check_sync_status(self, service_name: str) -> Optional[List[Dict]]:
+        """Compare the remote path against the local path using ``rclone check``.
+
+        Runs ``rclone check <remote> <local> --combined -`` which writes one
+        status line per file to stdout:
+
+            ``= path`` – identical on both sides (synced)
+            ``* path`` – exists on both sides but content/mtime differs
+            ``+ path`` – exists only on source (remote)
+            ``- path`` – exists only on destination (local)
+
+        Returns a list of ``{"rel": str, "status": str}`` dicts on success,
+        or ``None`` when rclone is not installed, the service is not fully
+        configured, or the command times out.
+        """
+        svc = self._config.get_service(service_name)
+        if svc is None:
+            return None
+        remote_name = svc.get("remote_name", "")
+        remote_path = svc.get("remote_path", "/")
+        local_path = svc.get("local_path", "")
+        if not remote_name or not local_path:
+            return None
+
+        exclusions = svc.get("exclusions", [])
+        remote = f"{remote_name}:{remote_path}"
+        cmd = _rclone_base_args(self._config) + [
+            "check",
+            remote,
+            local_path,
+            "--combined", "-",
+        ]
+        for exc in exclusions:
+            cmd += ["--exclude", exc]
+
+        _STATUS_MAP = {
+            "=": "synced",
+            "*": "diff",
+            "+": "remote_only",
+            "-": "local_only",
+        }
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=180,
+            )
+            # rclone check exits with code 1 when differences exist — that is
+            # expected and still produces valid combined output in stdout.
+            output = result.stdout or ""
+            items: List[Dict] = []
+            for line in output.splitlines():
+                line = line.rstrip("\r\n")
+                # Combined format: "<char> <path>"
+                if len(line) >= 3 and line[1] == " ":
+                    char = line[0]
+                    rel = line[2:].strip().replace("\\", "/")
+                    if rel:
+                        items.append({"rel": rel, "status": _STATUS_MAP.get(char, "unknown")})
+            return items
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------

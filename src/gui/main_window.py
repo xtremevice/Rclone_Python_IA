@@ -21,7 +21,7 @@ import tkinter as tk
 from tkinter import messagebox, ttk
 from typing import Callable, Dict, List, Optional
 
-from src.config.config_manager import PLATFORM_LABELS, ConfigManager
+from src.config.config_manager import PLATFORM_LABELS, TREE_FILE_THRESHOLD, ConfigManager
 from src.gui.tray_icon import TrayIcon
 from src.gui.elementary_indicator import ElementaryIndicator, is_elementary_os
 from src.gui.error_logger import ErrorLogger
@@ -114,6 +114,8 @@ class MainWindow:
         self._drive_id_banners: Dict[str, tk.Frame] = {}
         # Per-service Treeview widgets for the sync-file tree (right panel)
         self._file_trees: Dict[str, ttk.Treeview] = {}
+        # Per-service tkinter after() IDs for the scheduled sync-tree auto-refresh
+        self._tree_refresh_ids: Dict[str, Optional[str]] = {}
         # Whether the pystray tray icon has been started (non-Elementary only)
         self._tray_started = False
 
@@ -226,6 +228,17 @@ class MainWindow:
             font=("Segoe UI", 9),
             cursor="hand2",
         ).grid(row=0, column=5, sticky="w", padx=(4, 0))
+
+        # "Refresh sync tree" shortcut button (next to import button)
+        tk.Button(
+            header,
+            text="🔄 Actualizar",
+            command=lambda n=name: self._refresh_sync_tree(n),
+            relief=tk.FLAT,
+            bg="#f0f4fa",
+            font=("Segoe UI", 9),
+            cursor="hand2",
+        ).grid(row=0, column=6, sticky="w", padx=(4, 0))
 
         # Row 1: Storage quota info (fetched asynchronously via rclone about)
         storage_var = tk.StringVar(value="💾 Total: 0  |  Usado: 0  |  Libre: 0")
@@ -345,6 +358,9 @@ class MainWindow:
         sync_tree.column("status", width=100, anchor="center", stretch=False)
         sync_tree.tag_configure("synced", foreground="#007700")
         sync_tree.tag_configure("pending", foreground="#cc6600")
+        sync_tree.tag_configure("diff", foreground="#cc6600")
+        sync_tree.tag_configure("remote_only", foreground="#0078d4")
+        sync_tree.tag_configure("local_only", foreground="#7b3fa0")
         sync_tree.tag_configure("unknown", foreground="#888888")
         sync_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         sb_tree_y.config(command=sync_tree.yview)
@@ -427,33 +443,128 @@ class MainWindow:
         tree: ttk.Treeview,
         svc: Dict,
     ) -> None:
-        """Walk the service's local directory in a background thread and
-        populate the right-side sync tree view with the results.
+        """Show a loading indicator and start a background rclone check for the tree.
 
-        Sync status for each file is determined by cross-referencing the
-        persisted *sync_history*:
-          - ✅  file appears in history with ``synced=True``
-          - ⏳  file appears in history with ``synced=False``
-          - ❓  file has no history entry (status unknown)
+        On the first call (tab creation) we show a placeholder row so the user
+        knows the tree is loading.  The background check then runs
+        ``rclone check --combined -`` and fills in accurate sync status for
+        every file.  If rclone check is unavailable or times out, we fall back
+        to a local filesystem scan combined with ``sync_history`` data.
 
-        Folders are shown with ❓ status because their sync state is
-        inferred from their children.
+        After the tree is populated an automatic re-check is scheduled
+        according to the service's configured ``tree_refresh_small_secs`` /
+        ``tree_refresh_large_secs`` settings.
         """
-        local_path = svc.get("local_path", "")
-        sync_history = svc.get("sync_history", [])
+        # Show loading placeholder immediately
+        try:
+            tree.delete(*tree.get_children())
+            tree.insert("", "end", iid="__loading__",
+                        text="🔄 Actualizando…", values=("",))
+        except tk.TclError:
+            pass
+        self._start_tree_check(service_name)
 
-        synced_set: set = {e.get("file", "") for e in sync_history if e.get("synced") is True}
-        pending_set: set = {e.get("file", "") for e in sync_history if e.get("synced") is False}
+    def _refresh_sync_tree(self, service_name: str) -> None:
+        """Cancel any pending auto-refresh and run a new tree check immediately."""
+        # Cancel pending scheduled refresh
+        after_id = self._tree_refresh_ids.pop(service_name, None)
+        if after_id is not None:
+            try:
+                self._root.after_cancel(after_id)
+            except tk.TclError:
+                pass
+        tree = self._file_trees.get(service_name)
+        if tree is None:
+            return
+        try:
+            tree.delete(*tree.get_children())
+            tree.insert("", "end", iid="__loading__",
+                        text="🔄 Actualizando…", values=("",))
+        except tk.TclError:
+            pass
+        self._start_tree_check(service_name)
 
+    def _start_tree_check(self, service_name: str) -> None:
+        """Launch a daemon thread to run the rclone check and update the tree."""
         def _worker() -> None:
-            items = _scan_local_tree(local_path, synced_set, pending_set)
-            self._root.after(0, lambda: _fill_sync_tree(tree, items))
+            svc = self._config.get_service(service_name)
+            items = self._build_tree_items_from_check(service_name, svc)
+            self._root.after(0, lambda: self._on_tree_check_done(service_name, items))
 
         threading.Thread(
             target=_worker,
             daemon=True,
-            name=f"scan-{service_name}",
+            name=f"check-{service_name}",
         ).start()
+
+    def _build_tree_items_from_check(
+        self, service_name: str, svc: Optional[Dict]
+    ) -> List[Dict]:
+        """Run rclone check for *service_name* and return tree node dicts.
+
+        Falls back to a local filesystem scan (with ``sync_history`` status)
+        when rclone check is unavailable or returns None.
+        """
+        if svc is None:
+            return []
+        check_results = self._rclone.check_sync_status(service_name)
+        if check_results is not None:
+            return _build_check_tree(check_results)
+        # Fallback: local filesystem scan
+        local_path = svc.get("local_path", "")
+        sync_history = svc.get("sync_history", [])
+        synced_set = {e.get("file", "") for e in sync_history if e.get("synced") is True}
+        pending_set = {e.get("file", "") for e in sync_history if e.get("synced") is False}
+        return _scan_local_tree(local_path, synced_set, pending_set)
+
+    def _on_tree_check_done(self, service_name: str, items: List[Dict]) -> None:
+        """Called on the main thread after a tree check completes.
+
+        Fills the tree widget and schedules the next automatic refresh.
+        """
+        tree = self._file_trees.get(service_name)
+        if tree is None:
+            return
+        _fill_sync_tree(tree, items)
+        self._schedule_tree_refresh(service_name, len(items))
+
+    def _schedule_tree_refresh(self, service_name: str, item_count: int) -> None:
+        """Cancel any existing scheduled refresh and queue the next one.
+
+        The delay is taken from the service's ``tree_refresh_small_secs`` or
+        ``tree_refresh_large_secs`` setting depending on whether *item_count*
+        is below or at/above ``TREE_FILE_THRESHOLD``.
+        """
+        # Cancel existing scheduled refresh for this service
+        after_id = self._tree_refresh_ids.pop(service_name, None)
+        if after_id is not None:
+            try:
+                self._root.after_cancel(after_id)
+            except tk.TclError:
+                pass
+        svc = self._config.get_service(service_name)
+        if svc is None:
+            return
+        if item_count < TREE_FILE_THRESHOLD:
+            interval_secs = svc.get("tree_refresh_small_secs", 60)
+        else:
+            interval_secs = svc.get("tree_refresh_large_secs", 600)
+        interval_ms = max(_MIN_REFRESH_INTERVAL_SECS, interval_secs) * 1000
+        new_id = self._root.after(
+            interval_ms,
+            lambda n=service_name: self._refresh_sync_tree(n),
+        )
+        self._tree_refresh_ids[service_name] = new_id
+
+    def _cancel_all_tree_refreshes(self) -> None:
+        """Cancel all pending tree auto-refresh after() jobs."""
+        for after_id in self._tree_refresh_ids.values():
+            if after_id is not None:
+                try:
+                    self._root.after_cancel(after_id)
+                except tk.TclError:
+                    pass
+        self._tree_refresh_ids.clear()
 
     # ------------------------------------------------------------------
     # Actions
@@ -629,6 +740,7 @@ class MainWindow:
 
     def _quit(self) -> None:
         """Stop all sync threads, save error log, remove tray icon(s), and destroy the window."""
+        self._cancel_all_tree_refreshes()
         self._rclone.stop_all()
         self._error_logger.save_to_file()
         self._tray.stop()
@@ -748,6 +860,7 @@ class MainWindow:
 
     def _refresh_tabs(self) -> None:
         """Rebuild all tabs after a config change."""
+        self._cancel_all_tree_refreshes()
         if self._notebook:
             self._notebook.destroy()
             self._notebook = None
@@ -787,23 +900,87 @@ class MainWindow:
 # Helpers
 # ------------------------------------------------------------------
 
-# Maximum number of nodes rendered in the sync tree.  Scanning very large
-# sync directories (tens of thousands of files) would freeze the UI and
-# produce an unreadable tree.  When the cap is reached the remaining items are
-# silently omitted — the tree still provides a useful overview of the top
-# portion of the directory hierarchy.
-_MAX_TREE_ITEMS = 500
+# Maximum number of nodes rendered in the sync tree.  Set equal to
+# TREE_FILE_THRESHOLD so that all files are visible up to the point where
+# the "large" refresh interval kicks in.  On very large directories the
+# remaining items are silently omitted — the tree still provides a useful
+# overview of the top portion of the hierarchy.
+_MAX_TREE_ITEMS = TREE_FILE_THRESHOLD
+
+# Minimum auto-refresh interval in seconds (hard floor to avoid hammering
+# the cloud API when a user sets an unreasonably low value).
+_MIN_REFRESH_INTERVAL_SECS = 30
 
 _TREE_STATUS_LABELS: Dict[str, str] = {
-    "synced":  "✅ Sí",
-    "pending": "⏳ Pendiente",
-    "unknown": "❓",
+    "synced":       "✅ Sí",
+    "diff":         "⚠️ Diferente",
+    "remote_only":  "⬇ Solo remoto",
+    "local_only":   "⬆ Solo local",
+    "pending":      "⏳ Pendiente",
+    "unknown":      "❓",
 }
 _TREE_STATUS_TAGS: Dict[str, tuple] = {
-    "synced":  ("synced",),
-    "pending": ("pending",),
-    "unknown": ("unknown",),
+    "synced":       ("synced",),
+    "diff":         ("diff",),
+    "remote_only":  ("remote_only",),
+    "local_only":   ("local_only",),
+    "pending":      ("pending",),
+    "unknown":      ("unknown",),
 }
+
+
+def _build_check_tree(check_items: List[Dict]) -> List[Dict]:
+    """Convert ``rclone check --combined`` output into Treeview node dicts.
+
+    Each input item has ``rel`` (POSIX path) and ``status`` keys.
+    Virtual directory nodes are synthesised from file paths so the tree
+    has proper parent–child structure.
+
+    Items are ordered depth-first (parent always before its children) so they
+    can be inserted into a :class:`ttk.Treeview` in a single forward pass.
+    The result is capped at ``_MAX_TREE_ITEMS`` total nodes.
+    """
+    result: List[Dict] = []
+    seen_dirs: set = set()
+
+    # Sort so that a directory path always precedes its children when the file
+    # paths themselves are processed in alphabetical order.
+    for item in sorted(check_items, key=lambda x: x.get("rel", "").lower()):
+        rel = item.get("rel", "").strip("/").replace("\\", "/")
+        if not rel:
+            continue
+        if len(result) >= _MAX_TREE_ITEMS:
+            break
+
+        parts = rel.split("/")
+
+        # Synthesise parent directory nodes
+        for i in range(1, len(parts)):
+            dir_rel = "/".join(parts[:i])
+            if dir_rel not in seen_dirs:
+                seen_dirs.add(dir_rel)
+                parent_rel = "/".join(parts[: i - 1]) if i > 1 else ""
+                result.append({
+                    "rel": dir_rel,
+                    "parent": parent_rel,
+                    "name": parts[i - 1],
+                    "is_dir": True,
+                    "status": "unknown",
+                })
+                if len(result) >= _MAX_TREE_ITEMS:
+                    return result
+
+        # File node
+        parent_rel = "/".join(parts[:-1])
+        result.append({
+            "rel": rel,
+            "parent": parent_rel,
+            "name": parts[-1],
+            "is_dir": False,
+            "status": item.get("status", "unknown"),
+        })
+
+    return result
 
 
 def _scan_local_tree(

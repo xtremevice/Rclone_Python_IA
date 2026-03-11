@@ -24,6 +24,7 @@ from src.config.config_manager import (
     PLATFORM_LABELS,
     DEFAULT_SYNC_INTERVAL,
     PERSONAL_VAULT_PATTERN,
+    TREE_FILE_THRESHOLD,
     ConfigManager,
 )
 from src.rclone.rclone_manager import RcloneManager
@@ -742,6 +743,40 @@ class ConfigWindow:
             values=list(INTERVAL_OPTIONS.keys()),
             state="readonly",
             width=20,
+        ).pack(anchor="w", pady=(2, 15))
+
+        # ── Tree refresh intervals ─────────────────────────────────────
+        tk.Label(
+            p,
+            text="Actualización del árbol de sincronización:",
+            anchor="w",
+            font=("Segoe UI", 10, "bold"),
+        ).pack(anchor="w", pady=(10, 5))
+
+        tk.Label(
+            p,
+            text=(
+                f"Intervalo si hay menos de {TREE_FILE_THRESHOLD} archivos (minutos):"
+            ),
+            anchor="w",
+        ).pack(anchor="w")
+        self._tree_small_var = tk.IntVar(
+            value=max(1, self._svc.get("tree_refresh_small_secs", 60) // 60)
+        )
+        tk.Spinbox(
+            p, from_=1, to=60, textvariable=self._tree_small_var, width=8
+        ).pack(anchor="w", pady=(2, 8))
+
+        tk.Label(
+            p,
+            text=f"Intervalo si hay {TREE_FILE_THRESHOLD} archivos o más (minutos):",
+            anchor="w",
+        ).pack(anchor="w")
+        self._tree_large_var = tk.IntVar(
+            value=max(1, self._svc.get("tree_refresh_large_secs", 600) // 60)
+        )
+        tk.Spinbox(
+            p, from_=1, to=120, textvariable=self._tree_large_var, width=8
         ).pack(anchor="w", pady=(2, 15))
 
         # Startup options
@@ -1466,6 +1501,16 @@ class ConfigWindow:
         if hasattr(self, "_interval_var"):
             label = self._interval_var.get()
             updates["sync_interval"] = INTERVAL_OPTIONS.get(label, DEFAULT_SYNC_INTERVAL)
+        if hasattr(self, "_tree_small_var"):
+            try:
+                updates["tree_refresh_small_secs"] = max(1, int(self._tree_small_var.get())) * 60
+            except (tk.TclError, ValueError):
+                pass
+        if hasattr(self, "_tree_large_var"):
+            try:
+                updates["tree_refresh_large_secs"] = max(1, int(self._tree_large_var.get())) * 60
+            except (tk.TclError, ValueError):
+                pass
         if hasattr(self, "_startup_var"):
             self._config.set_preference("start_with_system", self._startup_var.get())
         if hasattr(self, "_startup_delay_var"):
