@@ -249,6 +249,11 @@ class ConfigManager:
             "vfs_cache_max_size": "10G",
             # Custom cache directory (empty = rclone default)
             "vfs_cache_dir": "",
+            # bisync: per-service working directory for lock files and state.
+            # Empty string means the path is derived automatically from the
+            # remote name: <cache_base>/bisync-<remote_name>.  Set this to a
+            # custom absolute path to override the default.
+            "bisync_workdir": "",
             # bisync: conflict resolution mode used during --resync
             "resync_mode": "newer",
             # bisync: emit verbose output (--verbose flag)

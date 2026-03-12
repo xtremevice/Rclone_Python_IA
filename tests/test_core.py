@@ -33,6 +33,7 @@ from src.rclone.rclone_manager import (
     _human_size,
     _rclone_supports_resync_mode,
     _bisync_cache_dir,
+    _bisync_workdir_for_service,
     _clear_bisync_stale_files,
     _DRIVE_ID_MISSING_PHRASE,
     _BISYNC_NO_PRIOR_PHRASE,
@@ -173,6 +174,12 @@ class TestConfigManager(unittest.TestCase):
         svc = self.mgr.add_service("VfsDirSvc", "onedrive", "/tmp/vfsdir")
         self.assertIn("vfs_cache_dir", svc)
         self.assertEqual(svc["vfs_cache_dir"], "")
+
+    def test_service_has_bisync_workdir_field(self):
+        """New services should include the bisync_workdir field defaulting to empty."""
+        svc = self.mgr.add_service("WorkdirSvc", "onedrive", "/tmp/workdir")
+        self.assertIn("bisync_workdir", svc)
+        self.assertEqual(svc["bisync_workdir"], "")
 
 
 class TestConfigManagerConstants(unittest.TestCase):
@@ -370,7 +377,121 @@ class TestRcloneManager(unittest.TestCase):
         self.assertTrue(len(captured_cmds) > 0)
         self.assertNotIn("--cache-dir", captured_cmds[0])
 
-    def test_do_bisync_logs_command_before_running(self):
+    # ------------------------------------------------------------------ #
+    # --workdir per-service isolation tests                               #
+    # ------------------------------------------------------------------ #
+
+    def test_bisync_workdir_for_service_default_uses_remote_name(self):
+        """_bisync_workdir_for_service() derives workdir from remote_name when unset."""
+        svc = {"remote_name": "duexy", "bisync_workdir": ""}
+        workdir = _bisync_workdir_for_service(svc)
+        self.assertTrue(workdir.name.endswith("bisync-duexy"),
+                        f"Expected workdir to end with 'bisync-duexy', got: {workdir}")
+        # The parent must be the rclone cache base (sibling of default bisync dir)
+        self.assertEqual(workdir.parent, _bisync_cache_dir().parent)
+
+    def test_bisync_workdir_for_service_uses_stored_path(self):
+        """_bisync_workdir_for_service() returns the stored bisync_workdir when set."""
+        svc = {"remote_name": "duexy", "bisync_workdir": "/custom/workdir"}
+        workdir = _bisync_workdir_for_service(svc)
+        self.assertEqual(workdir, Path("/custom/workdir"))
+
+    def test_bisync_workdir_different_per_service(self):
+        """Two services with different remote_names should get different workdirs."""
+        svc1 = {"remote_name": "service_a", "bisync_workdir": ""}
+        svc2 = {"remote_name": "service_b", "bisync_workdir": ""}
+        self.assertNotEqual(
+            _bisync_workdir_for_service(svc1),
+            _bisync_workdir_for_service(svc2),
+        )
+
+    def test_do_bisync_passes_workdir_flag(self):
+        """_do_bisync() must include --workdir in the bisync command."""
+        self.config.add_service("WdirSvc", "onedrive", "/tmp/wdir_test")
+        captured_cmds = []
+
+        def fake_run_rclone(cmd, service_name, svc, is_retry=False):
+            captured_cmds.append(cmd)
+            return True
+
+        self.rclone._run_rclone = fake_run_rclone
+        svc = self.config.get_service("WdirSvc")
+        self.rclone._do_bisync(svc)
+
+        self.assertTrue(len(captured_cmds) > 0)
+        cmd = captured_cmds[0]
+        self.assertIn("--workdir", cmd, "--workdir must be present in bisync command")
+        workdir_idx = cmd.index("--workdir")
+        actual_workdir = Path(cmd[workdir_idx + 1])
+        expected_workdir = _bisync_workdir_for_service(svc)
+        self.assertEqual(actual_workdir, expected_workdir)
+
+    def test_do_bisync_workdir_matches_remote_name(self):
+        """The --workdir value must be derived from the service remote_name."""
+        self.config.add_service("RemoteSvc", "onedrive", "/tmp/remote_svc")
+        self.config.update_service("RemoteSvc", {"remote_name": "my_remote"})
+        captured_cmds = []
+
+        def fake_run_rclone(cmd, service_name, svc, is_retry=False):
+            captured_cmds.append(cmd)
+            return True
+
+        self.rclone._run_rclone = fake_run_rclone
+        svc = self.config.get_service("RemoteSvc")
+        self.rclone._do_bisync(svc)
+
+        self.assertTrue(len(captured_cmds) > 0)
+        cmd = captured_cmds[0]
+        self.assertIn("--workdir", cmd)
+        workdir_val = cmd[cmd.index("--workdir") + 1]
+        self.assertIn("my_remote", workdir_val,
+                      "Workdir path should contain the remote name")
+
+    def test_do_bisync_uses_custom_bisync_workdir_when_set(self):
+        """_do_bisync() must use the bisync_workdir field when it is explicitly set."""
+        self.config.add_service("CustomWdirSvc", "onedrive", "/tmp/custom_wdir")
+        import tempfile
+        custom_dir = tempfile.mkdtemp()
+        try:
+            self.config.update_service("CustomWdirSvc", {"bisync_workdir": custom_dir})
+            captured_cmds = []
+
+            def fake_run_rclone(cmd, service_name, svc, is_retry=False):
+                captured_cmds.append(cmd)
+                return True
+
+            self.rclone._run_rclone = fake_run_rclone
+            svc = self.config.get_service("CustomWdirSvc")
+            self.rclone._do_bisync(svc)
+
+            self.assertTrue(len(captured_cmds) > 0)
+            cmd = captured_cmds[0]
+            self.assertIn("--workdir", cmd)
+            self.assertEqual(Path(cmd[cmd.index("--workdir") + 1]), Path(custom_dir))
+        finally:
+            import shutil
+            shutil.rmtree(custom_dir, ignore_errors=True)
+
+    def test_do_bisync_workdir_included_in_resync_retry(self):
+        """--workdir must also be present in the --resync retry command."""
+        self.config.add_service("ResyncWdirSvc", "onedrive", "/tmp/resync_wdir")
+        captured_cmds = []
+
+        call_count = [0]
+
+        def fake_run_rclone(cmd, service_name, svc, is_retry=False):
+            captured_cmds.append(cmd)
+            call_count[0] += 1
+            return False  # Always fail to trigger resync retry
+
+        self.rclone._run_rclone = fake_run_rclone
+        svc = self.config.get_service("ResyncWdirSvc")
+        self.rclone._do_bisync(svc)
+
+        # Both the initial attempt and the --resync retry must have --workdir
+        for i, cmd in enumerate(captured_cmds):
+            self.assertIn("--workdir", cmd,
+                          f"--workdir missing from command #{i + 1}: {cmd}")
         """_do_bisync() should emit a [CMD] entry via on_error before the first run."""
         self.config.add_service("CmdSvc", "onedrive", "/tmp/cmd_test")
         logged = []
@@ -1467,21 +1588,23 @@ class TestBisyncLockCleanup(unittest.TestCase):
         self.assertEqual(self.rclone.clear_bisync_locks("nonexistent"), 0)
 
     def test_clear_bisync_locks_removes_files_for_service(self):
-        """clear_bisync_locks() should remove lock files matching the service remote."""
+        """clear_bisync_locks() should remove lock files from the service's workdir."""
         self.config.add_service("LockSvc", "onedrive", "/tmp/lock_test")
-        self.config.update_service("LockSvc", {"remote_name": "lockremote"})
 
-        # Create a fake lock file in a temp cache dir
-        fake_cache = Path(self._tmpdir) / "fake_bisync_cache"
-        fake_cache.mkdir()
-        lock = fake_cache / "lockremote_..tmp_lock_test.lck"
+        # Create a fake workdir and put a lock file in it
+        fake_workdir = Path(self._tmpdir) / "fake_bisync_workdir"
+        fake_workdir.mkdir()
+        self.config.update_service("LockSvc", {
+            "remote_name": "lockremote",
+            "bisync_workdir": str(fake_workdir),
+        })
+        lock = fake_workdir / "lockremote_..tmp_lock_test.lck"
         lock.write_text("pid")
 
         errors = []
         self.rclone.on_error = lambda name, msg: errors.append(msg)
 
-        with patch("src.rclone.rclone_manager._bisync_cache_dir", return_value=fake_cache):
-            count = self.rclone.clear_bisync_locks("LockSvc")
+        count = self.rclone.clear_bisync_locks("LockSvc")
 
         self.assertEqual(count, 1)
         self.assertFalse(lock.exists())

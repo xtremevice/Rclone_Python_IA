@@ -40,6 +40,38 @@ def _bisync_cache_dir() -> Path:
     return base / "rclone" / "bisync"
 
 
+def _bisync_workdir_for_service(svc: Dict) -> Path:
+    """Return the per-service bisync working directory.
+
+    Each service uses an isolated workdir so that multiple services can run
+    bisync concurrently without their lock files or state snapshots conflicting.
+
+    If the service dict has a non-empty ``"bisync_workdir"`` key that value is
+    used as-is (allowing the user to override the location).  Otherwise the
+    workdir is derived automatically from the remote name using the pattern::
+
+        <cache_base>/bisync-<remote_name>
+
+    For example, on Linux with a remote named ``"duexy"`` the default is
+    ``~/.cache/rclone/bisync-duexy``.
+
+    Args:
+        svc: Service configuration dictionary (must contain at least
+             ``"remote_name"``).
+
+    Returns:
+        Absolute :class:`~pathlib.Path` for the workdir.
+    """
+    stored = svc.get("bisync_workdir", "")
+    if stored:
+        return Path(stored)
+    remote_name = svc.get("remote_name", "default")
+    # Place the per-service workdir alongside the default bisync cache dir so
+    # it is easy to locate: ~/.cache/rclone/bisync-<remote_name>
+    base = _bisync_cache_dir().parent
+    return base / f"bisync-{remote_name}"
+
+
 def _clear_bisync_stale_files(
     remote_name: str,
     cache_dir: Path,
@@ -47,13 +79,19 @@ def _clear_bisync_stale_files(
 ) -> int:
     """Remove stale rclone bisync lock and partial-listing files for *remote_name*.
 
+    When a per-service workdir is used (via ``--workdir``) rclone stores *all*
+    state files inside that directory without name-prefixing, so this function
+    removes every ``*.lck`` and ``*.lst-new`` file in *cache_dir* that starts
+    with *remote_name*.  If the workdir is fully isolated (one remote per dir)
+    all matching files in the directory are candidates for removal.
+
     Only files whose names begin with *remote_name* (case-sensitive) are
     removed, so we never accidentally delete state that belongs to a
     different remote.  Both ``*.lck`` and ``*.lst-new`` files are targeted.
 
     Args:
         remote_name: The rclone remote identifier (e.g. ``"duexy"``).
-        cache_dir: Path to the rclone bisync cache directory.
+        cache_dir: Path to the rclone bisync working directory.
         emit_fn: Callable that accepts a single log-message string.
 
     Returns:
@@ -442,9 +480,9 @@ class RcloneManager:
         given service.
 
         This is useful when a previous bisync was interrupted and left a
-        ``*.lck`` or ``*.lst-new`` file in the rclone cache directory that
-        blocks the next run.  Any removed files are reported via the
-        ``on_error`` callback.
+        ``*.lck`` or ``*.lst-new`` file in the service's bisync working
+        directory that blocks the next run.  Any removed files are reported
+        via the ``on_error`` callback.
 
         Returns the number of files that were deleted.
         """
@@ -452,10 +490,10 @@ class RcloneManager:
         if svc is None:
             return 0
         remote_name = svc.get("remote_name", "")
-        cache_dir = _bisync_cache_dir()
+        workdir = _bisync_workdir_for_service(svc)
         return _clear_bisync_stale_files(
             remote_name,
-            cache_dir,
+            workdir,
             lambda msg: self._emit_error(service_name, msg),
         )
 
@@ -1195,9 +1233,11 @@ class RcloneManager:
 
         # Clear any stale lock / partial-listing files left by a previous
         # interrupted bisync before attempting to run again.
+        workdir = _bisync_workdir_for_service(svc)
+        workdir.mkdir(parents=True, exist_ok=True)
         _clear_bisync_stale_files(
             svc.get("remote_name", ""),
-            _bisync_cache_dir(),
+            workdir,
             lambda msg: self._emit_error(name, msg),
         )
 
@@ -1255,7 +1295,9 @@ class RcloneManager:
         Path(local).mkdir(parents=True, exist_ok=True)
 
         # First attempt: standard bisync, or bisync --resync for subsequent runs
-        cmd = base + ["bisync", remote, local] + perf_args + exclude_args
+        # --workdir isolates this service's lock files and state snapshots from
+        # all other services so concurrent bisync runs don't block each other.
+        cmd = base + ["bisync", remote, local, "--workdir", str(workdir)] + perf_args + exclude_args
         if use_resync:
             # Include --resync so rclone re-establishes the baseline instead of
             # comparing against prior listing files.
@@ -1304,7 +1346,7 @@ class RcloneManager:
                 )
             _clear_bisync_stale_files(
                 svc.get("remote_name", ""),
-                _bisync_cache_dir(),
+                workdir,
                 lambda msg: self._emit_error(name, msg),
             )
             cmd_resync = cmd + ["--resync"]
