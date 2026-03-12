@@ -514,7 +514,14 @@ class MainWindow:
         self._start_tree_check(service_name)
 
     def _refresh_sync_tree(self, service_name: str) -> None:
-        """Cancel any pending auto-refresh and run a new tree check immediately."""
+        """Cancel any pending auto-refresh and run a new tree check immediately.
+
+        The existing tree is **kept visible** while the background scan runs so
+        the user always has data in front of them.  A ``__loading__`` notice row
+        is added at the bottom to signal that a refresh is in progress.  When
+        the scan completes, :meth:`_on_tree_check_done` replaces the whole tree
+        with the fresh results (via :func:`_fill_sync_tree`).
+        """
         # Cancel pending scheduled refresh
         after_id = self._tree_refresh_ids.pop(service_name, None)
         if after_id is not None:
@@ -525,8 +532,12 @@ class MainWindow:
         tree = self._file_trees.get(service_name)
         if tree is None:
             return
+        # Keep the existing tree content — only add/replace the loading notice.
+        # This ensures the user always sees the previous scan while waiting for
+        # the next one to complete.
         try:
-            tree.delete(*tree.get_children())
+            if tree.exists("__loading__"):
+                tree.delete("__loading__")
             tree.insert("", "end", iid="__loading__",
                         text="🔄 Actualizando…", values=("",))
         except tk.TclError:
@@ -551,29 +562,38 @@ class MainWindow:
     ) -> List[Dict]:
         """Determine sync status for each file and return tree node dicts.
 
-        Strategy (fastest to slowest, in order of preference):
+        Strategy:
 
-        1. **mtime comparison** – ``rclone lsjson --recursive`` fetches only
-           file metadata (names + modification times); local mtimes are read
-           with :func:`os.stat`.  No data is transferred.
-        2. **rclone check** – ``rclone check --combined -`` computes checksums
-           and is more accurate but significantly slower.
-        3. **local filesystem scan** – offline fallback that uses the persisted
-           ``sync_history`` to mark files as synced/pending.  Works without
-           remote access but may be stale.
+        1. **Local filesystem scan** is always run first to build a complete
+           baseline of every file present on disk.  This guarantees that every
+           local file appears in the tree regardless of what the remote reports.
+
+        2. **mtime comparison** – ``rclone lsjson --recursive`` fetches remote
+           file metadata; local mtimes come from :func:`os.stat`.  When this
+           succeeds the comparison statuses are overlaid onto the local baseline
+           and any remote-only files are appended.
+
+        3. **rclone check** – ``rclone check --combined -`` computes checksums.
+           Used the same way as stage 2 when the mtime comparison is unavailable.
+
+        4. **Offline fallback** – when no remote connection is available, the
+           local-baseline scan is returned with ``sync_history`` used to infer
+           "synced" / "pending" status for files that have been seen before.
         """
         if svc is None:
             return []
-        # Stage 1: mtime-based comparison (fast — metadata only)
+        local_path = svc.get("local_path", "")
+
+        # Stage 2 & 3: try remote comparison (mtime first, then checksum)
         mtime_results = self._rclone.check_sync_status_mtime(service_name)
         if mtime_results is not None:
-            return _build_check_tree(mtime_results)
-        # Stage 2: rclone check (accurate but slower — uses checksums)
+            return _merge_local_and_comparison(local_path, mtime_results)
+
         check_results = self._rclone.check_sync_status(service_name)
         if check_results is not None:
-            return _build_check_tree(check_results)
-        # Stage 3: local filesystem scan (offline fallback)
-        local_path = svc.get("local_path", "")
+            return _merge_local_and_comparison(local_path, check_results)
+
+        # Stage 4: local filesystem scan (offline fallback)
         sync_history = svc.get("sync_history", [])
         synced_set = {e.get("file", "") for e in sync_history if e.get("synced") is True}
         pending_set = {e.get("file", "") for e in sync_history if e.get("synced") is False}
@@ -1057,6 +1077,100 @@ def _propagate_dir_status(items: List[Dict]) -> None:
             # except "diff").  Mark it as "synced" so it appears green —
             # indicating that at least some content is present on both sides.
             item["status"] = "synced"
+
+
+def _merge_local_and_comparison(
+    local_path: str,
+    comparison_items: List[Dict],
+) -> List[Dict]:
+    """Build tree items using the local filesystem as the complete baseline,
+    then overlay remote-comparison statuses on top.
+
+    This is the core of the "local-first scan" strategy requested by the user:
+
+    1. Walk *local_path* to discover **every** file on disk.  All files start
+       with status ``"local_only"`` (present locally but not confirmed on the
+       remote yet).
+    2. Apply statuses from *comparison_items* (``synced``, ``diff``,
+       ``remote_only``, …) to the matching local file nodes.
+    3. Any ``remote_only`` files reported by the comparison that do not exist
+       locally are appended (with their synthesised parent directories) so the
+       tree also reflects content that lives only on the remote.
+    4. Directory statuses are re-propagated from scratch so they reflect the
+       final, merged child statuses.
+
+    Parameters
+    ----------
+    local_path:
+        Absolute path to the local sync folder.
+    comparison_items:
+        List of ``{"rel": str, "status": str}`` dicts returned by
+        :meth:`RcloneManager.check_sync_status_mtime` or
+        :meth:`RcloneManager.check_sync_status`.
+
+    Returns
+    -------
+    List[Dict]
+        Flat, depth-first-ordered list of node dicts ready for
+        :func:`_fill_sync_tree`.  Parents always precede their children.
+    """
+    # Build comparison lookup: rel_path (normalised) → status
+    comp_map: Dict[str, str] = {}
+    for item in comparison_items:
+        rel = item.get("rel", "").strip("/").replace("\\", "/")
+        if rel:
+            comp_map[rel] = item.get("status", "unknown")
+
+    # ── Stage 1: scan local filesystem (complete baseline) ──────────────────
+    # _scan_local_tree walks the entire local directory regardless of network
+    # availability.  We pass empty synced/pending sets here because we will
+    # overlay the real statuses from comp_map in the next step.
+    result = _scan_local_tree(local_path, set(), set())
+
+    # ── Stage 2: overlay comparison statuses onto local file nodes ───────────
+    local_file_rels: set = set()
+    for item in result:
+        if item["is_dir"]:
+            continue
+        rel = item["rel"]
+        local_file_rels.add(rel)
+        if rel in comp_map:
+            # Comparison confirmed this file exists on one or both sides.
+            item["status"] = comp_map[rel]
+        else:
+            # File is present locally but the remote comparison did not mention
+            # it → it only exists on the local disk.
+            item["status"] = "local_only"
+
+    # ── Stage 3: append remote-only files ───────────────────────────────────
+    # Files reported as "remote_only" by the comparison exist on the remote
+    # but were NOT found by the local scan (i.e. they are genuinely absent
+    # from the local folder).  Add them to the result so the tree shows the
+    # full picture.
+    remote_only_items = [
+        {"rel": rel, "status": "remote_only"}
+        for rel, st in comp_map.items()
+        if st == "remote_only" and rel not in local_file_rels
+    ]
+
+    if remote_only_items:
+        # _build_check_tree synthesises parent directory nodes in depth-first
+        # order, then caps at _MAX_TREE_FILES / _MAX_TREE_DIRS.
+        remote_tree = _build_check_tree(remote_only_items)
+        existing_rels: set = {item["rel"] for item in result}
+        for item in remote_tree:
+            if item["rel"] not in existing_rels:
+                result.append(item)
+
+    # ── Stage 4: re-propagate directory statuses ─────────────────────────────
+    # Local scan already called _propagate_dir_status, but statuses changed in
+    # stages 2 & 3, so we reset all directory nodes and re-run the propagation.
+    for item in result:
+        if item["is_dir"]:
+            item["status"] = "unknown"
+    _propagate_dir_status(result)
+
+    return result
 
 
 def _build_check_tree(check_items: List[Dict]) -> List[Dict]:

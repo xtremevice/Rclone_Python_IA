@@ -2747,5 +2747,241 @@ class TestTreeCachePersistence(unittest.TestCase):
         self.assertEqual(loaded[0], item)
 
 
+# ---------------------------------------------------------------------------
+# Testable replica of _merge_local_and_comparison
+# (canonical: src/gui/main_window.py::_merge_local_and_comparison)
+# ---------------------------------------------------------------------------
+
+def _merge_local_and_comparison_testable(local_path, comparison_items,
+                                          max_files=1000, max_dirs=10000):
+    """Pure-Python replica of main_window._merge_local_and_comparison.
+
+    Uses the already-defined _build_check_tree_testable helper plus an inline
+    local-scan so we can test the merge logic without importing tkinter.
+    """
+    import os
+    from pathlib import Path as _P
+
+    # ── inline local scan (mirrors _scan_local_tree) ─────────────────────────
+    def _do_local_scan(local_path_, max_files_, max_dirs_):
+        result_ = []
+        if not local_path_ or not os.path.isdir(local_path_):
+            return result_
+        base_ = _P(local_path_)
+        fc = [0]
+        dc = [0]
+
+        def _walk(dir_path, parent_rel):
+            if dc[0] >= max_dirs_:
+                return
+            try:
+                raw = list(dir_path.iterdir())
+                entries = [(p, p.is_dir()) for p in raw]
+                entries.sort(key=lambda t: (not t[1], t[0].name.lower()))
+            except (PermissionError, OSError):
+                return
+            for entry, is_dir_flag in entries:
+                rel = entry.relative_to(base_).as_posix()
+                if is_dir_flag:
+                    if dc[0] >= max_dirs_:
+                        break
+                    result_.append({"rel": rel, "parent": parent_rel,
+                                    "name": entry.name, "is_dir": True, "status": "unknown"})
+                    dc[0] += 1
+                    _walk(entry, rel)
+                else:
+                    if fc[0] >= max_files_:
+                        continue
+                    result_.append({"rel": rel, "parent": parent_rel,
+                                    "name": entry.name, "is_dir": False, "status": "unknown"})
+                    fc[0] += 1
+        _walk(base_, "")
+        return result_
+    # ─────────────────────────────────────────────────────────────────────────
+
+    # Build comparison lookup
+    comp_map = {}
+    for item in comparison_items:
+        rel = item.get("rel", "").strip("/").replace("\\", "/")
+        if rel:
+            comp_map[rel] = item.get("status", "unknown")
+
+    # Stage 1: complete local scan (all files as "unknown" initially)
+    result = _do_local_scan(local_path, max_files, max_dirs)
+
+    # Stage 2: overlay comparison statuses onto local file nodes
+    local_file_rels = set()
+    for item in result:
+        if item["is_dir"]:
+            continue
+        rel = item["rel"]
+        local_file_rels.add(rel)
+        if rel in comp_map:
+            item["status"] = comp_map[rel]
+        else:
+            item["status"] = "local_only"
+
+    # Stage 3: add remote-only files not found locally
+    remote_only_items = [
+        {"rel": rel, "status": "remote_only"}
+        for rel, st in comp_map.items()
+        if st == "remote_only" and rel not in local_file_rels
+    ]
+    if remote_only_items:
+        remote_tree = _build_check_tree_testable(remote_only_items, max_files, max_dirs)
+        existing_rels = {item["rel"] for item in result}
+        for item in remote_tree:
+            if item["rel"] not in existing_rels:
+                result.append(item)
+
+    # Stage 4: re-propagate dir statuses
+    for item in result:
+        if item["is_dir"]:
+            item["status"] = "unknown"
+    _propagate_dir_status_testable(result)
+    return result
+
+
+class TestMergeLocalAndComparison(unittest.TestCase):
+    """Tests for the local-first merge strategy in _merge_local_and_comparison."""
+
+    def setUp(self):
+        self._tmpdir = _tempfile_mod.mkdtemp()
+        # Build a small local tree:
+        #   file_a.txt
+        #   subdir/
+        #     file_b.txt
+        #     file_c.txt
+        self._root = self._tmpdir
+        os.makedirs(os.path.join(self._root, "subdir"))
+        for name in ("file_a.txt",):
+            open(os.path.join(self._root, name), "w").close()
+        for name in ("file_b.txt", "file_c.txt"):
+            open(os.path.join(self._root, "subdir", name), "w").close()
+
+    def tearDown(self):
+        _shutil_mod.rmtree(self._tmpdir, ignore_errors=True)
+
+    def _merge(self, comparison_items):
+        return _merge_local_and_comparison_testable(self._root, comparison_items)
+
+    def _file_statuses(self, result):
+        return {item["rel"]: item["status"]
+                for item in result if not item["is_dir"]}
+
+    # ── basic status overlay ─────────────────────────────────────────────────
+
+    def test_synced_overlay(self):
+        """Files reported as 'synced' by comparison must appear as synced."""
+        comp = [
+            {"rel": "file_a.txt",        "status": "synced"},
+            {"rel": "subdir/file_b.txt", "status": "synced"},
+            {"rel": "subdir/file_c.txt", "status": "synced"},
+        ]
+        statuses = self._file_statuses(self._merge(comp))
+        self.assertEqual(statuses["file_a.txt"],        "synced")
+        self.assertEqual(statuses["subdir/file_b.txt"], "synced")
+        self.assertEqual(statuses["subdir/file_c.txt"], "synced")
+
+    def test_diff_overlay(self):
+        """Files reported as 'diff' must appear as diff."""
+        comp = [{"rel": "file_a.txt", "status": "diff"}]
+        statuses = self._file_statuses(self._merge(comp))
+        self.assertEqual(statuses["file_a.txt"], "diff")
+
+    def test_local_file_not_in_comparison_becomes_local_only(self):
+        """Local files absent from the comparison must be marked 'local_only'."""
+        comp = [{"rel": "file_a.txt", "status": "synced"}]
+        statuses = self._file_statuses(self._merge(comp))
+        # file_b.txt and file_c.txt are NOT in the comparison
+        self.assertEqual(statuses["subdir/file_b.txt"], "local_only")
+        self.assertEqual(statuses["subdir/file_c.txt"], "local_only")
+
+    def test_all_local_files_present_even_with_empty_comparison(self):
+        """Even when comparison returns no items, ALL local files must be in result."""
+        result = self._merge([])
+        rels = {item["rel"] for item in result if not item["is_dir"]}
+        self.assertIn("file_a.txt",        rels)
+        self.assertIn("subdir/file_b.txt", rels)
+        self.assertIn("subdir/file_c.txt", rels)
+
+    # ── remote-only files ────────────────────────────────────────────────────
+
+    def test_remote_only_file_is_added(self):
+        """A 'remote_only' file in the comparison must appear in the tree."""
+        comp = [{"rel": "only_on_remote.txt", "status": "remote_only"}]
+        rels = {item["rel"] for item in self._merge(comp)}
+        self.assertIn("only_on_remote.txt", rels)
+
+    def test_remote_only_file_status_is_remote_only(self):
+        """A remote-only file must have status 'remote_only'."""
+        comp = [{"rel": "remote_file.txt", "status": "remote_only"}]
+        statuses = self._file_statuses(self._merge(comp))
+        self.assertEqual(statuses["remote_file.txt"], "remote_only")
+
+    def test_remote_only_file_in_new_subdir_adds_parent_dir(self):
+        """A remote-only file under a new directory must also create the dir node."""
+        comp = [{"rel": "remote_dir/remote_file.txt", "status": "remote_only"}]
+        result = self._merge(comp)
+        rels = {item["rel"] for item in result}
+        self.assertIn("remote_dir",               rels, "parent dir must be created")
+        self.assertIn("remote_dir/remote_file.txt", rels)
+
+    def test_local_file_not_duplicated_when_in_comparison(self):
+        """A local file that also appears in comparison must not be duplicated."""
+        comp = [{"rel": "file_a.txt", "status": "synced"}]
+        result = self._merge(comp)
+        matches = [item for item in result if item["rel"] == "file_a.txt"]
+        self.assertEqual(len(matches), 1, "file_a.txt must appear exactly once")
+
+    # ── directory colour propagation ─────────────────────────────────────────
+
+    def test_dir_coloured_from_child_statuses(self):
+        """After merge, parent dir colour must reflect child file statuses."""
+        comp = [
+            {"rel": "subdir/file_b.txt", "status": "synced"},
+            {"rel": "subdir/file_c.txt", "status": "diff"},
+        ]
+        result = self._merge(comp)
+        dir_statuses = {item["rel"]: item["status"]
+                        for item in result if item["is_dir"]}
+        # subdir has both synced and diff → should be "diff"
+        self.assertEqual(dir_statuses.get("subdir"), "diff")
+
+    def test_all_local_only_dir_is_local_only(self):
+        """A directory containing only local_only files must be coloured local_only."""
+        result = self._merge([])  # empty comparison → all files become local_only
+        dir_statuses = {item["rel"]: item["status"]
+                        for item in result if item["is_dir"]}
+        self.assertEqual(dir_statuses.get("subdir"), "local_only")
+
+    # ── edge cases ───────────────────────────────────────────────────────────
+
+    def test_empty_local_path(self):
+        """An empty or non-existent local_path must return an empty list."""
+        result = _merge_local_and_comparison_testable("", [])
+        self.assertEqual(result, [])
+
+    def test_nonexistent_local_path(self):
+        """A missing local_path must return an empty list without raising."""
+        result = _merge_local_and_comparison_testable("/no/such/path/xyz", [])
+        self.assertEqual(result, [])
+
+    def test_comparison_with_remote_only_and_local_mix(self):
+        """Mixed comparison must show all local files AND remote-only files."""
+        comp = [
+            {"rel": "file_a.txt",       "status": "synced"},
+            {"rel": "only_remote.txt",  "status": "remote_only"},
+        ]
+        result = self._merge(comp)
+        rels = {item["rel"] for item in result if not item["is_dir"]}
+        # All local files present
+        self.assertIn("file_a.txt",        rels)
+        self.assertIn("subdir/file_b.txt", rels)
+        self.assertIn("subdir/file_c.txt", rels)
+        # Remote-only file also present
+        self.assertIn("only_remote.txt",   rels)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
