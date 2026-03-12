@@ -10,6 +10,7 @@ import json
 import os
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -2249,6 +2250,300 @@ class TestDoBisyncNoPriorListings(unittest.TestCase):
                 self.rclone._no_prior_listing_services,
                 "Service must be flagged in _no_prior_listing_services",
             )
+        finally:
+            import shutil
+            shutil.rmtree(local, ignore_errors=True)
+
+
+class TestFirstSyncTracking(unittest.TestCase):
+    """Tests for first-sync detection: status messages, --resync on subsequent runs,
+    and persistence of the first_sync_done flag."""
+
+    def setUp(self):
+        self._tmpdir = tempfile.mkdtemp()
+        import src.config.config_manager as cm_mod
+        self._original_get_config_dir = cm_mod.get_config_dir
+        cm_mod.get_config_dir = lambda: Path(self._tmpdir)
+        self.config = ConfigManager()
+        self.rclone = RcloneManager(self.config)
+
+    def tearDown(self):
+        import src.config.config_manager as cm_mod
+        cm_mod.get_config_dir = self._original_get_config_dir
+        import shutil
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+
+    # ── _do_bisync use_resync parameter ─────────────────────────────────────
+
+    def test_do_bisync_includes_resync_when_use_resync_true(self):
+        """_do_bisync(use_resync=True) must include --resync in the initial command."""
+        local = tempfile.mkdtemp()
+        try:
+            self.config.add_service("ReSync1", "onedrive", local)
+            svc = self.config.get_service("ReSync1")
+            captured_cmds = []
+
+            def fake_run_rclone(cmd, service_name, svc_arg, is_retry=False):
+                captured_cmds.append(list(cmd))
+                return True
+
+            self.rclone._run_rclone = fake_run_rclone
+
+            with patch(
+                "src.rclone.rclone_manager._check_local_free_space",
+                return_value=20 * 1024 ** 3,
+            ):
+                result = self.rclone._do_bisync(svc, use_resync=True)
+
+            self.assertTrue(result)
+            self.assertEqual(len(captured_cmds), 1, "Only one rclone call expected when --resync")
+            self.assertIn("--resync", captured_cmds[0],
+                          "--resync must appear in the initial command when use_resync=True")
+        finally:
+            import shutil
+            shutil.rmtree(local, ignore_errors=True)
+
+    def test_do_bisync_no_resync_by_default(self):
+        """_do_bisync() without use_resync must NOT add --resync to the initial command."""
+        local = tempfile.mkdtemp()
+        try:
+            self.config.add_service("NoReSyncSvc", "onedrive", local)
+            svc = self.config.get_service("NoReSyncSvc")
+            captured_cmds = []
+
+            def fake_run_rclone(cmd, service_name, svc_arg, is_retry=False):
+                captured_cmds.append(list(cmd))
+                return True
+
+            self.rclone._run_rclone = fake_run_rclone
+
+            with patch(
+                "src.rclone.rclone_manager._check_local_free_space",
+                return_value=20 * 1024 ** 3,
+            ):
+                result = self.rclone._do_bisync(svc)
+
+            self.assertTrue(result)
+            # --resync must NOT be in the first (and only) command
+            self.assertNotIn("--resync", captured_cmds[0],
+                             "--resync must not appear in the first command by default")
+        finally:
+            import shutil
+            shutil.rmtree(local, ignore_errors=True)
+
+    def test_do_bisync_no_retry_when_use_resync_true_and_fails(self):
+        """When use_resync=True and the command fails, no retry must be attempted."""
+        local = tempfile.mkdtemp()
+        try:
+            self.config.add_service("ReFailSvc", "onedrive", local)
+            svc = self.config.get_service("ReFailSvc")
+            call_count = [0]
+
+            def fake_run_rclone(cmd, service_name, svc_arg, is_retry=False):
+                call_count[0] += 1
+                return False  # always fail
+
+            self.rclone._run_rclone = fake_run_rclone
+
+            with patch(
+                "src.rclone.rclone_manager._check_local_free_space",
+                return_value=20 * 1024 ** 3,
+            ):
+                result = self.rclone._do_bisync(svc, use_resync=True)
+
+            self.assertFalse(result)
+            self.assertEqual(call_count[0], 1,
+                             "Must NOT retry when the initial --resync command fails")
+        finally:
+            import shutil
+            shutil.rmtree(local, ignore_errors=True)
+
+    # ── first_sync_done persistence ──────────────────────────────────────────
+
+    def test_first_sync_done_persisted_after_success(self):
+        """first_sync_done must be saved to config after the first successful sync."""
+        local = tempfile.mkdtemp()
+        try:
+            self.config.add_service("PersistSvc", "onedrive", local)
+
+            statuses = []
+            self.rclone.on_status_change = lambda name, s: statuses.append(s)
+
+            call_count = [0]
+
+            def fake_run_rclone(cmd, service_name, svc_arg, is_retry=False):
+                call_count[0] += 1
+                return True
+
+            self.rclone._run_rclone = fake_run_rclone
+
+            stop_event = threading.Event()
+            # Run two sync cycles: stop after second cycle starts waiting
+            cycle = [0]
+            orig_wait = stop_event.wait
+
+            def patched_wait(timeout=None):
+                cycle[0] += 1
+                if cycle[0] >= 2:
+                    stop_event.set()
+                orig_wait(timeout=0.01)
+
+            stop_event.wait = patched_wait
+
+            with patch(
+                "src.rclone.rclone_manager._check_local_free_space",
+                return_value=20 * 1024 ** 3,
+            ):
+                self.rclone._sync_loop("PersistSvc", stop_event)
+
+            svc = self.config.get_service("PersistSvc")
+            self.assertTrue(
+                svc.get("first_sync_done", False),
+                "first_sync_done must be True in config after a successful sync",
+            )
+        finally:
+            import shutil
+            shutil.rmtree(local, ignore_errors=True)
+
+    def test_status_message_is_sincronizando_on_first_run(self):
+        """_sync_loop must emit 'Sincronizando…' for the first sync cycle."""
+        local = tempfile.mkdtemp()
+        try:
+            self.config.add_service("FirstMsgSvc", "onedrive", local)
+
+            statuses = []
+            self.rclone.on_status_change = lambda name, s: statuses.append(s)
+
+            def fake_run_rclone(cmd, service_name, svc_arg, is_retry=False):
+                return True
+
+            self.rclone._run_rclone = fake_run_rclone
+
+            stop_event = threading.Event()
+            stopped = [False]
+
+            def patched_wait(timeout=None):
+                stop_event.set()
+                stopped[0] = True
+
+            stop_event.wait = patched_wait
+
+            with patch(
+                "src.rclone.rclone_manager._check_local_free_space",
+                return_value=20 * 1024 ** 3,
+            ):
+                self.rclone._sync_loop("FirstMsgSvc", stop_event)
+
+            self.assertIn("Sincronizando…", statuses,
+                          "'Sincronizando…' must appear as status on the first sync run")
+            self.assertNotIn("Actualizando cambios…", statuses,
+                             "'Actualizando cambios…' must NOT appear on the first run")
+        finally:
+            import shutil
+            shutil.rmtree(local, ignore_errors=True)
+
+    def test_status_message_is_actualizando_on_subsequent_runs(self):
+        """_sync_loop must emit 'Actualizando cambios…' when first_sync_done is True."""
+        local = tempfile.mkdtemp()
+        try:
+            self.config.add_service("SubseqSvc", "onedrive", local)
+            # Pre-mark first sync as done
+            self.config.update_service("SubseqSvc", {"first_sync_done": True})
+
+            statuses = []
+            self.rclone.on_status_change = lambda name, s: statuses.append(s)
+
+            def fake_run_rclone(cmd, service_name, svc_arg, is_retry=False):
+                return True
+
+            self.rclone._run_rclone = fake_run_rclone
+
+            stop_event = threading.Event()
+
+            def patched_wait(timeout=None):
+                stop_event.set()
+
+            stop_event.wait = patched_wait
+
+            with patch(
+                "src.rclone.rclone_manager._check_local_free_space",
+                return_value=20 * 1024 ** 3,
+            ):
+                self.rclone._sync_loop("SubseqSvc", stop_event)
+
+            self.assertIn("Actualizando cambios…", statuses,
+                          "'Actualizando cambios…' must appear as status when first_sync_done=True")
+            self.assertNotIn("Sincronizando…", statuses,
+                             "'Sincronizando…' must NOT appear when first_sync_done=True")
+        finally:
+            import shutil
+            shutil.rmtree(local, ignore_errors=True)
+
+    def test_use_resync_false_on_first_run(self):
+        """_sync_loop must call _do_bisync WITHOUT --resync on the first cycle."""
+        local = tempfile.mkdtemp()
+        try:
+            self.config.add_service("FirstResyncSvc", "onedrive", local)
+            captured_cmds = []
+
+            def fake_run_rclone(cmd, service_name, svc_arg, is_retry=False):
+                captured_cmds.append(list(cmd))
+                return True
+
+            self.rclone._run_rclone = fake_run_rclone
+
+            stop_event = threading.Event()
+
+            def patched_wait(timeout=None):
+                stop_event.set()
+
+            stop_event.wait = patched_wait
+
+            with patch(
+                "src.rclone.rclone_manager._check_local_free_space",
+                return_value=20 * 1024 ** 3,
+            ):
+                self.rclone._sync_loop("FirstResyncSvc", stop_event)
+
+            # On first run, --resync must NOT be in any command
+            all_cmds_flat = [arg for cmd in captured_cmds for arg in cmd]
+            self.assertNotIn("--resync", all_cmds_flat,
+                             "--resync must not be added on the first sync cycle")
+        finally:
+            import shutil
+            shutil.rmtree(local, ignore_errors=True)
+
+    def test_use_resync_true_on_subsequent_runs(self):
+        """_sync_loop must include --resync in the bisync command after first_sync_done=True."""
+        local = tempfile.mkdtemp()
+        try:
+            self.config.add_service("SubResyncSvc", "onedrive", local)
+            # Simulate a service that already had its first successful sync
+            self.config.update_service("SubResyncSvc", {"first_sync_done": True})
+            captured_cmds = []
+
+            def fake_run_rclone(cmd, service_name, svc_arg, is_retry=False):
+                captured_cmds.append(list(cmd))
+                return True
+
+            self.rclone._run_rclone = fake_run_rclone
+
+            stop_event = threading.Event()
+
+            def patched_wait(timeout=None):
+                stop_event.set()
+
+            stop_event.wait = patched_wait
+
+            with patch(
+                "src.rclone.rclone_manager._check_local_free_space",
+                return_value=20 * 1024 ** 3,
+            ):
+                self.rclone._sync_loop("SubResyncSvc", stop_event)
+
+            all_cmds_flat = [arg for cmd in captured_cmds for arg in cmd]
+            self.assertIn("--resync", all_cmds_flat,
+                          "--resync must be present when first_sync_done=True")
         finally:
             import shutil
             shutil.rmtree(local, ignore_errors=True)

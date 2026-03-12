@@ -1124,9 +1124,22 @@ class RcloneManager:
             if svc is None or not svc.get("sync_enabled", True):
                 break
 
-            self._set_status(service_name, "Sincronizando…")
-            success = self._do_bisync(svc)
+            # Distinguish first-time full sync from ongoing incremental updates.
+            # After the first successful sync the service config has
+            # "first_sync_done": True (persisted so the distinction survives
+            # restarts).  On first run we show "Sincronizando…"; on all
+            # subsequent runs we show "Actualizando cambios…" and pass
+            # use_resync=True to _do_bisync so rclone re-establishes the
+            # baseline from the current state of both directories.
+            is_first = not svc.get("first_sync_done", False)
+            status_in_progress = "Sincronizando…" if is_first else "Actualizando cambios…"
+            self._set_status(service_name, status_in_progress)
+            success = self._do_bisync(svc, use_resync=not is_first)
             if success:
+                if is_first:
+                    # Persist so the next cycle (and future sessions) use the
+                    # "Actualizando cambios…" path from the start.
+                    self._config.update_service(service_name, {"first_sync_done": True})
                 self._set_status(service_name, "Actualizado")
             else:
                 self._set_status(service_name, "Error en sincronización")
@@ -1138,7 +1151,7 @@ class RcloneManager:
 
         self._set_status(service_name, "Detenido")
 
-    def _do_bisync(self, svc: Dict) -> bool:
+    def _do_bisync(self, svc: Dict, use_resync: bool = False) -> bool:
         """
         Run rclone bisync for a single service dictionary.
 
@@ -1146,11 +1159,18 @@ class RcloneManager:
         filesystem has less than :data:`_MIN_FREE_SPACE_BYTES` (10 GiB) free,
         the sync is aborted with a clear error message.
 
-        On the first bisync run, or after an abnormal termination, rclone may
-        fail with "cannot find prior Path1 or Path2 listings".  This condition
-        is detected automatically and a ``--resync`` run is performed to
-        (re)initialise the bisync state without treating it as an unexpected
-        failure.
+        When *use_resync* is ``True`` the ``--resync`` flag is added to the
+        initial command.  This is used from the second sync cycle onward, after
+        the first full sync has completed successfully, so that rclone
+        re-establishes the baseline from the current state of both directories
+        rather than comparing against potentially stale listing files.
+
+        On the very first bisync run (or after an abnormal termination that
+        deleted the listing files), rclone may fail with "cannot find prior
+        Path1 or Path2 listings".  This condition is detected automatically
+        and a ``--resync`` retry is performed automatically — but only when
+        *use_resync* is ``False`` (i.e. the initial command did not already
+        include ``--resync``).
 
         Returns True on success.
         """
@@ -1234,20 +1254,28 @@ class RcloneManager:
         base = _rclone_base_args(self._config)
         Path(local).mkdir(parents=True, exist_ok=True)
 
-        # First attempt: standard bisync
+        # First attempt: standard bisync, or bisync --resync for subsequent runs
         cmd = base + ["bisync", remote, local] + perf_args + exclude_args
+        if use_resync:
+            # Include --resync so rclone re-establishes the baseline instead of
+            # comparing against prior listing files.
+            cmd += ["--resync"]
+            if _rclone_supports_resync_mode(self._config):
+                cmd += ["--resync-mode", resync_mode]
         # Log the exact command being run so it appears in the error log as reference
         self._emit_error(name, "[CMD] " + shlex.join(cmd))
         success = self._run_rclone(cmd, name, svc)
 
         # Second attempt: bisync --resync if first attempt failed.
-        # Skip the retry if a stop was explicitly requested (the process was
+        # Skip the retry entirely when the initial command already included
+        # --resync: retrying with the same flag would be pointless.
+        # Also skip the retry if a stop was explicitly requested (the process was
         # terminated on purpose, not due to a real error).
         # Clean stale lock files again before retrying: the first attempt may
         # have created a lock that it never released (e.g. if the process was
         # killed), which would cause the retry to fail immediately with
         # "prior lock file found".
-        if not success:
+        if not success and not use_resync:
             stop_ev = self._stop_events.get(name)
             if stop_ev and stop_ev.is_set():
                 # Service is being stopped; don't retry or log spurious errors
