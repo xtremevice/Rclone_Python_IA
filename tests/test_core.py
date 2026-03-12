@@ -2281,13 +2281,16 @@ def _propagate_dir_status_testable(items):
         if not item["is_dir"]:
             continue
         statuses = dir_child_statuses.get(item["rel"], set())
-        if not statuses:
+        # Exclude "unknown" — files with no known origin must not inflate
+        # a directory to "synced".  Derive status only from known-origin files.
+        known = statuses - {"unknown"}
+        if not known:
             item["status"] = "unknown"
-        elif statuses <= {"local_only"}:
+        elif known <= {"local_only"}:
             item["status"] = "local_only"
-        elif statuses <= {"remote_only"}:
+        elif known <= {"remote_only"}:
             item["status"] = "remote_only"
-        elif "diff" in statuses:
+        elif "diff" in known:
             item["status"] = "diff"
         else:
             item["status"] = "synced"
@@ -2400,6 +2403,49 @@ class TestPropagateDirStatus(unittest.TestCase):
         _propagate_dir_status_testable(items)
         file_item = next(i for i in items if not i["is_dir"])
         self.assertEqual(file_item["status"], "synced")
+
+    # ── "unknown" file status handling ──────────────────────────────────────
+
+    def test_all_unknown_files_dir_stays_unknown(self):
+        """A directory whose only descendants have 'unknown' status must stay
+        'unknown', NOT be promoted to 'synced' (regression test)."""
+        items = [
+            _make_dir("docs"),
+            _make_file("docs/a.txt", "unknown"),
+            _make_file("docs/b.txt", "unknown"),
+        ]
+        statuses = self._apply(items)
+        self.assertEqual(statuses["docs"], "unknown",
+                         "All-unknown files must not inflate directory to 'synced'")
+
+    def test_synced_and_unknown_files_dir_is_synced(self):
+        """A directory with one synced and one unknown file must be 'synced'
+        (the synced file is the only known-origin file)."""
+        items = [
+            _make_dir("docs"),
+            _make_file("docs/synced.txt", "synced"),
+            _make_file("docs/unknown.txt", "unknown"),
+        ]
+        statuses = self._apply(items)
+        self.assertEqual(statuses["docs"], "synced")
+
+    def test_local_only_and_unknown_files_dir_is_local_only(self):
+        """A directory with local_only + unknown files: unknown excluded,
+        only local_only known → directory is local_only."""
+        items = [
+            _make_dir("docs"),
+            _make_file("docs/local.txt", "local_only"),
+            _make_file("docs/unknown.txt", "unknown"),
+        ]
+        statuses = self._apply(items)
+        self.assertEqual(statuses["docs"], "local_only")
+
+    def test_empty_dir_stays_unknown(self):
+        """A directory with no file children (no file descendants) must remain
+        'unknown' — same behavior as before."""
+        items = [_make_dir("empty")]
+        statuses = self._apply(items)
+        self.assertEqual(statuses["empty"], "unknown")
 
 
 # ---------------------------------------------------------------------------

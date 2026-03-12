@@ -863,6 +863,10 @@ class MainWindow:
         # is now resolved — hide the warning banner automatically.
         if status == "Actualizado":
             self._hide_drive_id_banner(service_name)
+            # Trigger an immediate tree refresh so directory colours reflect
+            # the completed sync.  A short delay lets the status label render
+            # first; the refresh itself runs in a daemon background thread.
+            self._root.after(500, lambda n=service_name: self._refresh_sync_tree(n))
         # Update tooltips in both tray implementations
         tooltip = f"Rclone Manager – {service_name}: {status}"
         self._tray.update_tooltip(tooltip)
@@ -941,6 +945,10 @@ class MainWindow:
         tree = self._file_trees.get(service_name)
         if tree is not None:
             _update_tree_status(tree, file_path, "synced" if synced else "pending")
+            # Propagate the new file status up to all ancestor directories so
+            # their colours stay accurate during an active bisync cycle — without
+            # waiting for the next scheduled full tree refresh.
+            _update_tree_ancestors(tree, file_path)
 
     # ------------------------------------------------------------------
     # Tab refresh helpers
@@ -1063,19 +1071,24 @@ def _propagate_dir_status(items: List[Dict]) -> None:
         if not item["is_dir"]:
             continue
         statuses = dir_child_statuses.get(item["rel"], set())
-        if not statuses:
+        # Exclude "unknown" files — they carry no origin information and
+        # must not inflate a directory's colour to "synced" just because
+        # its files haven't been compared yet.  We derive status only from
+        # files whose origin is known.
+        known = statuses - {"unknown"}
+        if not known:
             item["status"] = "unknown"
-        elif statuses <= {"local_only"}:
+        elif known <= {"local_only"}:
             item["status"] = "local_only"
-        elif statuses <= {"remote_only"}:
+        elif known <= {"remote_only"}:
             item["status"] = "remote_only"
-        elif "diff" in statuses:
+        elif "diff" in known:
             item["status"] = "diff"
         else:
             # This directory contains files from both sides (e.g. synced +
-            # local_only, or synced + remote_only, or a mix of all statuses
-            # except "diff").  Mark it as "synced" so it appears green —
-            # indicating that at least some content is present on both sides.
+            # local_only, or synced + remote_only, or a mix of all known
+            # statuses except "diff").  Mark it as "synced" — indicating
+            # that at least some content is present on both sides.
             item["status"] = "synced"
 
 
@@ -1449,6 +1462,62 @@ def _update_tree_status(tree: ttk.Treeview, rel_path: str, status: str) -> None:
             tree.item(rel_path, tags=tags)
     except tk.TclError:
         pass
+
+
+def _update_tree_ancestors(tree: ttk.Treeview, rel_path: str) -> None:
+    """Re-derive and apply each ancestor directory's status after a child changes.
+
+    Walks bottom-up from the file's immediate parent to the root.  For each
+    ancestor directory the current tags of ALL its direct children are read
+    from the Treeview widget and the directory's colour is recomputed using
+    the same rules as :func:`_propagate_dir_status`.
+
+    This ensures that folder colours stay accurate in real-time as individual
+    files are marked ``"synced"`` or ``"pending"`` during a bisync cycle —
+    without waiting for the next full background scan.
+
+    Must be called on the Tkinter main thread (as all Treeview operations are).
+    """
+    parts = rel_path.split("/")
+    # Walk from the immediate parent upward (leaf → root order so each
+    # directory's tag is correct when its own parent is processed next).
+    for depth in range(len(parts) - 1, 0, -1):
+        dir_rel = "/".join(parts[:depth])
+        if not dir_rel:
+            continue
+        try:
+            if not tree.exists(dir_rel):
+                continue
+            children = tree.get_children(dir_rel)
+        except tk.TclError:
+            continue
+
+        # Collect the first tag of each direct child — the tag encodes its status
+        child_statuses: set = set()
+        for child_iid in children:
+            if child_iid == "__loading__":
+                continue
+            try:
+                tags = tree.item(child_iid, "tags")
+                if tags:
+                    child_statuses.add(tags[0])
+            except tk.TclError:
+                pass
+
+        # Derive the directory's status using the same logic as _propagate_dir_status
+        known = child_statuses - {"unknown"}
+        if not known:
+            new_status = "unknown"
+        elif known <= {"local_only"}:
+            new_status = "local_only"
+        elif known <= {"remote_only"}:
+            new_status = "remote_only"
+        elif "diff" in known:
+            new_status = "diff"
+        else:
+            new_status = "synced"
+
+        _update_tree_status(tree, dir_rel, new_status)
 
 
 
