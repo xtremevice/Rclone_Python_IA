@@ -10,6 +10,7 @@ import os
 import platform
 import re
 import shlex
+import shutil
 import subprocess
 import threading
 from pathlib import Path
@@ -21,9 +22,14 @@ from src.config.config_manager import ConfigManager, get_rclone_config_path, PER
 def _bisync_cache_dir() -> Path:
     """Return the platform-appropriate directory where rclone stores bisync state.
 
-    rclone writes lock files (``*.lck``) and partial listing files
-    (``*.lst-new``) here.  A stale lock from an interrupted sync prevents the
-    next run from proceeding, so we clean up these files before each bisync.
+    This path (``~/.cache/rclone/bisync/`` on Linux) is the *old* shared
+    working directory used by rclone bisync when no ``--workdir`` flag is
+    given.  It is now used primarily as the **source** directory for the
+    one-time migration performed by :func:`_migrate_bisync_state` when an
+    existing installation is upgraded to the per-service workdir scheme.
+
+    New bisync runs always use the per-service directory returned by
+    :func:`_bisync_workdir_for_service` instead.
 
     Paths by platform:
         Linux  : ``~/.cache/rclone/bisync/``
@@ -70,6 +76,55 @@ def _bisync_workdir_for_service(svc: Dict) -> Path:
     # it is easy to locate: ~/.cache/rclone/bisync-<remote_name>
     base = _bisync_cache_dir().parent
     return base / f"bisync-{remote_name}"
+
+
+def _migrate_bisync_state(
+    remote_name: str,
+    old_dir: Path,
+    new_dir: Path,
+    emit_fn: Callable[[str], None],
+) -> int:
+    """Move pre-existing bisync state files from *old_dir* to *new_dir*.
+
+    This one-time migration runs when a service is first used under the new
+    per-service ``--workdir`` scheme.  If state files from a previous
+    (pre-workdir) installation exist in the shared *old_dir* they are moved
+    into the service-specific *new_dir* so the first bisync run after the
+    upgrade does not require a full ``--resync``.
+
+    Only files whose names start with *remote_name* are moved; files belonging
+    to other services are left untouched.  Files that already exist in *new_dir*
+    are not overwritten.
+
+    Args:
+        remote_name: The rclone remote identifier (e.g. ``"duexy"``).
+        old_dir: The old shared bisync cache directory
+                 (typically ``~/.cache/rclone/bisync/``).
+        new_dir: The new per-service working directory (already created).
+        emit_fn: Callable that accepts a single log-message string.
+
+    Returns:
+        The number of files successfully moved.
+    """
+    if not old_dir.is_dir() or not remote_name:
+        return 0
+
+    moved = 0
+    for pattern in ("*.lck", "*.lst", "*.lst-new", "*.lst-err"):
+        for f in old_dir.glob(pattern):
+            if not f.name.startswith(remote_name):
+                continue
+            dest = new_dir / f.name
+            if dest.exists():
+                # Already migrated or a newer copy already exists — skip.
+                continue
+            try:
+                shutil.move(str(f), str(dest))
+                emit_fn(f"[MIGRATE] Movido estado de bisync: {f.name} → {new_dir.name}/")
+                moved += 1
+            except OSError as exc:
+                emit_fn(f"[MIGRATE] No se pudo mover {f.name}: {exc}")
+    return moved
 
 
 def _clear_bisync_stale_files(
@@ -161,8 +216,6 @@ def _check_local_free_space(local_path: str) -> int:
     without requiring any external command.  Returns 0 when *local_path* does
     not exist or the query fails.
     """
-    import shutil as _shutil
-
     try:
         # If the path does not yet exist, walk up to the first existing ancestor
         # so we can still query the filesystem it would be created on.
@@ -171,7 +224,7 @@ def _check_local_free_space(local_path: str) -> int:
             p = p.parent
         if not p.exists():
             return 0
-        return _shutil.disk_usage(str(p)).free
+        return shutil.disk_usage(str(p)).free
     except OSError:
         return 0
 
@@ -1235,6 +1288,16 @@ class RcloneManager:
         # interrupted bisync before attempting to run again.
         workdir = _bisync_workdir_for_service(svc)
         workdir.mkdir(parents=True, exist_ok=True)
+        # One-time migration: move any state files that a pre-workdir
+        # installation left in the shared bisync cache directory into this
+        # service's own workdir so the first run after the upgrade does not
+        # need a full --resync.
+        _migrate_bisync_state(
+            svc.get("remote_name", ""),
+            _bisync_cache_dir(),
+            workdir,
+            lambda msg: self._emit_error(name, msg),
+        )
         _clear_bisync_stale_files(
             svc.get("remote_name", ""),
             workdir,

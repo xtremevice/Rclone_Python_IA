@@ -34,6 +34,7 @@ from src.rclone.rclone_manager import (
     _rclone_supports_resync_mode,
     _bisync_cache_dir,
     _bisync_workdir_for_service,
+    _migrate_bisync_state,
     _clear_bisync_stale_files,
     _DRIVE_ID_MISSING_PHRASE,
     _BISYNC_NO_PRIOR_PHRASE,
@@ -1690,6 +1691,155 @@ class TestBisyncLockCleanup(unittest.TestCase):
         self.assertEqual(call_order[0], "clear")
         self.assertEqual(call_order[1], "bisync")
         self.assertEqual(call_order[2], "clear")
+
+
+class TestMigrateBisyncState(unittest.TestCase):
+    """Tests for _migrate_bisync_state(): one-time migration from old shared workdir."""
+
+    def setUp(self):
+        self._tmpdir = tempfile.mkdtemp()
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+
+    def _mkdir(self, name: str) -> Path:
+        d = Path(self._tmpdir) / name
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+
+    # ── basic moves ──────────────────────────────────────────────────────────
+
+    def test_migrate_moves_lst_files(self):
+        """_migrate_bisync_state() must move *.lst state files matching remote_name."""
+        old = self._mkdir("old")
+        new = self._mkdir("new")
+        (old / "myremote_path1.lst").write_text("state1")
+        (old / "myremote_path2.lst").write_text("state2")
+
+        msgs = []
+        count = _migrate_bisync_state("myremote", old, new, msgs.append)
+
+        self.assertEqual(count, 2)
+        self.assertTrue((new / "myremote_path1.lst").exists())
+        self.assertTrue((new / "myremote_path2.lst").exists())
+        self.assertFalse((old / "myremote_path1.lst").exists())
+        self.assertFalse((old / "myremote_path2.lst").exists())
+        self.assertTrue(any("[MIGRATE]" in m for m in msgs))
+
+    def test_migrate_moves_lck_files(self):
+        """_migrate_bisync_state() must move *.lck lock files matching remote_name."""
+        old = self._mkdir("old_lck")
+        new = self._mkdir("new_lck")
+        (old / "myremote_..data.lck").write_text("pid")
+
+        count = _migrate_bisync_state("myremote", old, new, lambda m: None)
+
+        self.assertEqual(count, 1)
+        self.assertTrue((new / "myremote_..data.lck").exists())
+        self.assertFalse((old / "myremote_..data.lck").exists())
+
+    def test_migrate_moves_lst_new_files(self):
+        """_migrate_bisync_state() must move *.lst-new partial-listing files."""
+        old = self._mkdir("old_new")
+        new = self._mkdir("new_new")
+        (old / "myremote_path1.lst-new").write_text("partial")
+
+        count = _migrate_bisync_state("myremote", old, new, lambda m: None)
+
+        self.assertEqual(count, 1)
+        self.assertTrue((new / "myremote_path1.lst-new").exists())
+
+    def test_migrate_does_not_touch_other_remotes(self):
+        """_migrate_bisync_state() must leave files belonging to other remotes untouched."""
+        old = self._mkdir("old_other")
+        new = self._mkdir("new_other")
+        (old / "myremote_path1.lst").write_text("mine")
+        (old / "otherremote_path1.lst").write_text("theirs")
+
+        _migrate_bisync_state("myremote", old, new, lambda m: None)
+
+        # Other remote's file must still be in old_dir
+        self.assertTrue((old / "otherremote_path1.lst").exists())
+        self.assertFalse((new / "otherremote_path1.lst").exists())
+
+    def test_migrate_skips_existing_dest_file(self):
+        """_migrate_bisync_state() must NOT overwrite a file already in new_dir."""
+        old = self._mkdir("old_skip")
+        new = self._mkdir("new_skip")
+        (old / "myremote_path1.lst").write_text("old_content")
+        (new / "myremote_path1.lst").write_text("already_here")
+
+        count = _migrate_bisync_state("myremote", old, new, lambda m: None)
+
+        self.assertEqual(count, 0, "Should skip file already present in new_dir")
+        self.assertEqual((new / "myremote_path1.lst").read_text(), "already_here")
+        # Source file stays because we didn't move it
+        self.assertTrue((old / "myremote_path1.lst").exists())
+
+    def test_migrate_empty_remote_name_moves_nothing(self):
+        """_migrate_bisync_state() with empty remote_name must be a no-op."""
+        old = self._mkdir("old_empty")
+        new = self._mkdir("new_empty")
+        (old / "myremote_path1.lst").write_text("state")
+
+        count = _migrate_bisync_state("", old, new, lambda m: None)
+
+        self.assertEqual(count, 0)
+        self.assertTrue((old / "myremote_path1.lst").exists())
+
+    def test_migrate_missing_old_dir_is_safe(self):
+        """_migrate_bisync_state() must not raise when old_dir does not exist."""
+        old = Path(self._tmpdir) / "nonexistent_old"
+        new = self._mkdir("new_safe")
+
+        count = _migrate_bisync_state("myremote", old, new, lambda m: None)
+        self.assertEqual(count, 0)
+
+    def test_migrate_called_in_do_bisync(self):
+        """_do_bisync() must call _migrate_bisync_state() before bisync runs."""
+        import src.config.config_manager as cm_mod
+        orig = cm_mod.get_config_dir
+        tmpdir = tempfile.mkdtemp()
+        try:
+            cm_mod.get_config_dir = lambda: Path(tmpdir)
+            config = ConfigManager()
+            rclone = RcloneManager(config)
+            local = tempfile.mkdtemp()
+            config.add_service("MigrSvc", "onedrive", local)
+            config.update_service("MigrSvc", {"remote_name": "migr"})
+            svc = config.get_service("MigrSvc")
+
+            migrate_calls = []
+
+            def fake_migrate(remote_name, old_dir, new_dir, emit_fn):
+                migrate_calls.append((remote_name, str(old_dir), str(new_dir)))
+                return 0
+
+            def fake_run(cmd, service_name, svc_arg, is_retry=False):
+                return True
+
+            rclone._run_rclone = fake_run
+
+            with patch(
+                "src.rclone.rclone_manager._check_local_free_space",
+                return_value=20 * 1024 ** 3,
+            ):
+                with patch(
+                    "src.rclone.rclone_manager._migrate_bisync_state",
+                    side_effect=fake_migrate,
+                ):
+                    rclone._do_bisync(svc)
+
+            self.assertTrue(len(migrate_calls) >= 1,
+                            "_migrate_bisync_state must be called by _do_bisync")
+            # First arg must be the remote_name
+            self.assertEqual(migrate_calls[0][0], "migr")
+        finally:
+            cm_mod.get_config_dir = orig
+            import shutil
+            shutil.rmtree(tmpdir, ignore_errors=True)
+            shutil.rmtree(local, ignore_errors=True)
 
 
 class TestErrorLogger(unittest.TestCase):
