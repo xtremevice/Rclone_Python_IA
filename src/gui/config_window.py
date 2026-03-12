@@ -1440,6 +1440,16 @@ class ConfigWindow:
         # Panel 1 – defaults (service name + rclone options)
         new_name = self._service_name_var.get().strip()
         if new_name and new_name != self._service_name:
+            # Guard against renaming to a name that is already taken by another
+            # service.  The check is case-sensitive to match get_service().
+            if self._config.get_service(new_name) is not None:
+                messagebox.showwarning(
+                    "Nombre duplicado",
+                    f"Ya existe un servicio con el nombre '{new_name}'.\n"
+                    "Elige un nombre diferente.",
+                    parent=self._win,
+                )
+                return
             # Include the new name in the update dict; update_service() will
             # overwrite the 'name' key while looking up by the old name.
             updates["name"] = new_name

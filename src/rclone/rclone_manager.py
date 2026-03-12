@@ -207,6 +207,19 @@ _DRIVE_ID_MISSING_PHRASE = "unable to get drive_id and drive_type"
 # the correct recovery is to run with --resync to initialise the state.
 _BISYNC_NO_PRIOR_PHRASE = "cannot find prior Path1 or Path2 listings"
 
+# Phrase that appears in rclone error output when the host network is not
+# reachable (e.g. IPv6 connectivity issues or temporarily offline).  When we
+# detect this, bisync is known to fail on every path listing — generating
+# potentially hundreds of individual ERROR lines that would flood the log.
+# We suppress those per-file entries and emit a single, clear summary message
+# instead.  Retrying with --resync is also pointless while the host is
+# offline, so the retry is skipped for this class of error.
+#
+# This string must match the exact phrase rclone writes to its output.  It
+# originates from the Go standard library's net package
+# ("read tcp … network is unreachable") and is present in all rclone versions.
+_NETWORK_UNREACHABLE_PHRASE = "network is unreachable"
+
 # Minimum free disk space (bytes) required before starting a bisync run.
 # When the local filesystem has less than this amount of free space the sync
 # is aborted with an informational message to prevent filling the disk.
@@ -352,6 +365,11 @@ class RcloneManager:
         # a real failure, the correct recovery is --resync, which is handled
         # automatically by _do_bisync.
         self._no_prior_listing_services: set = set()
+        # Services whose last bisync run encountered "network is unreachable"
+        # errors.  When this is detected, per-file error lines are suppressed
+        # (to avoid log spam) and the --resync retry is skipped because the
+        # network problem won't be fixed by rerunning with --resync.
+        self._network_error_services: set = set()
         # Optional callback(service_name, status_str) called on status changes
         self.on_status_change: Optional[Callable[[str, str], None]] = None
         # Optional callback(service_name, file_path, synced) for history updates
@@ -1484,6 +1502,14 @@ class RcloneManager:
             if name in self._config_error_services:
                 self._config_error_services.discard(name)
                 return False
+            # If the failure was caused by a network connectivity error ("network
+            # is unreachable"), skip the --resync retry: the remote server is
+            # unreachable regardless of the sync state, so the retry would also
+            # fail.  The single summary message was already emitted by
+            # _run_rclone; just clear the flag and wait for the next cycle.
+            if name in self._network_error_services:
+                self._network_error_services.discard(name)
+                return False
             # If the failure was caused by missing bisync state files ("cannot
             # find prior Path1 or Path2 listings"), emit an informational message
             # explaining what happened, then fall through to the --resync retry.
@@ -1565,6 +1591,29 @@ class RcloneManager:
                     )
                     # Notify the UI so it can surface an in-tab "fix" action.
                     self._emit_drive_id_error(service_name)
+                # Detect network-unreachable errors.  These generate one ERROR
+                # line per listed folder, which can flood the log with dozens of
+                # identical "couldn't list files: … network is unreachable"
+                # messages.  On the first occurrence we record the condition and
+                # emit a single clear human-readable summary.  Subsequent lines
+                # that contain the same phrase are suppressed entirely so the
+                # log stays readable.  The early-return below also skips
+                # forwarding the line through the general keyword scan.
+                if _NETWORK_UNREACHABLE_PHRASE in line:
+                    if service_name not in self._network_error_services:
+                        self._network_error_services.add(service_name)
+                        self._emit_error(
+                            service_name,
+                            "🌐 Red no disponible: el host no puede alcanzar el "
+                            "servidor remoto ('network is unreachable'). "
+                            "La sincronización se reintentará automáticamente "
+                            "en el próximo ciclo. "
+                            "Comprueba la conexión a Internet o la configuración "
+                            "de IPv6 del sistema.",
+                        )
+                    # Skip the rest of the per-line processing for this line so
+                    # we don't emit it again through the general error scanner.
+                    continue
                 # Detect missing bisync state files ("no prior listings").  This
                 # is the normal first-run or post-crash condition.  Flag the
                 # service so _do_bisync knows to treat the retry as an expected

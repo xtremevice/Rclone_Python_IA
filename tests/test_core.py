@@ -39,6 +39,7 @@ from src.rclone.rclone_manager import (
     _slug,
     _DRIVE_ID_MISSING_PHRASE,
     _BISYNC_NO_PRIOR_PHRASE,
+    _NETWORK_UNREACHABLE_PHRASE,
     _MIN_FREE_SPACE_BYTES,
     _MIN_FREE_SPACE_GIB,
     _check_local_free_space,
@@ -182,6 +183,21 @@ class TestConfigManager(unittest.TestCase):
         svc = self.mgr.add_service("WorkdirSvc", "onedrive", "/tmp/workdir")
         self.assertIn("bisync_workdir", svc)
         self.assertEqual(svc["bisync_workdir"], "")
+
+    def test_add_service_allows_unique_names(self):
+        """add_service() with distinct names must succeed without errors."""
+        self.mgr.add_service("Svc Alpha", "onedrive", "/tmp/a")
+        self.mgr.add_service("Svc Beta", "drive", "/tmp/b")
+        services = self.mgr.get_services()
+        names = [s["name"] for s in services]
+        self.assertIn("Svc Alpha", names)
+        self.assertIn("Svc Beta", names)
+
+    def test_get_service_returns_none_for_unknown_name(self):
+        """get_service() must return None when no service has the requested name."""
+        self.mgr.add_service("Existing", "onedrive", "/tmp/x")
+        result = self.mgr.get_service("NonExistent")
+        self.assertIsNone(result, "get_service() should return None for an unknown name")
 
 
 class TestConfigManagerConstants(unittest.TestCase):
@@ -2612,6 +2628,118 @@ class TestDoBisyncNoPriorListings(unittest.TestCase):
                 self.rclone._no_prior_listing_services,
                 "Service must be flagged in _no_prior_listing_services",
             )
+        finally:
+            import shutil
+            shutil.rmtree(local, ignore_errors=True)
+
+
+
+class TestNetworkUnreachableHandling(unittest.TestCase):
+    """Tests for network-unreachable error suppression and retry skip."""
+
+    def setUp(self):
+        self._tmpdir = tempfile.mkdtemp()
+        import src.config.config_manager as cm_mod
+        self._original_get_config_dir = cm_mod.get_config_dir
+        cm_mod.get_config_dir = lambda: Path(self._tmpdir)
+        self.config = ConfigManager()
+        self.rclone = RcloneManager(self.config)
+
+    def tearDown(self):
+        import src.config.config_manager as cm_mod
+        cm_mod.get_config_dir = self._original_get_config_dir
+        import shutil
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+
+    def test_network_unreachable_phrase_constant(self):
+        """_NETWORK_UNREACHABLE_PHRASE must match the rclone error text."""
+        self.assertIn("network is unreachable", _NETWORK_UNREACHABLE_PHRASE)
+
+    def test_network_error_emits_single_summary_message(self):
+        """Multiple 'network is unreachable' lines should produce exactly one summary message."""
+        local = tempfile.mkdtemp()
+        try:
+            self.config.add_service("NetSvc", "onedrive", local)
+            svc = self.config.get_service("NetSvc")
+            errors = []
+            self.rclone.on_error = lambda name, msg: errors.append(msg)
+
+            import sys
+            # Simulate rclone emitting many ERROR lines containing the network phrase
+            script = (
+                "import sys; "
+                "for i in range(5): "
+                "print('ERROR : path' + str(i) + ': network is unreachable'); "
+                "sys.exit(1)"
+            )
+            fake_cmd = [sys.executable, "-c", script]
+            self.rclone._run_rclone(fake_cmd, "NetSvc", svc)
+
+            # Count messages that contain the network phrase (per-file spam)
+            per_file = [m for m in errors if "network is unreachable" in m.lower() and "🌐" not in m]
+            summary = [m for m in errors if "🌐" in m]
+            self.assertEqual(len(summary), 1, "Exactly one summary network message should be emitted")
+            self.assertEqual(len(per_file), 0, "Per-file network error lines must be suppressed")
+        finally:
+            import shutil
+            shutil.rmtree(local, ignore_errors=True)
+
+    def test_network_error_skips_resync_retry(self):
+        """_do_bisync must NOT retry with --resync when a network error was detected."""
+        local = tempfile.mkdtemp()
+        try:
+            self.config.add_service("NetRetrySvc", "onedrive", local)
+            svc = self.config.get_service("NetRetrySvc")
+            captured_cmds = []
+
+            call_count = [0]
+
+            def fake_run_rclone(cmd, service_name, svc_arg, is_retry=False):
+                captured_cmds.append(list(cmd))
+                call_count[0] += 1
+                # Mark network error on first call (simulates detection in _run_rclone)
+                self.rclone._network_error_services.add(service_name)
+                return False
+
+            self.rclone._run_rclone = fake_run_rclone
+
+            with patch(
+                "src.rclone.rclone_manager._check_local_free_space",
+                return_value=20 * 1024 ** 3,
+            ):
+                self.rclone._do_bisync(svc)
+
+            # Only one attempt should have been made (no --resync retry)
+            self.assertEqual(call_count[0], 1,
+                             "Network error must skip the --resync retry (only 1 attempt expected)")
+            for cmd in captured_cmds:
+                self.assertNotIn("--resync", cmd,
+                                 "--resync must not appear in commands after a network error")
+        finally:
+            import shutil
+            shutil.rmtree(local, ignore_errors=True)
+
+    def test_network_error_flag_cleared_after_do_bisync(self):
+        """_network_error_services must be cleared after _do_bisync processes the flag."""
+        local = tempfile.mkdtemp()
+        try:
+            self.config.add_service("NetClearSvc", "onedrive", local)
+            svc = self.config.get_service("NetClearSvc")
+
+            def fake_run_rclone(cmd, service_name, svc_arg, is_retry=False):
+                self.rclone._network_error_services.add(service_name)
+                return False
+
+            self.rclone._run_rclone = fake_run_rclone
+
+            with patch(
+                "src.rclone.rclone_manager._check_local_free_space",
+                return_value=20 * 1024 ** 3,
+            ):
+                self.rclone._do_bisync(svc)
+
+            self.assertNotIn("NetClearSvc", self.rclone._network_error_services,
+                             "Service must be removed from _network_error_services after _do_bisync")
         finally:
             import shutil
             shutil.rmtree(local, ignore_errors=True)
