@@ -46,6 +46,17 @@ def _bisync_cache_dir() -> Path:
     return base / "rclone" / "bisync"
 
 
+def _slug(text: str) -> str:
+    """Convert *text* to a lowercase, filesystem-safe slug.
+
+    Non-alphanumeric characters are replaced with underscores and leading /
+    trailing underscores are stripped.  The result is always non-empty (falls
+    back to ``"service"`` for an all-symbol input).
+    """
+    slug = re.sub(r"[^a-zA-Z0-9]+", "_", text).strip("_").lower()
+    return slug or "service"
+
+
 def _bisync_workdir_for_service(svc: Dict) -> Path:
     """Return the per-service bisync working directory.
 
@@ -54,16 +65,21 @@ def _bisync_workdir_for_service(svc: Dict) -> Path:
 
     If the service dict has a non-empty ``"bisync_workdir"`` key that value is
     used as-is (allowing the user to override the location).  Otherwise the
-    workdir is derived automatically from the remote name using the pattern::
+    workdir is derived automatically from the **service name** (slugified) using
+    the pattern::
 
-        <cache_base>/bisync-<remote_name>
+        <cache_base>/bisync/<service_name_slug>
 
-    For example, on Linux with a remote named ``"duexy"`` the default is
-    ``~/.cache/rclone/bisync-duexy``.
+    For example, on Linux with a service named ``"Mi OneDrive"`` the default
+    path is ``~/.cache/rclone/bisync/mi_onedrive``.
+
+    Using the service name (rather than the remote name) makes the folders
+    immediately recognisable in a file-manager and ensures each service has a
+    unique, human-readable directory.
 
     Args:
         svc: Service configuration dictionary (must contain at least
-             ``"remote_name"``).
+             ``"name"``).
 
     Returns:
         Absolute :class:`~pathlib.Path` for the workdir.
@@ -71,11 +87,11 @@ def _bisync_workdir_for_service(svc: Dict) -> Path:
     stored = svc.get("bisync_workdir", "")
     if stored:
         return Path(stored)
-    remote_name = svc.get("remote_name", "default")
-    # Place the per-service workdir alongside the default bisync cache dir so
-    # it is easy to locate: ~/.cache/rclone/bisync-<remote_name>
-    base = _bisync_cache_dir().parent
-    return base / f"bisync-{remote_name}"
+    service_name = svc.get("name", "") or svc.get("remote_name", "default")
+    # Place the per-service workdir *inside* the default bisync cache dir so
+    # all service workdirs are grouped in one place and are easy to find:
+    #   ~/.cache/rclone/bisync/mi_onedrive/
+    return _bisync_cache_dir() / _slug(service_name)
 
 
 def _migrate_bisync_state(
@@ -350,6 +366,75 @@ class RcloneManager:
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
+
+    def ensure_service_workdirs(self) -> int:
+        """Assign and persist a unique bisync workdir to every configured service.
+
+        This method should be called once at application startup.  It:
+
+        1. Computes the default workdir for every service that does not yet
+           have ``bisync_workdir`` set in the config (using
+           :func:`_bisync_workdir_for_service`).
+        2. Detects **collisions** — two or more services that would end up in
+           the same directory.  When a collision is found the conflicting
+           services receive unique suffixes based on their ``remote_name`` so
+           each one ends up in a distinct folder.
+        3. Persists the resolved paths back to the service config so that
+           every subsequent run uses exactly the same workdirs without
+           recomputing them.
+
+        Returns the total number of services whose ``bisync_workdir`` was
+        updated (newly assigned or collision-resolved).
+        """
+        services = self._config.get_services()
+        if not services:
+            return 0
+
+        # Pass 1: compute the candidate workdir for every service.
+        # Services that already have bisync_workdir set keep their path.
+        candidates: Dict[str, Path] = {}
+        for svc in services:
+            name = svc.get("name", "")
+            if not name:
+                continue
+            candidates[name] = _bisync_workdir_for_service(svc)
+
+        # Pass 2: detect collisions (two services mapped to the same path).
+        from collections import defaultdict
+        path_to_names: Dict[Path, list] = defaultdict(list)
+        for svc_name, path in candidates.items():
+            path_to_names[path].append(svc_name)
+
+        # Pass 3: resolve collisions by appending the remote_name slug.
+        # Services whose path is unique are left untouched.
+        svc_by_name = {s.get("name", ""): s for s in services}
+        resolved: Dict[str, Path] = {}
+        for path, names in path_to_names.items():
+            if len(names) == 1:
+                resolved[names[0]] = path
+            else:
+                # Multiple services would share this workdir.  Disambiguate by
+                # appending the remote_name slug so the folder still reflects
+                # both the service and the remote.
+                for svc_name in names:
+                    svc = svc_by_name.get(svc_name, {})
+                    remote_slug = _slug(svc.get("remote_name", "") or svc_name)
+                    resolved[svc_name] = path.parent / f"{path.name}_{remote_slug}"
+
+        # Pass 4: persist any path that differs from what is currently stored.
+        updated = 0
+        for svc in services:
+            name = svc.get("name", "")
+            if not name or name not in resolved:
+                continue
+            new_path = resolved[name]
+            current = svc.get("bisync_workdir", "")
+            if current == str(new_path):
+                continue
+            self._config.update_service(name, {"bisync_workdir": str(new_path)})
+            updated += 1
+
+        return updated
 
     def start_service(self, service_name: str) -> None:
         """
@@ -1288,6 +1373,12 @@ class RcloneManager:
         # interrupted bisync before attempting to run again.
         workdir = _bisync_workdir_for_service(svc)
         workdir.mkdir(parents=True, exist_ok=True)
+        # Persist the workdir to config if it was not already stored.
+        # This makes the path stable across runs and visible to the user
+        # without requiring a bisync run to inspect which folder is in use.
+        if not svc.get("bisync_workdir"):
+            self._config.update_service(name, {"bisync_workdir": str(workdir)})
+            svc["bisync_workdir"] = str(workdir)
         # One-time migration: move any state files that a pre-workdir
         # installation left in the shared bisync cache directory into this
         # service's own workdir so the first run after the upgrade does not

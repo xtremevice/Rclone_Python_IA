@@ -36,6 +36,7 @@ from src.rclone.rclone_manager import (
     _bisync_workdir_for_service,
     _migrate_bisync_state,
     _clear_bisync_stale_files,
+    _slug,
     _DRIVE_ID_MISSING_PHRASE,
     _BISYNC_NO_PRIOR_PHRASE,
     _MIN_FREE_SPACE_BYTES,
@@ -382,14 +383,26 @@ class TestRcloneManager(unittest.TestCase):
     # --workdir per-service isolation tests                               #
     # ------------------------------------------------------------------ #
 
-    def test_bisync_workdir_for_service_default_uses_remote_name(self):
-        """_bisync_workdir_for_service() derives workdir from remote_name when unset."""
-        svc = {"remote_name": "duexy", "bisync_workdir": ""}
+    def test_slug_converts_spaces_and_special_chars(self):
+        """_slug() should convert spaces and special chars to underscores."""
+        self.assertEqual(_slug("Mi OneDrive"), "mi_onedrive")
+        self.assertEqual(_slug("Work Drive!"), "work_drive")
+        self.assertEqual(_slug("Service-A"), "service_a")
+
+    def test_slug_fallback_for_empty_input(self):
+        """_slug() should return 'service' when the input is all non-alphanumeric."""
+        self.assertEqual(_slug(""), "service")
+        self.assertEqual(_slug("!!??"), "service")
+
+    def test_bisync_workdir_for_service_default_uses_service_name(self):
+        """_bisync_workdir_for_service() derives workdir from service name when unset."""
+        svc = {"name": "Mi OneDrive", "remote_name": "duexy", "bisync_workdir": ""}
         workdir = _bisync_workdir_for_service(svc)
-        self.assertTrue(workdir.name.endswith("bisync-duexy"),
-                        f"Expected workdir to end with 'bisync-duexy', got: {workdir}")
-        # The parent must be the rclone cache base (sibling of default bisync dir)
-        self.assertEqual(workdir.parent, _bisync_cache_dir().parent)
+        # The folder name must be the slug of the service name
+        self.assertEqual(workdir.name, "mi_onedrive",
+                         f"Expected workdir folder name 'mi_onedrive', got: {workdir.name}")
+        # The workdir must live inside the default bisync cache dir
+        self.assertEqual(workdir.parent, _bisync_cache_dir())
 
     def test_bisync_workdir_for_service_uses_stored_path(self):
         """_bisync_workdir_for_service() returns the stored bisync_workdir when set."""
@@ -398,9 +411,9 @@ class TestRcloneManager(unittest.TestCase):
         self.assertEqual(workdir, Path("/custom/workdir"))
 
     def test_bisync_workdir_different_per_service(self):
-        """Two services with different remote_names should get different workdirs."""
-        svc1 = {"remote_name": "service_a", "bisync_workdir": ""}
-        svc2 = {"remote_name": "service_b", "bisync_workdir": ""}
+        """Two services with different names should get different workdirs."""
+        svc1 = {"name": "Service A", "remote_name": "service_a", "bisync_workdir": ""}
+        svc2 = {"name": "Service B", "remote_name": "service_b", "bisync_workdir": ""}
         self.assertNotEqual(
             _bisync_workdir_for_service(svc1),
             _bisync_workdir_for_service(svc2),
@@ -427,10 +440,9 @@ class TestRcloneManager(unittest.TestCase):
         expected_workdir = _bisync_workdir_for_service(svc)
         self.assertEqual(actual_workdir, expected_workdir)
 
-    def test_do_bisync_workdir_matches_remote_name(self):
-        """The --workdir value must be derived from the service remote_name."""
-        self.config.add_service("RemoteSvc", "onedrive", "/tmp/remote_svc")
-        self.config.update_service("RemoteSvc", {"remote_name": "my_remote"})
+    def test_do_bisync_workdir_contains_service_name_slug(self):
+        """The --workdir value must be derived from the service name (slugified)."""
+        self.config.add_service("Mi Nube Personal", "onedrive", "/tmp/remote_svc")
         captured_cmds = []
 
         def fake_run_rclone(cmd, service_name, svc, is_retry=False):
@@ -438,15 +450,15 @@ class TestRcloneManager(unittest.TestCase):
             return True
 
         self.rclone._run_rclone = fake_run_rclone
-        svc = self.config.get_service("RemoteSvc")
+        svc = self.config.get_service("Mi Nube Personal")
         self.rclone._do_bisync(svc)
 
         self.assertTrue(len(captured_cmds) > 0)
         cmd = captured_cmds[0]
         self.assertIn("--workdir", cmd)
         workdir_val = cmd[cmd.index("--workdir") + 1]
-        self.assertIn("my_remote", workdir_val,
-                      "Workdir path should contain the remote name")
+        self.assertIn("mi_nube_personal", workdir_val,
+                      "Workdir path should contain the slugified service name")
 
     def test_do_bisync_uses_custom_bisync_workdir_when_set(self):
         """_do_bisync() must use the bisync_workdir field when it is explicitly set."""
@@ -493,6 +505,83 @@ class TestRcloneManager(unittest.TestCase):
         for i, cmd in enumerate(captured_cmds):
             self.assertIn("--workdir", cmd,
                           f"--workdir missing from command #{i + 1}: {cmd}")
+
+    def test_do_bisync_workdir_persisted_to_config_on_first_use(self):
+        """_do_bisync() must persist the computed workdir to bisync_workdir on first run.
+
+        A service that starts without bisync_workdir set should have the derived
+        path saved to config after the first _do_bisync() call so that all
+        subsequent runs use the same folder.
+        """
+        self.config.add_service("PersistWdirSvc", "onedrive", "/tmp/persist_wdir")
+        # Confirm it starts empty
+        svc_before = self.config.get_service("PersistWdirSvc")
+        self.assertEqual(svc_before.get("bisync_workdir", ""), "")
+
+        def fake_run_rclone(cmd, service_name, svc, is_retry=False):
+            return True
+
+        self.rclone._run_rclone = fake_run_rclone
+        svc = self.config.get_service("PersistWdirSvc")
+        self.rclone._do_bisync(svc)
+
+        # After running, bisync_workdir must be stored in the config
+        svc_after = self.config.get_service("PersistWdirSvc")
+        stored = svc_after.get("bisync_workdir", "")
+        self.assertNotEqual(stored, "", "bisync_workdir must be persisted after first run")
+        # The stored value must contain the slug of the service name
+        self.assertIn("persistwdirsvc", stored.lower(),
+                      "Stored workdir should contain slug of service name")
+
+    def test_ensure_service_workdirs_assigns_and_persists(self):
+        """ensure_service_workdirs() should assign a workdir to every service without one."""
+        self.config.add_service("EnsureSvc1", "onedrive", "/tmp/ensure1")
+        self.config.add_service("EnsureSvc2", "onedrive", "/tmp/ensure2")
+        # Both start without bisync_workdir
+        for name in ("EnsureSvc1", "EnsureSvc2"):
+            svc = self.config.get_service(name)
+            self.assertEqual(svc.get("bisync_workdir", ""), "")
+
+        updated = self.rclone.ensure_service_workdirs()
+        self.assertEqual(updated, 2, "Both services should have been updated")
+
+        # After the call, every service must have bisync_workdir set
+        for name in ("EnsureSvc1", "EnsureSvc2"):
+            svc = self.config.get_service(name)
+            self.assertNotEqual(svc.get("bisync_workdir", ""), "",
+                                f"{name} must have bisync_workdir after ensure_service_workdirs()")
+
+    def test_ensure_service_workdirs_resolves_collisions(self):
+        """ensure_service_workdirs() must assign unique workdirs when two services
+        have the same service-name slug (and would otherwise share a folder)."""
+        # Both services have the same name slug: "onedrive"
+        self.config.add_service("onedrive", "onedrive", "/tmp/coll1")
+        self.config.update_service("onedrive", {"remote_name": "remote_a"})
+        # Add a second service whose slug is also "onedrive"
+        self.config.add_service("OneDrive", "onedrive", "/tmp/coll2")
+        self.config.update_service("OneDrive", {"remote_name": "remote_b"})
+
+        self.rclone.ensure_service_workdirs()
+
+        svc1 = self.config.get_service("onedrive")
+        svc2 = self.config.get_service("OneDrive")
+        workdir1 = svc1.get("bisync_workdir", "")
+        workdir2 = svc2.get("bisync_workdir", "")
+        self.assertNotEqual(workdir1, workdir2,
+                            "Collision must be resolved: each service must have a unique workdir")
+
+    def test_ensure_service_workdirs_idempotent_for_already_assigned(self):
+        """ensure_service_workdirs() should not change a workdir that is already set."""
+        self.config.add_service("AlreadySvc", "onedrive", "/tmp/already")
+        self.config.update_service("AlreadySvc", {"bisync_workdir": "/custom/already"})
+
+        updated = self.rclone.ensure_service_workdirs()
+        self.assertEqual(updated, 0, "No service should be updated when workdir is already set")
+        svc = self.config.get_service("AlreadySvc")
+        self.assertEqual(svc.get("bisync_workdir"), "/custom/already",
+                         "Pre-set bisync_workdir must not be overwritten")
+
+    def test_do_bisync_logs_command_before_running(self):
         """_do_bisync() should emit a [CMD] entry via on_error before the first run."""
         self.config.add_service("CmdSvc", "onedrive", "/tmp/cmd_test")
         logged = []
