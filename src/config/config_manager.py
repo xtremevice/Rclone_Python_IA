@@ -53,6 +53,10 @@ PERSONAL_VAULT_PATTERN = "/Almacén personal/**"
 # Default exclusion rules applied to every service
 DEFAULT_EXCLUSIONS = [PERSONAL_VAULT_PATTERN]
 
+# Number of files in the sync tree above which the "large directory" refresh
+# interval is used instead of the "small directory" one.
+TREE_FILE_THRESHOLD = 1000
+
 # Platforms supported by rclone that are offered in the wizard.
 # The first section lists the most commonly used cloud drives that were
 # already supported.  The remainder of the list mirrors the full set of
@@ -245,6 +249,11 @@ class ConfigManager:
             "vfs_cache_max_size": "10G",
             # Custom cache directory (empty = rclone default)
             "vfs_cache_dir": "",
+            # bisync: per-service working directory for lock files and state.
+            # Empty string means the path is derived automatically from the
+            # remote name: <cache_base>/bisync-<remote_name>.  Set this to a
+            # custom absolute path to override the default.
+            "bisync_workdir": "",
             # bisync: conflict resolution mode used during --resync
             "resync_mode": "newer",
             # bisync: emit verbose output (--verbose flag)
@@ -259,6 +268,11 @@ class ConfigManager:
             "vfs_read_chunk_size_limit": "100M",
             # Recent file sync history (list of dicts)
             "sync_history": [],
+            # Sync-tree auto-refresh intervals (seconds).  When the tree has
+            # fewer than TREE_FILE_THRESHOLD items, the small interval is used;
+            # otherwise the large one is used.
+            "tree_refresh_small_secs": 60,
+            "tree_refresh_large_secs": 600,
         }
 
     # ------------------------------------------------------------------

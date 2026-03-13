@@ -10,6 +10,7 @@ import os
 import platform
 import re
 import shlex
+import shutil
 import subprocess
 import threading
 from pathlib import Path
@@ -21,9 +22,14 @@ from src.config.config_manager import ConfigManager, get_rclone_config_path, PER
 def _bisync_cache_dir() -> Path:
     """Return the platform-appropriate directory where rclone stores bisync state.
 
-    rclone writes lock files (``*.lck``) and partial listing files
-    (``*.lst-new``) here.  A stale lock from an interrupted sync prevents the
-    next run from proceeding, so we clean up these files before each bisync.
+    This path (``~/.cache/rclone/bisync/`` on Linux) is the *old* shared
+    working directory used by rclone bisync when no ``--workdir`` flag is
+    given.  It is now used primarily as the **source** directory for the
+    one-time migration performed by :func:`_migrate_bisync_state` when an
+    existing installation is upgraded to the per-service workdir scheme.
+
+    New bisync runs always use the per-service directory returned by
+    :func:`_bisync_workdir_for_service` instead.
 
     Paths by platform:
         Linux  : ``~/.cache/rclone/bisync/``
@@ -40,6 +46,103 @@ def _bisync_cache_dir() -> Path:
     return base / "rclone" / "bisync"
 
 
+def _slug(text: str) -> str:
+    """Convert *text* to a lowercase, filesystem-safe slug.
+
+    Non-alphanumeric characters are replaced with underscores and leading /
+    trailing underscores are stripped.  The result is always non-empty (falls
+    back to ``"service"`` for an all-symbol input).
+    """
+    slug = re.sub(r"[^a-zA-Z0-9]+", "_", text).strip("_").lower()
+    return slug or "service"
+
+
+def _bisync_workdir_for_service(svc: Dict) -> Path:
+    """Return the per-service bisync working directory.
+
+    Each service uses an isolated workdir so that multiple services can run
+    bisync concurrently without their lock files or state snapshots conflicting.
+
+    If the service dict has a non-empty ``"bisync_workdir"`` key that value is
+    used as-is (allowing the user to override the location).  Otherwise the
+    workdir is derived automatically from the **service name** (slugified) using
+    the pattern::
+
+        <cache_base>/bisync/<service_name_slug>
+
+    For example, on Linux with a service named ``"Mi OneDrive"`` the default
+    path is ``~/.cache/rclone/bisync/mi_onedrive``.
+
+    Using the service name (rather than the remote name) makes the folders
+    immediately recognisable in a file-manager and ensures each service has a
+    unique, human-readable directory.
+
+    Args:
+        svc: Service configuration dictionary (must contain at least
+             ``"name"``).
+
+    Returns:
+        Absolute :class:`~pathlib.Path` for the workdir.
+    """
+    stored = svc.get("bisync_workdir", "")
+    if stored:
+        return Path(stored)
+    service_name = svc.get("name", "") or svc.get("remote_name", "default")
+    # Place the per-service workdir *inside* the default bisync cache dir so
+    # all service workdirs are grouped in one place and are easy to find:
+    #   ~/.cache/rclone/bisync/mi_onedrive/
+    return _bisync_cache_dir() / _slug(service_name)
+
+
+def _migrate_bisync_state(
+    remote_name: str,
+    old_dir: Path,
+    new_dir: Path,
+    emit_fn: Callable[[str], None],
+) -> int:
+    """Move pre-existing bisync state files from *old_dir* to *new_dir*.
+
+    This one-time migration runs when a service is first used under the new
+    per-service ``--workdir`` scheme.  If state files from a previous
+    (pre-workdir) installation exist in the shared *old_dir* they are moved
+    into the service-specific *new_dir* so the first bisync run after the
+    upgrade does not require a full ``--resync``.
+
+    Only files whose names start with *remote_name* are moved; files belonging
+    to other services are left untouched.  Files that already exist in *new_dir*
+    are not overwritten.
+
+    Args:
+        remote_name: The rclone remote identifier (e.g. ``"duexy"``).
+        old_dir: The old shared bisync cache directory
+                 (typically ``~/.cache/rclone/bisync/``).
+        new_dir: The new per-service working directory (already created).
+        emit_fn: Callable that accepts a single log-message string.
+
+    Returns:
+        The number of files successfully moved.
+    """
+    if not old_dir.is_dir() or not remote_name:
+        return 0
+
+    moved = 0
+    for pattern in ("*.lck", "*.lst", "*.lst-new", "*.lst-err"):
+        for f in old_dir.glob(pattern):
+            if not f.name.startswith(remote_name):
+                continue
+            dest = new_dir / f.name
+            if dest.exists():
+                # Already migrated or a newer copy already exists — skip.
+                continue
+            try:
+                shutil.move(str(f), str(dest))
+                emit_fn(f"[MIGRATE] Movido estado de bisync: {f.name} → {new_dir.name}/")
+                moved += 1
+            except OSError as exc:
+                emit_fn(f"[MIGRATE] No se pudo mover {f.name}: {exc}")
+    return moved
+
+
 def _clear_bisync_stale_files(
     remote_name: str,
     cache_dir: Path,
@@ -47,13 +150,19 @@ def _clear_bisync_stale_files(
 ) -> int:
     """Remove stale rclone bisync lock and partial-listing files for *remote_name*.
 
+    When a per-service workdir is used (via ``--workdir``) rclone stores *all*
+    state files inside that directory without name-prefixing, so this function
+    removes every ``*.lck`` and ``*.lst-new`` file in *cache_dir* that starts
+    with *remote_name*.  If the workdir is fully isolated (one remote per dir)
+    all matching files in the directory are candidates for removal.
+
     Only files whose names begin with *remote_name* (case-sensitive) are
     removed, so we never accidentally delete state that belongs to a
     different remote.  Both ``*.lck`` and ``*.lst-new`` files are targeted.
 
     Args:
         remote_name: The rclone remote identifier (e.g. ``"duexy"``).
-        cache_dir: Path to the rclone bisync cache directory.
+        cache_dir: Path to the rclone bisync working directory.
         emit_fn: Callable that accepts a single log-message string.
 
     Returns:
@@ -91,6 +200,151 @@ _RCLONE_ERROR_KEYWORDS = ("ERROR", "FATAL", "Fatal error", "error:")
 # and retrying with --resync would fail in the same way because the problem is
 # in the stored configuration, not in the sync state.
 _DRIVE_ID_MISSING_PHRASE = "unable to get drive_id and drive_type"
+
+# Phrase emitted by rclone when bisync state files (snapshots) do not exist.
+# This happens on the very first bisync run, or when a previous run terminated
+# abnormally before it could write the snapshot.  Unlike a real bisync failure,
+# the correct recovery is to run with --resync to initialise the state.
+_BISYNC_NO_PRIOR_PHRASE = "cannot find prior Path1 or Path2 listings"
+
+# Phrase that appears in rclone error output when the host network is not
+# reachable (e.g. IPv6 connectivity issues or temporarily offline).  When we
+# detect this, bisync is known to fail on every path listing — generating
+# potentially hundreds of individual ERROR lines that would flood the log.
+# We suppress those per-file entries and emit a single, clear summary message
+# instead.  Retrying with --resync is also pointless while the host is
+# offline, so the retry is skipped for this class of error.
+#
+# This string must match the exact phrase rclone writes to its output.  It
+# originates from the Go standard library's net package
+# ("read tcp … network is unreachable") and is present in all rclone versions.
+_NETWORK_UNREACHABLE_PHRASE = "network is unreachable"
+
+# Minimum free disk space (bytes) required before starting a bisync run.
+# When the local filesystem has less than this amount of free space the sync
+# is aborted with an informational message to prevent filling the disk.
+# 10 GiB = 10 * 1024^3 bytes.
+_MIN_FREE_SPACE_GIB: int = 10
+_MIN_FREE_SPACE_BYTES: int = _MIN_FREE_SPACE_GIB * 1024 ** 3
+
+# Tolerance (seconds) for comparing local vs remote file modification times.
+# FAT32 filesystems store mtimes with 2-second precision; some cloud providers
+# also round timestamps.  Using a 2 s window avoids false "diff" reports.
+_MTIME_TOLERANCE_SECS: float = 2.0
+
+# Number of fractional-second digits (microseconds) that Python's strptime
+# understands.  rclone returns nanoseconds (9 digits); we normalise to this
+# precision before parsing.
+_MICROSECOND_PRECISION: int = 6
+
+
+def _check_local_free_space(local_path: str) -> int:
+    """Return the number of free bytes on the filesystem containing *local_path*.
+
+    Uses :func:`shutil.disk_usage` so it works on Linux, macOS, and Windows
+    without requiring any external command.  Returns 0 when *local_path* does
+    not exist or the query fails.
+    """
+    try:
+        # If the path does not yet exist, walk up to the first existing ancestor
+        # so we can still query the filesystem it would be created on.
+        p = Path(local_path)
+        while p != p.parent and not p.exists():
+            p = p.parent
+        if not p.exists():
+            return 0
+        return shutil.disk_usage(str(p)).free
+    except OSError:
+        return 0
+
+
+def _parse_rclone_mtime(s: str) -> Optional[float]:
+    """Parse an rclone ISO-8601 ModTime string to a UTC Unix timestamp.
+
+    rclone returns timestamps with nanosecond precision, e.g.
+    ``"2024-01-15T10:30:00.123456789Z"``.  Python's
+    :func:`datetime.strptime` only supports up to 6 fractional digits, so
+    any extra digits are truncated before parsing.
+
+    Returns the timestamp as a ``float`` (seconds since the Unix epoch,
+    UTC), or ``None`` when the string cannot be parsed.
+    """
+    from datetime import datetime, timezone as _tz
+
+    # Normalise any fractional seconds to exactly _MICROSECOND_PRECISION digits
+    # then strip trailing Z.  The regex matches the fractional-seconds part of
+    # the timestamp (e.g. ".123456789"), pads short fractions with trailing
+    # zeros, and truncates long fractions (like nanoseconds) to exactly 6 digits
+    # — the maximum Python's strptime ``%f`` directive understands.
+    _pad = "0" * _MICROSECOND_PRECISION
+    normalised = re.sub(
+        r"\.(\d+)",
+        lambda m: "." + (m.group(1) + _pad)[:_MICROSECOND_PRECISION],
+        s,
+    ).rstrip("Z")
+    for fmt in ("%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S"):
+        try:
+            dt = datetime.strptime(normalised, fmt)
+            return dt.replace(tzinfo=_tz.utc).timestamp()
+        except ValueError:
+            continue
+    return None
+
+
+def _scan_local_mtimes(local_path: str) -> Dict[str, float]:
+    """Walk *local_path* and return ``{rel_posix_path: mtime_utc_secs}`` for every file.
+
+    Paths are relative to *local_path* and use forward slashes (POSIX style)
+    so they can be compared directly against rclone remote paths.
+    Unreadable files are silently skipped.
+    """
+    result: Dict[str, float] = {}
+    if not os.path.isdir(local_path):
+        return result
+    base = Path(local_path)
+    for dirpath, _dirs, filenames in os.walk(local_path):
+        for name in filenames:
+            full = os.path.join(dirpath, name)
+            try:
+                rel = str(Path(full).relative_to(base)).replace("\\", "/")
+                result[rel] = os.stat(full).st_mtime
+            except (OSError, ValueError):
+                pass
+    return result
+
+
+def _build_mtime_comparison(
+    local_mtimes: Dict[str, float],
+    remote_mtimes: Dict[str, float],
+) -> List[Dict]:
+    """Merge two mtime maps and return a list of comparison result dicts.
+
+    Each returned dict contains:
+
+    * ``"rel"``          – POSIX-style path relative to the sync root.
+    * ``"status"``       – one of ``"synced"``, ``"diff"``, ``"remote_only"``,
+                           or ``"local_only"``.
+    * ``"local_mtime"``  – UTC Unix timestamp (:class:`float`) or ``None``.
+    * ``"remote_mtime"`` – UTC Unix timestamp (:class:`float`) or ``None``.
+    """
+    all_paths = set(local_mtimes) | set(remote_mtimes)
+    items: List[Dict] = []
+    for rel in sorted(all_paths):
+        r_ts = remote_mtimes.get(rel)
+        l_ts = local_mtimes.get(rel)
+        if r_ts is not None and l_ts is not None:
+            status = "synced" if abs(r_ts - l_ts) <= _MTIME_TOLERANCE_SECS else "diff"
+        elif r_ts is not None:
+            status = "remote_only"
+        else:
+            status = "local_only"
+        items.append({
+            "rel": rel,
+            "status": status,
+            "local_mtime": l_ts,
+            "remote_mtime": r_ts,
+        })
+    return items
 
 
 def _rclone_base_args(config_manager: ConfigManager) -> List[str]:
@@ -140,6 +394,16 @@ class RcloneManager:
         # configuration error.  _do_bisync checks this before retrying with
         # --resync to avoid a pointless retry for what is a config problem.
         self._config_error_services: set = set()
+        # Services whose last bisync run failed because there were no prior
+        # bisync state files (first run, or state lost after a crash).  Unlike
+        # a real failure, the correct recovery is --resync, which is handled
+        # automatically by _do_bisync.
+        self._no_prior_listing_services: set = set()
+        # Services whose last bisync run encountered "network is unreachable"
+        # errors.  When this is detected, per-file error lines are suppressed
+        # (to avoid log spam) and the --resync retry is skipped because the
+        # network problem won't be fixed by rerunning with --resync.
+        self._network_error_services: set = set()
         # Optional callback(service_name, status_str) called on status changes
         self.on_status_change: Optional[Callable[[str, str], None]] = None
         # Optional callback(service_name, file_path, synced) for history updates
@@ -154,6 +418,75 @@ class RcloneManager:
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
+
+    def ensure_service_workdirs(self) -> int:
+        """Assign and persist a unique bisync workdir to every configured service.
+
+        This method should be called once at application startup.  It:
+
+        1. Computes the default workdir for every service that does not yet
+           have ``bisync_workdir`` set in the config (using
+           :func:`_bisync_workdir_for_service`).
+        2. Detects **collisions** — two or more services that would end up in
+           the same directory.  When a collision is found the conflicting
+           services receive unique suffixes based on their ``remote_name`` so
+           each one ends up in a distinct folder.
+        3. Persists the resolved paths back to the service config so that
+           every subsequent run uses exactly the same workdirs without
+           recomputing them.
+
+        Returns the total number of services whose ``bisync_workdir`` was
+        updated (newly assigned or collision-resolved).
+        """
+        services = self._config.get_services()
+        if not services:
+            return 0
+
+        # Pass 1: compute the candidate workdir for every service.
+        # Services that already have bisync_workdir set keep their path.
+        candidates: Dict[str, Path] = {}
+        for svc in services:
+            name = svc.get("name", "")
+            if not name:
+                continue
+            candidates[name] = _bisync_workdir_for_service(svc)
+
+        # Pass 2: detect collisions (two services mapped to the same path).
+        from collections import defaultdict
+        path_to_names: Dict[Path, list] = defaultdict(list)
+        for svc_name, path in candidates.items():
+            path_to_names[path].append(svc_name)
+
+        # Pass 3: resolve collisions by appending the remote_name slug.
+        # Services whose path is unique are left untouched.
+        svc_by_name = {s.get("name", ""): s for s in services}
+        resolved: Dict[str, Path] = {}
+        for path, names in path_to_names.items():
+            if len(names) == 1:
+                resolved[names[0]] = path
+            else:
+                # Multiple services would share this workdir.  Disambiguate by
+                # appending the remote_name slug so the folder still reflects
+                # both the service and the remote.
+                for svc_name in names:
+                    svc = svc_by_name.get(svc_name, {})
+                    remote_slug = _slug(svc.get("remote_name", "") or svc_name)
+                    resolved[svc_name] = path.parent / f"{path.name}_{remote_slug}"
+
+        # Pass 4: persist any path that differs from what is currently stored.
+        updated = 0
+        for svc in services:
+            name = svc.get("name", "")
+            if not name or name not in resolved:
+                continue
+            new_path = resolved[name]
+            current = svc.get("bisync_workdir", "")
+            if current == str(new_path):
+                continue
+            self._config.update_service(name, {"bisync_workdir": str(new_path)})
+            updated += 1
+
+        return updated
 
     def start_service(self, service_name: str) -> None:
         """
@@ -337,9 +670,9 @@ class RcloneManager:
         given service.
 
         This is useful when a previous bisync was interrupted and left a
-        ``*.lck`` or ``*.lst-new`` file in the rclone cache directory that
-        blocks the next run.  Any removed files are reported via the
-        ``on_error`` callback.
+        ``*.lck`` or ``*.lst-new`` file in the service's bisync working
+        directory that blocks the next run.  Any removed files are reported
+        via the ``on_error`` callback.
 
         Returns the number of files that were deleted.
         """
@@ -347,10 +680,10 @@ class RcloneManager:
         if svc is None:
             return 0
         remote_name = svc.get("remote_name", "")
-        cache_dir = _bisync_cache_dir()
+        workdir = _bisync_workdir_for_service(svc)
         return _clear_bisync_stale_files(
             remote_name,
-            cache_dir,
+            workdir,
             lambda msg: self._emit_error(service_name, msg),
         )
 
@@ -852,6 +1185,185 @@ class RcloneManager:
         except (OSError, subprocess.TimeoutExpired):
             return None
 
+    def list_remote_mtimes(self, service_name: str) -> Optional[Dict[str, float]]:
+        """Return a ``{rel_path: utc_unix_timestamp}`` map for all files on the remote.
+
+        Convenience wrapper around :meth:`list_remote_metadata` that returns
+        only the mtime values (no file sizes) to preserve backwards
+        compatibility with callers that do not need sizes.
+
+        Returns ``None`` when rclone is unavailable, the service is not fully
+        configured, or the remote listing command fails or times out.
+        """
+        meta = self.list_remote_metadata(service_name)
+        if meta is None:
+            return None
+        return {rel: entry["mtime"] for rel, entry in meta.items()}
+
+    def list_remote_metadata(
+        self, service_name: str
+    ) -> Optional[Dict[str, Dict]]:
+        """Return a ``{rel_path: {"mtime": float, "size": int}}`` map for all remote files.
+
+        Extends :meth:`list_remote_mtimes` by also returning the file size
+        (``"size"`` key, bytes as :class:`int`) from the ``rclone lsjson``
+        output.  Used by :meth:`~src.gui.main_window.MainWindow._start_tree_check`
+        Thread 2 to write both fields to :class:`~src.db.file_scan_db.FileScanDB`.
+
+        Returns ``None`` when the remote is unavailable or the service is not
+        fully configured (same failure conditions as :meth:`list_remote_mtimes`).
+        """
+        import json as _json
+
+        svc = self._config.get_service(service_name)
+        if svc is None:
+            return None
+        remote_name = svc.get("remote_name", "")
+        remote_path = svc.get("remote_path", "/")
+        local_path = svc.get("local_path", "")
+        if not remote_name or not local_path:
+            return None
+
+        exclusions = svc.get("exclusions", [])
+        remote = f"{remote_name}:{remote_path}"
+        cmd = _rclone_base_args(self._config) + [
+            "lsjson",
+            "--recursive",
+            "--files-only",
+            "--no-mimetype",
+            remote,
+        ]
+        for exc in exclusions:
+            cmd += ["--exclude", exc]
+
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            if result.returncode != 0:
+                return None
+            remote_items = _json.loads(result.stdout or "[]")
+        except (OSError, subprocess.TimeoutExpired, ValueError):
+            return None
+
+        metadata: Dict[str, Dict] = {}
+        for item in remote_items:
+            rel = item.get("Path", "").replace("\\", "/").strip("/")
+            mtime_str = item.get("ModTime", "")
+            size = item.get("Size", 0)
+            if rel:
+                ts = _parse_rclone_mtime(mtime_str)
+                if ts is not None:
+                    metadata[rel] = {"mtime": ts, "size": int(size)}
+        return metadata
+
+    def check_sync_status_mtime(self, service_name: str) -> Optional[List[Dict]]:
+        """Compare remote vs local files using modification timestamps.
+
+        Faster than :meth:`check_sync_status` because it only fetches file
+        metadata (names and modification times) via ``rclone lsjson
+        --recursive --files-only`` rather than computing checksums.  Local
+        modification times are read with :func:`os.stat`.
+
+        Status values returned in each dict's ``status`` key:
+
+            ``synced``      – local mtime ≈ remote mtime (within
+                              :data:`_MTIME_TOLERANCE_SECS`)
+            ``diff``        – file exists on both sides but mtimes differ
+            ``remote_only`` – file exists on the remote but not locally
+            ``local_only``  – file exists locally but not on the remote
+
+        Each dict also contains ``local_mtime`` and ``remote_mtime`` (UTC
+        Unix timestamps as :class:`float`, or ``None`` when the file does not
+        exist on that side).
+
+        Returns a list of ``{"rel": str, "status": str, "local_mtime": …,
+        "remote_mtime": …}`` dicts on success, or ``None`` when rclone is
+        unavailable, the service is not fully configured, or the remote
+        listing times out.
+        """
+        svc = self._config.get_service(service_name)
+        if svc is None:
+            return None
+        local_path = svc.get("local_path", "")
+        if not local_path:
+            return None
+
+        remote_mtimes = self.list_remote_mtimes(service_name)
+        if remote_mtimes is None:
+            return None
+
+        local_mtimes: Dict[str, float] = _scan_local_mtimes(local_path)
+
+        return _build_mtime_comparison(local_mtimes, remote_mtimes)
+
+    def check_sync_status(self, service_name: str) -> Optional[List[Dict]]:
+        """Compare the remote path against the local path using ``rclone check``.
+
+        Runs ``rclone check <remote> <local> --combined -`` which writes one
+        status line per file to stdout:
+
+            ``= path`` – identical on both sides (synced)
+            ``* path`` – exists on both sides but content/mtime differs
+            ``+ path`` – exists only on source (remote)
+            ``- path`` – exists only on destination (local)
+
+        Returns a list of ``{"rel": str, "status": str}`` dicts on success,
+        or ``None`` when rclone is not installed, the service is not fully
+        configured, or the command times out.
+        """
+        svc = self._config.get_service(service_name)
+        if svc is None:
+            return None
+        remote_name = svc.get("remote_name", "")
+        remote_path = svc.get("remote_path", "/")
+        local_path = svc.get("local_path", "")
+        if not remote_name or not local_path:
+            return None
+
+        exclusions = svc.get("exclusions", [])
+        remote = f"{remote_name}:{remote_path}"
+        cmd = _rclone_base_args(self._config) + [
+            "check",
+            remote,
+            local_path,
+            "--combined", "-",
+        ]
+        for exc in exclusions:
+            cmd += ["--exclude", exc]
+
+        _STATUS_MAP = {
+            "=": "synced",
+            "*": "diff",
+            "+": "remote_only",
+            "-": "local_only",
+        }
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=180,
+            )
+            # rclone check exits with code 1 when differences exist — that is
+            # expected and still produces valid combined output in stdout.
+            output = result.stdout or ""
+            items: List[Dict] = []
+            for line in output.splitlines():
+                line = line.rstrip("\r\n")
+                # Combined format: "<char> <path>"
+                if len(line) >= 3 and line[1] == " ":
+                    char = line[0]
+                    rel = line[2:].strip().replace("\\", "/")
+                    if rel:
+                        items.append({"rel": rel, "status": _STATUS_MAP.get(char, "unknown")})
+            return items
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
@@ -870,9 +1382,22 @@ class RcloneManager:
             if svc is None or not svc.get("sync_enabled", True):
                 break
 
-            self._set_status(service_name, "Sincronizando…")
-            success = self._do_bisync(svc)
+            # Distinguish first-time full sync from ongoing incremental updates.
+            # After the first successful sync the service config has
+            # "first_sync_done": True (persisted so the distinction survives
+            # restarts).  On first run we show "Sincronizando…"; on all
+            # subsequent runs we show "Actualizando cambios…" and pass
+            # use_resync=True to _do_bisync so rclone re-establishes the
+            # baseline from the current state of both directories.
+            is_first = not svc.get("first_sync_done", False)
+            status_in_progress = "Sincronizando…" if is_first else "Actualizando cambios…"
+            self._set_status(service_name, status_in_progress)
+            success = self._do_bisync(svc, use_resync=not is_first)
             if success:
+                if is_first:
+                    # Persist so the next cycle (and future sessions) use the
+                    # "Actualizando cambios…" path from the start.
+                    self._config.update_service(service_name, {"first_sync_done": True})
                 self._set_status(service_name, "Actualizado")
             else:
                 self._set_status(service_name, "Error en sincronización")
@@ -884,22 +1409,71 @@ class RcloneManager:
 
         self._set_status(service_name, "Detenido")
 
-    def _do_bisync(self, svc: Dict) -> bool:
+    def _do_bisync(self, svc: Dict, use_resync: bool = False) -> bool:
         """
         Run rclone bisync for a single service dictionary.
 
-        Attempts bisync first; if it fails, retries with --resync.
+        Performs a disk-space check before attempting bisync: if the local
+        filesystem has less than :data:`_MIN_FREE_SPACE_BYTES` (10 GiB) free,
+        the sync is aborted with a clear error message.
+
+        When *use_resync* is ``True`` the ``--resync`` flag is added to the
+        initial command.  This is used from the second sync cycle onward, after
+        the first full sync has completed successfully, so that rclone
+        re-establishes the baseline from the current state of both directories
+        rather than comparing against potentially stale listing files.
+
+        On the very first bisync run (or after an abnormal termination that
+        deleted the listing files), rclone may fail with "cannot find prior
+        Path1 or Path2 listings".  This condition is detected automatically
+        and a ``--resync`` retry is performed automatically — but only when
+        *use_resync* is ``False`` (i.e. the initial command did not already
+        include ``--resync``).
+
         Returns True on success.
         """
         remote = f"{svc['remote_name']}:{svc.get('remote_path', '/')}"
         local = svc.get("local_path", "")
         name = svc.get("name", "?")
 
+        # --- Disk space guard -------------------------------------------
+        # Abort early if the local filesystem is critically full.  This
+        # prevents bisync from filling the disk and corrupting the state.
+        free_bytes = _check_local_free_space(local)
+        if free_bytes < _MIN_FREE_SPACE_BYTES:
+            free_gb = free_bytes / (1024 ** 3)
+            self._emit_error(
+                name,
+                f"⛔ Sincronización cancelada: espacio libre insuficiente en el disco "
+                f"({free_gb:.1f} GiB disponibles; se requieren al menos "
+                f"{_MIN_FREE_SPACE_GIB} GiB). "
+                "Libera espacio y vuelve a intentarlo.",
+            )
+            return False
+
         # Clear any stale lock / partial-listing files left by a previous
         # interrupted bisync before attempting to run again.
-        _clear_bisync_stale_files(
+        workdir = _bisync_workdir_for_service(svc)
+        workdir.mkdir(parents=True, exist_ok=True)
+        # Persist the workdir to config if it was not already stored.
+        # This makes the path stable across runs and visible to the user
+        # without requiring a bisync run to inspect which folder is in use.
+        if not svc.get("bisync_workdir"):
+            self._config.update_service(name, {"bisync_workdir": str(workdir)})
+            svc["bisync_workdir"] = str(workdir)
+        # One-time migration: move any state files that a pre-workdir
+        # installation left in the shared bisync cache directory into this
+        # service's own workdir so the first run after the upgrade does not
+        # need a full --resync.
+        _migrate_bisync_state(
             svc.get("remote_name", ""),
             _bisync_cache_dir(),
+            workdir,
+            lambda msg: self._emit_error(name, msg),
+        )
+        _clear_bisync_stale_files(
+            svc.get("remote_name", ""),
+            workdir,
             lambda msg: self._emit_error(name, msg),
         )
 
@@ -956,20 +1530,30 @@ class RcloneManager:
         base = _rclone_base_args(self._config)
         Path(local).mkdir(parents=True, exist_ok=True)
 
-        # First attempt: standard bisync
-        cmd = base + ["bisync", remote, local] + perf_args + exclude_args
+        # First attempt: standard bisync, or bisync --resync for subsequent runs
+        # --workdir isolates this service's lock files and state snapshots from
+        # all other services so concurrent bisync runs don't block each other.
+        cmd = base + ["bisync", remote, local, "--workdir", str(workdir)] + perf_args + exclude_args
+        if use_resync:
+            # Include --resync so rclone re-establishes the baseline instead of
+            # comparing against prior listing files.
+            cmd += ["--resync"]
+            if _rclone_supports_resync_mode(self._config):
+                cmd += ["--resync-mode", resync_mode]
         # Log the exact command being run so it appears in the error log as reference
         self._emit_error(name, "[CMD] " + shlex.join(cmd))
         success = self._run_rclone(cmd, name, svc)
 
         # Second attempt: bisync --resync if first attempt failed.
-        # Skip the retry if a stop was explicitly requested (the process was
+        # Skip the retry entirely when the initial command already included
+        # --resync: retrying with the same flag would be pointless.
+        # Also skip the retry if a stop was explicitly requested (the process was
         # terminated on purpose, not due to a real error).
         # Clean stale lock files again before retrying: the first attempt may
         # have created a lock that it never released (e.g. if the process was
         # killed), which would cause the retry to fail immediately with
         # "prior lock file found".
-        if not success:
+        if not success and not use_resync:
             stop_ev = self._stop_events.get(name)
             if stop_ev and stop_ev.is_set():
                 # Service is being stopped; don't retry or log spurious errors
@@ -982,9 +1566,31 @@ class RcloneManager:
             if name in self._config_error_services:
                 self._config_error_services.discard(name)
                 return False
+            # If the failure was caused by a network connectivity error ("network
+            # is unreachable"), skip the --resync retry: the remote server is
+            # unreachable regardless of the sync state, so the retry would also
+            # fail.  The single summary message was already emitted by
+            # _run_rclone; just clear the flag and wait for the next cycle.
+            if name in self._network_error_services:
+                self._network_error_services.discard(name)
+                return False
+            # If the failure was caused by missing bisync state files ("cannot
+            # find prior Path1 or Path2 listings"), emit an informational message
+            # explaining what happened, then fall through to the --resync retry.
+            # This is not an unexpected error — it is the expected first-run or
+            # post-crash condition; --resync initialises the state safely.
+            is_no_prior = name in self._no_prior_listing_services
+            if is_no_prior:
+                self._no_prior_listing_services.discard(name)
+                self._emit_error(
+                    name,
+                    "ℹ️ No se encontraron archivos de estado previos de bisync "
+                    "(primera ejecución o estado perdido). "
+                    "Iniciando sincronización inicial con --resync…",
+                )
             _clear_bisync_stale_files(
                 svc.get("remote_name", ""),
-                _bisync_cache_dir(),
+                workdir,
                 lambda msg: self._emit_error(name, msg),
             )
             cmd_resync = cmd + ["--resync"]
@@ -1049,6 +1655,35 @@ class RcloneManager:
                     )
                     # Notify the UI so it can surface an in-tab "fix" action.
                     self._emit_drive_id_error(service_name)
+                # Detect network-unreachable errors.  These generate one ERROR
+                # line per listed folder, which can flood the log with dozens of
+                # identical "couldn't list files: … network is unreachable"
+                # messages.  On the first occurrence we record the condition and
+                # emit a single clear human-readable summary.  Subsequent lines
+                # that contain the same phrase are suppressed entirely so the
+                # log stays readable.  The early-return below also skips
+                # forwarding the line through the general keyword scan.
+                if _NETWORK_UNREACHABLE_PHRASE in line:
+                    if service_name not in self._network_error_services:
+                        self._network_error_services.add(service_name)
+                        self._emit_error(
+                            service_name,
+                            "🌐 Red no disponible: el host no puede alcanzar el "
+                            "servidor remoto ('network is unreachable'). "
+                            "La sincronización se reintentará automáticamente "
+                            "en el próximo ciclo. "
+                            "Comprueba la conexión a Internet o la configuración "
+                            "de IPv6 del sistema.",
+                        )
+                    # Skip the rest of the per-line processing for this line so
+                    # we don't emit it again through the general error scanner.
+                    continue
+                # Detect missing bisync state files ("no prior listings").  This
+                # is the normal first-run or post-crash condition.  Flag the
+                # service so _do_bisync knows to treat the retry as an expected
+                # --resync initialisation, not an unexpected failure.
+                if _BISYNC_NO_PRIOR_PHRASE in line:
+                    self._no_prior_listing_services.add(service_name)
                 # Forward any rclone error / fatal output to the error log
                 if any(kw in line for kw in _RCLONE_ERROR_KEYWORDS):
                     self._emit_error(service_name, line)
