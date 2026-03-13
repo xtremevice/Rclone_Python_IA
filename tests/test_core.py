@@ -3980,5 +3980,70 @@ class TestFormatMtime(unittest.TestCase):
         self.assertIn("/", result)
 
 
+class TestTreeScanTimingLabels(unittest.TestCase):
+    """Tests for the 'last scan started' and 'next scan' label formatting logic.
+
+    These tests exercise the pure-datetime arithmetic used by
+    _start_tree_check() and _schedule_tree_refresh() without importing tkinter.
+
+    The label prefixes and time format must stay in sync with the module-level
+    constants in main_window.py:
+      _SCAN_TIME_FMT      = "%H:%M:%S"
+      _SCAN_STARTED_PREFIX = "🕐 Inicio: "
+      _SCAN_NEXT_PREFIX    = "⏭ Próxima: "
+    """
+
+    # Keep in sync with main_window._SCAN_TIME_FMT
+    _TIME_FMT = "%H:%M:%S"
+    # Keep in sync with main_window._SCAN_STARTED_PREFIX
+    _STARTED_PREFIX = "🕐 Inicio: "
+    # Keep in sync with main_window._SCAN_NEXT_PREFIX
+    _NEXT_PREFIX = "⏭ Próxima: "
+
+    def _format_started(self, ts: float) -> str:
+        """Inline replica of _start_tree_check()'s started-label logic."""
+        from datetime import datetime, timezone
+        return self._STARTED_PREFIX + datetime.fromtimestamp(ts, tz=timezone.utc).astimezone().strftime(self._TIME_FMT)
+
+    def _format_next(self, ts: float, interval_secs: int) -> str:
+        """Inline replica of _schedule_tree_refresh()'s next-label logic."""
+        from datetime import datetime, timedelta, timezone
+        next_dt = datetime.fromtimestamp(ts, tz=timezone.utc).astimezone() + timedelta(seconds=interval_secs)
+        return self._NEXT_PREFIX + next_dt.strftime(self._TIME_FMT)
+
+    def test_started_label_prefix(self):
+        """Scan-started label must begin with the configured prefix."""
+        label = self._format_started(1700000000.0)
+        self.assertTrue(label.startswith(self._STARTED_PREFIX.rstrip()))
+
+    def test_started_label_contains_colon(self):
+        """Time part of started label must contain colons (HH:MM:SS)."""
+        label = self._format_started(1700000000.0)
+        # The time portion after the prefix must have at least two colons
+        time_part = label[len(self._STARTED_PREFIX):]
+        self.assertEqual(time_part.count(":"), 2)
+
+    def test_next_label_prefix(self):
+        """Next-scan label must begin with the configured prefix."""
+        label = self._format_next(1700000000.0, 60)
+        self.assertTrue(label.startswith(self._NEXT_PREFIX.rstrip()))
+
+    def test_next_label_offset(self):
+        """Next-scan time must be exactly interval_secs ahead of started time."""
+        from datetime import datetime, timedelta, timezone
+        ts = 1700000000.0
+        interval = 120
+        started = datetime.fromtimestamp(ts, tz=timezone.utc).astimezone()
+        expected_next = (started + timedelta(seconds=interval)).strftime(self._TIME_FMT)
+        label = self._format_next(ts, interval)
+        self.assertIn(expected_next, label)
+
+    def test_next_label_time_contains_colons(self):
+        """Time part of next label must contain colons (HH:MM:SS)."""
+        label = self._format_next(1700000000.0, 300)
+        time_part = label[len(self._NEXT_PREFIX):]
+        self.assertEqual(time_part.count(":"), 2)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

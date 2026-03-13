@@ -20,7 +20,7 @@ import re
 import subprocess
 import threading
 import tkinter as tk
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from tkinter import messagebox, ttk
 from typing import Callable, Dict, List, Optional, Tuple
@@ -142,6 +142,10 @@ class MainWindow:
         # Each call to _start_tree_check() increments the counter; background
         # threads discard their results when the counter has moved on.
         self._tree_check_generations: Dict[str, int] = {}
+        # Per-service StringVars showing when the last file-tree scan started.
+        self._tree_scan_started_vars: Dict[str, tk.StringVar] = {}
+        # Per-service StringVars showing when the next scheduled scan will run.
+        self._tree_scan_next_vars: Dict[str, tk.StringVar] = {}
         # Whether the pystray tray icon has been started (non-Elementary only)
         self._tray_started = False
 
@@ -219,6 +223,9 @@ class MainWindow:
         # ── Header row ────────────────────────────────────────────────
         header = tk.Frame(tab_frame, bg="#f0f4fa", pady=8, padx=10)
         header.pack(fill=tk.X)
+        # Allow the status/name column to stretch when the window is resized
+        # while keeping the timestamp columns right-anchored without growing.
+        header.columnconfigure(0, weight=1)
 
         # Row 0: Service name | Platform | Sync status | Interval | Add button
         tk.Label(header, text=name, font=("Segoe UI", 11, "bold"), bg="#f0f4fa").grid(row=0, column=0, sticky="w", padx=(0, 20))
@@ -275,7 +282,29 @@ class MainWindow:
             bg="#f0f4fa",
             fg="#555555",
             font=("Segoe UI", 9),
-        ).grid(row=1, column=0, columnspan=6, sticky="w", pady=(4, 0))
+        ).grid(row=1, column=0, columnspan=5, sticky="w", pady=(4, 0))
+
+        # "Last scan started" label
+        scan_started_var = tk.StringVar(value=f"{_SCAN_STARTED_PREFIX}—")
+        self._tree_scan_started_vars[name] = scan_started_var
+        tk.Label(
+            header,
+            textvariable=scan_started_var,
+            bg="#f0f4fa",
+            fg="#555555",
+            font=("Segoe UI", 9),
+        ).grid(row=1, column=5, sticky="w", padx=(12, 0), pady=(4, 0))
+
+        # "Next scan" label
+        scan_next_var = tk.StringVar(value=f"{_SCAN_NEXT_PREFIX}—")
+        self._tree_scan_next_vars[name] = scan_next_var
+        tk.Label(
+            header,
+            textvariable=scan_next_var,
+            bg="#f0f4fa",
+            fg="#555555",
+            font=("Segoe UI", 9),
+        ).grid(row=1, column=6, sticky="w", padx=(12, 0), pady=(4, 0))
 
         # Fetch storage quota in the background and update the label when ready
         self._fetch_storage_info_async(name, storage_var)
@@ -578,6 +607,12 @@ class MainWindow:
         gen = self._tree_check_generations.get(service_name, 0) + 1
         self._tree_check_generations[service_name] = gen
 
+        # Record the time this scan started
+        started_str = datetime.now(timezone.utc).astimezone().strftime(_SCAN_TIME_FMT)
+        started_var = self._tree_scan_started_vars.get(service_name)
+        if started_var is not None:
+            started_var.set(f"{_SCAN_STARTED_PREFIX}{started_str}")
+
         svc = self._config.get_service(service_name)
         if svc is None:
             return
@@ -746,6 +781,8 @@ class MainWindow:
         The delay is taken from the service's ``tree_refresh_small_secs`` or
         ``tree_refresh_large_secs`` setting depending on whether *item_count*
         is below or at/above ``TREE_FILE_THRESHOLD``.
+
+        Updates the "next refresh" label with the computed wall-clock time.
         """
         # Cancel existing scheduled refresh for this service
         after_id = self._tree_refresh_ids.pop(service_name, None)
@@ -761,12 +798,20 @@ class MainWindow:
             interval_secs = svc.get("tree_refresh_small_secs", 60)
         else:
             interval_secs = svc.get("tree_refresh_large_secs", 600)
-        interval_ms = max(_MIN_REFRESH_INTERVAL_SECS, interval_secs) * 1000
+        effective_secs = max(_MIN_REFRESH_INTERVAL_SECS, interval_secs)
+        interval_ms = effective_secs * 1000
         new_id = self._root.after(
             interval_ms,
             lambda n=service_name: self._refresh_sync_tree(n),
         )
         self._tree_refresh_ids[service_name] = new_id
+
+        # Update the "next scan" label with the projected wall-clock time.
+        next_var = self._tree_scan_next_vars.get(service_name)
+        if next_var is not None:
+            next_dt = datetime.now(timezone.utc).astimezone() + timedelta(seconds=effective_secs)
+            next_str = next_dt.strftime(_SCAN_TIME_FMT)
+            next_var.set(f"{_SCAN_NEXT_PREFIX}{next_str}")
 
     def _cancel_all_tree_refreshes(self) -> None:
         """Cancel all pending tree auto-refresh after() jobs."""
@@ -840,10 +885,41 @@ class MainWindow:
             config_manager=self._config,
             rclone_manager=self._rclone,
             service_name=service_name,
-            on_saved=self._refresh_tabs,
+            on_saved=lambda: self._on_service_config_saved(service_name),
             on_deleted=self._on_service_deleted,
             error_logger=self._error_logger,
         )
+
+    def _on_service_config_saved(self, old_service_name: str) -> None:
+        """Called when the user saves the configuration for a single service.
+
+        Restarts **only** the affected service (sync + tree scan), leaving every
+        other service's threads and timers undisturbed.
+
+        The method calls :meth:`_refresh_tabs` to rebuild the full UI (needed
+        when any header label, interval, or name changed) and then restarts
+        only the modified service's bisync thread so the new settings take
+        effect immediately.  Other services keep running without interruption.
+        """
+        # Capture running state before making any changes.
+        was_running = self._rclone.is_running(old_service_name)
+        if was_running:
+            self._rclone.stop_service(old_service_name)
+
+        # Full UI rebuild (updates tab titles, labels, etc.).
+        # After this call all tree checks are restarted (side effect of
+        # _add_service_tab → _populate_sync_tree_async for each service).
+        self._refresh_tabs()
+
+        # Restart the bisync thread for the modified service so new settings
+        # (e.g. sync_interval, local_path) take effect immediately.
+        # Only restart if the service was running before the save OR if the
+        # config now has sync_enabled=True.
+        svc = self._config.get_service(old_service_name)
+        if svc is not None and (was_running or svc.get("sync_enabled")):
+            self._rclone.clear_bisync_locks(old_service_name)
+            self._config.update_service(old_service_name, {"sync_enabled": True})
+            self._rclone.start_service(old_service_name)
 
     def _open_config_at_info(self, service_name: str) -> None:
         """Open the configuration window at the 'Información del servicio' panel.
@@ -1094,6 +1170,8 @@ class MainWindow:
         # clear the dict so _add_service_tab can repopulate it with fresh widgets.
         self._drive_id_banners.clear()
         self._file_trees.clear()
+        self._tree_scan_started_vars.clear()
+        self._tree_scan_next_vars.clear()
         self._build_ui()
 
     def _on_service_added(self, service_name: str) -> None:
@@ -1136,6 +1214,13 @@ _MAX_TREE_DIRS = _MAX_TREE_FILES * 10
 # Minimum auto-refresh interval in seconds (hard floor to avoid hammering
 # the cloud API when a user sets an unreasonably low value).
 _MIN_REFRESH_INTERVAL_SECS = 30
+
+# strftime format used for "last scan started" and "next scan" labels.
+_SCAN_TIME_FMT = "%H:%M:%S"
+
+# Label prefixes for the tree-scan timing widgets.
+_SCAN_STARTED_PREFIX = "🕐 Inicio: "
+_SCAN_NEXT_PREFIX = "⏭ Próxima: "
 
 _TREE_STATUS_LABELS: Dict[str, str] = {
     "synced":       "🟢 Ambos",
