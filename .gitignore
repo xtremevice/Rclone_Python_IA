@@ -16,8 +16,10 @@ ENV/
 env.bak/
 venv.bak/
 
-# PyInstaller build artifacts
-build/
+# PyInstaller build artifacts (work directories and temp files only).
+# Source files (scripts, spec, hooks) in build/ remain tracked.
+build/work_*/
+build/__pycache__/
 dist/
 dist_linux/
 dist_mac/
