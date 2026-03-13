@@ -34,7 +34,7 @@ from src.config.config_manager import (
 from src.gui.tray_icon import TrayIcon
 from src.gui.elementary_indicator import ElementaryIndicator, is_elementary_os
 from src.gui.error_logger import ErrorLogger
-from src.rclone.rclone_manager import RcloneManager
+from src.rclone.rclone_manager import RcloneManager, _build_mtime_comparison, _scan_local_mtimes
 
 # Status string emitted by RcloneManager when no sync is running
 _STATUS_STOPPED = "Detenido"
@@ -138,6 +138,10 @@ class MainWindow:
         self._file_trees: Dict[str, ttk.Treeview] = {}
         # Per-service tkinter after() IDs for the scheduled sync-tree auto-refresh
         self._tree_refresh_ids: Dict[str, Optional[str]] = {}
+        # Generation counter per service used to cancel stale background checks.
+        # Each call to _start_tree_check() increments the counter; background
+        # threads discard their results when the counter has moved on.
+        self._tree_check_generations: Dict[str, int] = {}
         # Whether the pystray tray icon has been started (non-Elementary only)
         self._tray_started = False
 
@@ -368,16 +372,20 @@ class MainWindow:
 
         sync_tree = ttk.Treeview(
             tree_outer,
-            columns=("status",),
-            displaycolumns=("status",),
+            columns=("status", "local_mtime", "remote_mtime"),
+            displaycolumns=("status", "local_mtime", "remote_mtime"),
             yscrollcommand=sb_tree_y.set,
             xscrollcommand=sb_tree_x.set,
             selectmode="browse",
         )
         sync_tree.heading("#0", text="Archivo / Carpeta", anchor="w")
         sync_tree.heading("status", text="Estado", anchor="center")
+        sync_tree.heading("local_mtime", text="Mod. local", anchor="center")
+        sync_tree.heading("remote_mtime", text="Mod. remota", anchor="center")
         sync_tree.column("#0", stretch=True, minwidth=120)
         sync_tree.column("status", width=100, anchor="center", stretch=False)
+        sync_tree.column("local_mtime", width=110, anchor="center", stretch=False)
+        sync_tree.column("remote_mtime", width=110, anchor="center", stretch=False)
         sync_tree.tag_configure("synced",      foreground=_TREE_COLOR_SYNCED)
         sync_tree.tag_configure("pending",     foreground=_TREE_COLOR_DIFF)
         sync_tree.tag_configure("diff",        foreground=_TREE_COLOR_DIFF)
@@ -503,12 +511,12 @@ class MainWindow:
                 notice = f"🔄 Actualizando… (datos del {saved_at})"
                 try:
                     tree.insert("", "end", iid="__loading__",
-                                text=notice, values=("",))
+                                text=notice, values=("", "", ""))
                 except tk.TclError:
                     pass
             else:
                 tree.insert("", "end", iid="__loading__",
-                            text="🔄 Actualizando…", values=("",))
+                            text="🔄 Actualizando…", values=("", "", ""))
         except tk.TclError:
             pass
         self._start_tree_check(service_name)
@@ -539,23 +547,139 @@ class MainWindow:
             if tree.exists("__loading__"):
                 tree.delete("__loading__")
             tree.insert("", "end", iid="__loading__",
-                        text="🔄 Actualizando…", values=("",))
+                        text="🔄 Actualizando…", values=("", "", ""))
         except tk.TclError:
             pass
         self._start_tree_check(service_name)
 
     def _start_tree_check(self, service_name: str) -> None:
-        """Launch a daemon thread to run the rclone check and update the tree."""
-        def _worker() -> None:
-            svc = self._config.get_service(service_name)
-            items = self._build_tree_items_from_check(service_name, svc)
-            self._root.after(0, lambda: self._on_tree_check_done(service_name, items))
+        """Launch 3 daemon threads to scan local and remote, then merge results.
+
+        **Thread model**:
+
+        * **Thread 1 – local scan**: walks the local filesystem using
+          :func:`_scan_local_mtimes` (pure ``os.stat``, very fast).  Signals
+          ``local_done`` when finished.
+        * **Thread 2 – remote scan**: fetches remote file metadata via
+          ``rclone lsjson`` (:meth:`RcloneManager.list_remote_mtimes`).
+          Signals ``remote_done`` when finished (even on failure, setting the
+          result to ``None``).
+        * **Thread 3 – merger**: waits for the local scan first (fast), then
+          shows a partial tree of local-only files immediately so the user
+          always sees data.  When the remote scan also completes it performs
+          the final merge and posts the complete results to the UI.
+
+        **Cancellation**: every call increments
+        :attr:`_tree_check_generations` for the service.  All three threads
+        capture the generation number at start and discard their results if
+        the counter has changed (i.e. a newer refresh was requested while
+        they were running).
+        """
+        gen = self._tree_check_generations.get(service_name, 0) + 1
+        self._tree_check_generations[service_name] = gen
+
+        svc = self._config.get_service(service_name)
+        if svc is None:
+            return
+        local_path = svc.get("local_path", "")
+
+        # Shared state between the three threads
+        local_done = threading.Event()
+        remote_done = threading.Event()
+        shared: Dict = {
+            "local_mtimes": {},    # filled by Thread 1
+            "remote_mtimes": None, # filled by Thread 2 (None means failure)
+        }
+
+        def _local_worker() -> None:
+            mtimes = _scan_local_mtimes(local_path) if local_path else {}
+            shared["local_mtimes"] = mtimes
+            local_done.set()
+
+        def _remote_worker() -> None:
+            mtimes = self._rclone.list_remote_mtimes(service_name)
+            shared["remote_mtimes"] = mtimes
+            remote_done.set()
+
+        def _merger_worker() -> None:
+            # Wait for the fast local scan first
+            local_done.wait()
+            if self._tree_check_generations.get(service_name) != gen:
+                return  # cancelled
+
+            local_mtimes: Dict[str, float] = shared["local_mtimes"]
+
+            # Build partial tree from local data only and show it immediately,
+            # so the user sees the folder structure while waiting for the remote.
+            partial_comparison = _build_mtime_comparison(local_mtimes, {})
+            partial_items = _merge_local_and_comparison(local_path, partial_comparison)
+            self._root.after(
+                0,
+                lambda: self._on_tree_partial_update(service_name, gen, partial_items),
+            )
+
+            # Now wait for the slower remote scan
+            remote_done.wait()
+            if self._tree_check_generations.get(service_name) != gen:
+                return  # cancelled
+
+            remote_mtimes = shared["remote_mtimes"]
+            if remote_mtimes is not None:
+                # Full merge: local + remote
+                full_comparison = _build_mtime_comparison(local_mtimes, remote_mtimes)
+                final_items = _merge_local_and_comparison(local_path, full_comparison)
+            else:
+                # Remote unavailable: fall back to sync_history for status hints
+                sync_history = svc.get("sync_history", [])
+                synced_set = {
+                    e.get("file", "") for e in sync_history if e.get("synced") is True
+                }
+                pending_set = {
+                    e.get("file", "") for e in sync_history if e.get("synced") is False
+                }
+                final_items = _scan_local_tree(local_path, synced_set, pending_set)
+
+            self._root.after(
+                0,
+                lambda: self._on_tree_check_done(service_name, final_items),
+            )
 
         threading.Thread(
-            target=_worker,
-            daemon=True,
-            name=f"check-{service_name}",
+            target=_local_worker, daemon=True, name=f"local-{service_name}"
         ).start()
+        threading.Thread(
+            target=_remote_worker, daemon=True, name=f"remote-{service_name}"
+        ).start()
+        threading.Thread(
+            target=_merger_worker, daemon=True, name=f"merge-{service_name}"
+        ).start()
+
+    def _on_tree_partial_update(
+        self, service_name: str, gen: int, items: List[Dict]
+    ) -> None:
+        """Show partial (local-only) scan results while the remote scan runs.
+
+        Called on the main thread.  Fills the tree with local data immediately
+        and replaces the generic loading notice with a more specific message
+        indicating that the remote is still being scanned.
+        """
+        if self._tree_check_generations.get(service_name) != gen:
+            return  # a newer refresh has started — discard
+        tree = self._file_trees.get(service_name)
+        if tree is None:
+            return
+        _fill_sync_tree(tree, items)
+        # Replace the loading notice with a more descriptive one
+        try:
+            if tree.exists("__loading__"):
+                tree.delete("__loading__")
+            tree.insert(
+                "", "end", iid="__loading__",
+                text="🌐 Consultando versión remota…",
+                values=("", "", ""),
+            )
+        except tk.TclError:
+            pass
 
     def _build_tree_items_from_check(
         self, service_name: str, svc: Optional[Dict]
@@ -1105,7 +1229,9 @@ def _merge_local_and_comparison(
        with status ``"local_only"`` (present locally but not confirmed on the
        remote yet).
     2. Apply statuses from *comparison_items* (``synced``, ``diff``,
-       ``remote_only``, …) to the matching local file nodes.
+       ``remote_only``, …) to the matching local file nodes.  ``local_mtime``
+       and ``remote_mtime`` fields are propagated from *comparison_items* when
+       present so the Treeview mtime columns can be filled.
     3. Any ``remote_only`` files reported by the comparison that do not exist
        locally are appended (with their synthesised parent directories) so the
        tree also reflects content that lives only on the remote.
@@ -1117,9 +1243,10 @@ def _merge_local_and_comparison(
     local_path:
         Absolute path to the local sync folder.
     comparison_items:
-        List of ``{"rel": str, "status": str}`` dicts returned by
+        List of ``{"rel": str, "status": str, ...}`` dicts returned by
         :meth:`RcloneManager.check_sync_status_mtime` or
-        :meth:`RcloneManager.check_sync_status`.
+        :meth:`RcloneManager.check_sync_status`.  May optionally contain
+        ``local_mtime`` and ``remote_mtime`` float fields.
 
     Returns
     -------
@@ -1127,12 +1254,12 @@ def _merge_local_and_comparison(
         Flat, depth-first-ordered list of node dicts ready for
         :func:`_fill_sync_tree`.  Parents always precede their children.
     """
-    # Build comparison lookup: rel_path (normalised) → status
-    comp_map: Dict[str, str] = {}
+    # Build comparison lookup: rel_path (normalised) → full item dict
+    comp_map: Dict[str, Dict] = {}
     for item in comparison_items:
         rel = item.get("rel", "").strip("/").replace("\\", "/")
         if rel:
-            comp_map[rel] = item.get("status", "unknown")
+            comp_map[rel] = item
 
     # ── Stage 1: scan local filesystem (complete baseline) ──────────────────
     # _scan_local_tree walks the entire local directory regardless of network
@@ -1147,9 +1274,15 @@ def _merge_local_and_comparison(
             continue
         rel = item["rel"]
         local_file_rels.add(rel)
-        if rel in comp_map:
+        comp_item = comp_map.get(rel)
+        if comp_item is not None:
             # Comparison confirmed this file exists on one or both sides.
-            item["status"] = comp_map[rel]
+            item["status"] = comp_item.get("status", "unknown")
+            # Carry through mtime values so the columns can be populated
+            if "local_mtime" in comp_item:
+                item["local_mtime"] = comp_item["local_mtime"]
+            if "remote_mtime" in comp_item:
+                item["remote_mtime"] = comp_item["remote_mtime"]
         else:
             # File is present locally but the remote comparison did not mention
             # it → it only exists on the local disk.
@@ -1160,11 +1293,13 @@ def _merge_local_and_comparison(
     # but were NOT found by the local scan (i.e. they are genuinely absent
     # from the local folder).  Add them to the result so the tree shows the
     # full picture.
-    remote_only_items = [
-        {"rel": rel, "status": "remote_only"}
-        for rel, st in comp_map.items()
-        if st == "remote_only" and rel not in local_file_rels
-    ]
+    remote_only_items = []
+    for rel, ci in comp_map.items():
+        if ci.get("status") == "remote_only" and rel not in local_file_rels:
+            ro_item: Dict = {"rel": rel, "status": "remote_only"}
+            if "remote_mtime" in ci:
+                ro_item["remote_mtime"] = ci["remote_mtime"]
+            remote_only_items.append(ro_item)
 
     if remote_only_items:
         # _build_check_tree synthesises parent directory nodes in depth-first
@@ -1235,13 +1370,19 @@ def _build_check_tree(check_items: List[Dict]) -> List[Dict]:
         # File node (shown up to _MAX_TREE_FILES)
         if file_count < _MAX_TREE_FILES:
             parent_rel = "/".join(parts[:-1])
-            result.append({
+            node: Dict = {
                 "rel": rel,
                 "parent": parent_rel,
                 "name": parts[-1],
                 "is_dir": False,
                 "status": item.get("status", "unknown"),
-            })
+            }
+            # Carry through mtime fields when present
+            if "local_mtime" in item:
+                node["local_mtime"] = item["local_mtime"]
+            if "remote_mtime" in item:
+                node["remote_mtime"] = item["remote_mtime"]
+            result.append(node)
             file_count += 1
 
     # Colour each synthesised directory node based on its descendant files
@@ -1408,12 +1549,31 @@ def _load_tree_cache(service_name: str) -> Tuple[Optional[List[Dict]], Optional[
         return None, None
 
 
+def _format_mtime(ts: Optional[float]) -> str:
+    """Format a UTC Unix timestamp as a local-time string ``"dd/mm HH:MM"``.
+
+    Returns an empty string when *ts* is ``None`` or the conversion fails
+    (e.g. out-of-range timestamps on some platforms).
+    """
+    if ts is None:
+        return ""
+    try:
+        dt = datetime.fromtimestamp(ts)
+        return dt.strftime("%d/%m %H:%M")
+    except (OSError, OverflowError, ValueError):
+        return ""
+
+
 def _fill_sync_tree(tree: ttk.Treeview, items: List[Dict]) -> None:
     """Clear *tree* and insert *items*.
 
     Must be called on the Tkinter main thread.  *items* must be ordered so
     that every parent appears before its children (which ``_scan_local_tree``
     guarantees via its depth-first traversal).
+
+    Each item dict may optionally carry ``local_mtime`` and ``remote_mtime``
+    (UTC Unix timestamps as :class:`float`) which are formatted and shown in
+    the "Mod. local" and "Mod. remota" columns respectively.
     """
     # Remove all existing nodes
     try:
@@ -1434,13 +1594,17 @@ def _fill_sync_tree(tree: ttk.Treeview, items: List[Dict]) -> None:
         # Auto-open top-level directories so the user immediately sees content
         open_node = is_dir and parent == ""
 
+        # Mtime columns: only meaningful for files; directories show nothing
+        local_str  = "" if is_dir else _format_mtime(item.get("local_mtime"))
+        remote_str = "" if is_dir else _format_mtime(item.get("remote_mtime"))
+
         try:
             tree.insert(
                 parent,
                 "end",
                 iid=rel,
                 text=icon + name,
-                values=(label,),
+                values=(label, local_str, remote_str),
                 tags=tags,
                 open=open_node,
             )

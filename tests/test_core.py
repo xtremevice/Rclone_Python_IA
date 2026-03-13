@@ -45,6 +45,7 @@ from src.rclone.rclone_manager import (
     _check_local_free_space,
     _parse_rclone_mtime,
     _scan_local_mtimes,
+    _build_mtime_comparison,
     _MTIME_TOLERANCE_SECS,
     _MICROSECOND_PRECISION,
 )
@@ -3264,11 +3265,16 @@ def _build_check_tree_testable(check_items, max_files, max_dirs):
                 dir_count += 1
         if file_count < max_files:
             parent_rel = "/".join(parts[:-1])
-            result.append({
+            node = {
                 "rel": rel, "parent": parent_rel,
                 "name": parts[-1], "is_dir": False,
                 "status": item.get("status", "unknown"),
-            })
+            }
+            if "local_mtime" in item:
+                node["local_mtime"] = item["local_mtime"]
+            if "remote_mtime" in item:
+                node["remote_mtime"] = item["remote_mtime"]
+            result.append(node)
             file_count += 1
 
     _propagate_dir_status_testable(result)
@@ -3635,7 +3641,7 @@ def _merge_local_and_comparison_testable(local_path, comparison_items,
     for item in comparison_items:
         rel = item.get("rel", "").strip("/").replace("\\", "/")
         if rel:
-            comp_map[rel] = item.get("status", "unknown")
+            comp_map[rel] = item  # store full item dict, not just status
 
     # Stage 1: complete local scan (all files as "unknown" initially)
     result = _do_local_scan(local_path, max_files, max_dirs)
@@ -3647,17 +3653,24 @@ def _merge_local_and_comparison_testable(local_path, comparison_items,
             continue
         rel = item["rel"]
         local_file_rels.add(rel)
-        if rel in comp_map:
-            item["status"] = comp_map[rel]
+        comp_item = comp_map.get(rel)
+        if comp_item is not None:
+            item["status"] = comp_item.get("status", "unknown")
+            if "local_mtime" in comp_item:
+                item["local_mtime"] = comp_item["local_mtime"]
+            if "remote_mtime" in comp_item:
+                item["remote_mtime"] = comp_item["remote_mtime"]
         else:
             item["status"] = "local_only"
 
     # Stage 3: add remote-only files not found locally
-    remote_only_items = [
-        {"rel": rel, "status": "remote_only"}
-        for rel, st in comp_map.items()
-        if st == "remote_only" and rel not in local_file_rels
-    ]
+    remote_only_items = []
+    for rel, ci in comp_map.items():
+        if ci.get("status") == "remote_only" and rel not in local_file_rels:
+            ro_item = {"rel": rel, "status": "remote_only"}
+            if "remote_mtime" in ci:
+                ro_item["remote_mtime"] = ci["remote_mtime"]
+            remote_only_items.append(ro_item)
     if remote_only_items:
         remote_tree = _build_check_tree_testable(remote_only_items, max_files, max_dirs)
         existing_rels = {item["rel"] for item in result}
@@ -3812,6 +3825,159 @@ class TestMergeLocalAndComparison(unittest.TestCase):
         self.assertIn("subdir/file_c.txt", rels)
         # Remote-only file also present
         self.assertIn("only_remote.txt",   rels)
+
+
+# ---------------------------------------------------------------------------
+# _build_mtime_comparison tests
+# ---------------------------------------------------------------------------
+
+class TestBuildMtimeComparison(unittest.TestCase):
+    """Tests for the _build_mtime_comparison module-level helper."""
+
+    def setUp(self):
+        from src.rclone.rclone_manager import _build_mtime_comparison
+        self._fn = _build_mtime_comparison
+
+    def _call(self, local: dict, remote: dict):
+        return self._fn(local, remote)
+
+    def test_synced_when_mtimes_match(self):
+        """Files with matching mtimes (within tolerance) must be 'synced'."""
+        ts = 1700000000.0
+        result = self._call({"a.txt": ts}, {"a.txt": ts})
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["status"], "synced")
+        self.assertEqual(result[0]["local_mtime"], ts)
+        self.assertEqual(result[0]["remote_mtime"], ts)
+
+    def test_diff_when_mtimes_differ(self):
+        """Files with differing mtimes (beyond tolerance) must be 'diff'."""
+        ts_local = 1700000000.0
+        ts_remote = ts_local + 100  # 100 s difference → well above tolerance
+        result = self._call({"b.txt": ts_local}, {"b.txt": ts_remote})
+        self.assertEqual(result[0]["status"], "diff")
+        self.assertEqual(result[0]["local_mtime"], ts_local)
+        self.assertEqual(result[0]["remote_mtime"], ts_remote)
+
+    def test_local_only_when_not_on_remote(self):
+        """Files present only locally must have status 'local_only'."""
+        result = self._call({"c.txt": 1.0}, {})
+        self.assertEqual(result[0]["status"], "local_only")
+        self.assertIsNotNone(result[0]["local_mtime"])
+        self.assertIsNone(result[0]["remote_mtime"])
+
+    def test_remote_only_when_not_on_local(self):
+        """Files present only remotely must have status 'remote_only'."""
+        result = self._call({}, {"d.txt": 2.0})
+        self.assertEqual(result[0]["status"], "remote_only")
+        self.assertIsNone(result[0]["local_mtime"])
+        self.assertIsNotNone(result[0]["remote_mtime"])
+
+    def test_empty_maps_returns_empty_list(self):
+        """Two empty maps must return an empty list."""
+        self.assertEqual(self._call({}, {}), [])
+
+    def test_result_sorted_by_rel(self):
+        """Results must be sorted alphabetically by rel path."""
+        local = {"z.txt": 1.0, "a.txt": 2.0}
+        remote = {}
+        result = self._call(local, remote)
+        rels = [r["rel"] for r in result]
+        self.assertEqual(rels, sorted(rels))
+
+    def test_mtime_tolerance_synced(self):
+        """Files within _MTIME_TOLERANCE_SECS must be considered synced."""
+        from src.rclone.rclone_manager import _MTIME_TOLERANCE_SECS
+        ts = 1700000000.0
+        result = self._call({"f.txt": ts}, {"f.txt": ts + _MTIME_TOLERANCE_SECS - 0.1})
+        self.assertEqual(result[0]["status"], "synced")
+
+    def test_mtime_tolerance_diff(self):
+        """Files just outside _MTIME_TOLERANCE_SECS must be 'diff'."""
+        from src.rclone.rclone_manager import _MTIME_TOLERANCE_SECS
+        ts = 1700000000.0
+        result = self._call({"g.txt": ts}, {"g.txt": ts + _MTIME_TOLERANCE_SECS + 0.1})
+        self.assertEqual(result[0]["status"], "diff")
+
+
+class TestMergeLocalWithMtimes(unittest.TestCase):
+    """Tests that the testable merge replica carries mtime fields into tree items."""
+
+    def setUp(self):
+        self._tmpdir = _tempfile_mod.mkdtemp()
+        (Path(self._tmpdir) / "file.txt").write_text("x")
+
+    def tearDown(self):
+        _shutil_mod.rmtree(self._tmpdir, ignore_errors=True)
+
+    def _merge(self, comp):
+        return _merge_local_and_comparison_testable(self._tmpdir, comp)
+
+    def test_mtime_fields_propagated_to_tree_items(self):
+        """local_mtime and remote_mtime must appear in tree items after merge."""
+        comp = [
+            {
+                "rel": "file.txt",
+                "status": "synced",
+                "local_mtime": 1700000000.0,
+                "remote_mtime": 1700000000.0,
+            }
+        ]
+        items = self._merge(comp)
+        found = next((i for i in items if i["rel"] == "file.txt"), None)
+        self.assertIsNotNone(found)
+        self.assertEqual(found.get("local_mtime"), 1700000000.0)
+        self.assertEqual(found.get("remote_mtime"), 1700000000.0)
+
+    def test_remote_only_mtime_propagated(self):
+        """remote_mtime for remote-only files must survive into tree items."""
+        comp = [
+            {
+                "rel": "only_remote.txt",
+                "status": "remote_only",
+                "remote_mtime": 1600000000.0,
+            }
+        ]
+        items = self._merge(comp)
+        ro = next((i for i in items if i["rel"] == "only_remote.txt"), None)
+        self.assertIsNotNone(ro)
+        self.assertEqual(ro.get("remote_mtime"), 1600000000.0)
+
+    def test_local_only_file_has_no_remote_mtime(self):
+        """Files only on local disk should not have a remote_mtime set."""
+        items = self._merge([])  # empty comparison → everything is local_only
+        found = next((i for i in items if i["rel"] == "file.txt"), None)
+        self.assertIsNotNone(found)
+        self.assertNotIn("remote_mtime", found)
+
+
+class TestFormatMtime(unittest.TestCase):
+    """Tests for the _format_mtime display logic (pure datetime, no tkinter)."""
+
+    @staticmethod
+    def _format_mtime(ts):
+        """Inline replica of main_window._format_mtime."""
+        from datetime import datetime
+        if ts is None:
+            return ""
+        try:
+            dt = datetime.fromtimestamp(ts)
+            return dt.strftime("%d/%m %H:%M")
+        except (OSError, OverflowError, ValueError):
+            return ""
+
+    def test_none_returns_empty_string(self):
+        self.assertEqual(self._format_mtime(None), "")
+
+    def test_valid_timestamp_returns_nonempty_string(self):
+        result = self._format_mtime(1700000000.0)
+        self.assertIsInstance(result, str)
+        self.assertTrue(len(result) > 0)
+
+    def test_format_contains_slash(self):
+        """dd/mm format must contain a '/'."""
+        result = self._format_mtime(1700000000.0)
+        self.assertIn("/", result)
 
 
 if __name__ == "__main__":
