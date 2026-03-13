@@ -70,7 +70,7 @@ class ConfigWindow:
         config_manager: ConfigManager,
         rclone_manager: RcloneManager,
         service_name: str,
-        on_saved: Optional[Callable[[], None]] = None,
+        on_saved: Optional[Callable[..., None]] = None,
         on_deleted: Optional[Callable[[str], None]] = None,
         error_logger: Optional["ErrorLogger"] = None,
         initial_panel: int = 0,
@@ -1552,7 +1552,10 @@ class ConfigWindow:
 
         self._win.destroy()
         if self._on_saved:
-            self._on_saved()
+            # Pass the final (possibly renamed) service name as the first
+            # positional argument so that callers can detect renames and
+            # perform follow-up actions (e.g. rename the DB table).
+            self._on_saved(self._service_name)
 
     # ------------------------------------------------------------------
     # Helpers

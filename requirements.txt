@@ -11,6 +11,10 @@ Pillow>=10.0.0
 PyQt5>=5.15.0
 PyQt5-sip>=12.8.0
 
+# Fernet symmetric encryption used by the per-service file-scan database
+# (src/db/file_scan_db.py).  AES-128-CBC + HMAC-SHA256 at rest.
+cryptography>=41.0.0
+
 # Build tool (produces single-file executables)
 # pyinstaller>=6.0.0
 

@@ -31,6 +31,7 @@ from src.config.config_manager import (
     ConfigManager,
     get_config_dir,
 )
+from src.db.file_scan_db import FileScanDB
 from src.gui.tray_icon import TrayIcon
 from src.gui.elementary_indicator import ElementaryIndicator, is_elementary_os
 from src.gui.error_logger import ErrorLogger
@@ -83,6 +84,10 @@ class MainWindow:
 
         # Application-wide error logger (loads previous session from disk)
         self._error_logger = ErrorLogger()
+
+        # Encrypted SQLite database for per-service file scan metadata.
+        # Created once and shared across all service tree-check threads.
+        self._db = FileScanDB()
 
         # Root Tk window
         self._root = tk.Tk()
@@ -584,25 +589,35 @@ class MainWindow:
     def _start_tree_check(self, service_name: str) -> None:
         """Launch 3 daemon threads to scan local and remote, then merge results.
 
-        **Thread model**:
+        **Thread model** (each service has its own independent set of threads):
 
         * **Thread 1 – local scan**: walks the local filesystem using
-          :func:`_scan_local_mtimes` (pure ``os.stat``, very fast).  Signals
-          ``local_done`` when finished.
+          ``os.stat`` (very fast).  Writes every file's path, size, and mtime
+          to the per-service table in :attr:`_db` via
+          :meth:`~src.db.file_scan_db.FileScanDB.upsert_local_batch`.
+          Signals ``local_done`` when finished.
+
         * **Thread 2 – remote scan**: fetches remote file metadata via
-          ``rclone lsjson`` (:meth:`RcloneManager.list_remote_mtimes`).
-          Signals ``remote_done`` when finished (even on failure, setting the
-          result to ``None``).
-        * **Thread 3 – merger**: waits for the local scan first (fast), then
-          shows a partial tree of local-only files immediately so the user
-          always sees data.  When the remote scan also completes it performs
-          the final merge and posts the complete results to the UI.
+          ``rclone lsjson`` (:meth:`RcloneManager.list_remote_metadata`).
+          Writes path, size, and mtime to the DB via
+          :meth:`~src.db.file_scan_db.FileScanDB.upsert_remote_batch`.
+          Signals ``remote_done`` when finished (even on failure).
+
+        * **Thread 3 – merger**: waits for Thread 1 first (fast), reads the
+          DB and shows a partial tree immediately.  After Thread 2 completes
+          it calls :meth:`~src.db.file_scan_db.FileScanDB.update_statuses`
+          to persist per-file sync status, then reads the DB again to build
+          the final tree.
 
         **Cancellation**: every call increments
         :attr:`_tree_check_generations` for the service.  All three threads
         capture the generation number at start and discard their results if
         the counter has changed (i.e. a newer refresh was requested while
         they were running).
+
+        **Database isolation**: each service uses its own table, so Thread 1
+        for service A and Thread 1 for service B write to different tables and
+        never block each other.
         """
         gen = self._tree_check_generations.get(service_name, 0) + 1
         self._tree_check_generations[service_name] = gen
@@ -618,53 +633,97 @@ class MainWindow:
             return
         local_path = svc.get("local_path", "")
 
-        # Shared state between the three threads
+        # Ensure the DB table exists for this service.
+        self._db.ensure_table(service_name)
+
+        # Used to coordinate between the three threads.
         local_done = threading.Event()
         remote_done = threading.Event()
-        shared: Dict = {
-            "local_mtimes": {},    # filled by Thread 1
-            "remote_mtimes": None, # filled by Thread 2 (None means failure)
-        }
+        # Thread 2 sets this to False when the remote scan fails (None/error).
+        remote_available = threading.Event()
 
+        # Capture current generation for use inside closures.
+        scan_gen = gen
+        db = self._db
+        rclone = self._rclone
+
+        # ── Thread 1: local filesystem scan ────────────────────────────────
         def _local_worker() -> None:
-            mtimes = _scan_local_mtimes(local_path) if local_path else {}
-            shared["local_mtimes"] = mtimes
+            scan_ts = datetime.now(timezone.utc).timestamp()
+            local_files: Dict[str, Dict] = {}
+            if local_path and os.path.isdir(local_path):
+                base = Path(local_path)
+                for dirpath, _dirs, filenames in os.walk(local_path):
+                    for name in filenames:
+                        full = os.path.join(dirpath, name)
+                        try:
+                            rel = str(Path(full).relative_to(base)).replace("\\", "/")
+                            st = os.stat(full)
+                            local_files[rel] = {
+                                "mtime": st.st_mtime,
+                                "size": st.st_size,
+                            }
+                        except (OSError, ValueError):
+                            pass
+            db.upsert_local_batch(service_name, scan_ts, local_files)
             local_done.set()
 
+        # ── Thread 2: remote metadata scan ─────────────────────────────────
         def _remote_worker() -> None:
-            mtimes = self._rclone.list_remote_mtimes(service_name)
-            shared["remote_mtimes"] = mtimes
+            scan_ts = datetime.now(timezone.utc).timestamp()
+            remote_files = rclone.list_remote_metadata(service_name)
+            if remote_files is not None:
+                db.upsert_remote_batch(service_name, scan_ts, remote_files)
+                remote_available.set()
             remote_done.set()
 
+        # ── Thread 3: merger — reads DB, computes statuses, updates tree ────
         def _merger_worker() -> None:
-            # Wait for the fast local scan first
+            # Wait for the fast local scan first so we can show partial data.
             local_done.wait()
-            if self._tree_check_generations.get(service_name) != gen:
-                return  # cancelled
+            if self._tree_check_generations.get(service_name) != scan_gen:
+                return  # cancelled by a newer refresh
 
-            local_mtimes: Dict[str, float] = shared["local_mtimes"]
-
-            # Build partial tree from local data only and show it immediately,
-            # so the user sees the folder structure while waiting for the remote.
-            partial_comparison = _build_mtime_comparison(local_mtimes, {})
+            # Build partial tree from local-only DB data and show immediately.
+            records = db.get_all_records(service_name)
+            # Convert DB records into the comparison format expected by
+            # _merge_local_and_comparison (only local data available yet).
+            partial_comparison = [
+                {
+                    "rel": rec["rel"],
+                    "status": "local_only",
+                    "local_mtime": rec["local_mtime"],
+                    "remote_mtime": None,
+                }
+                for rec in records if rec["rel"]
+            ]
             partial_items = _merge_local_and_comparison(local_path, partial_comparison)
             self._root.after(
                 0,
-                lambda: self._on_tree_partial_update(service_name, gen, partial_items),
+                lambda: self._on_tree_partial_update(service_name, scan_gen, partial_items),
             )
 
-            # Now wait for the slower remote scan
+            # Now wait for the remote scan.
             remote_done.wait()
-            if self._tree_check_generations.get(service_name) != gen:
+            if self._tree_check_generations.get(service_name) != scan_gen:
                 return  # cancelled
 
-            remote_mtimes = shared["remote_mtimes"]
-            if remote_mtimes is not None:
-                # Full merge: local + remote
-                full_comparison = _build_mtime_comparison(local_mtimes, remote_mtimes)
+            if remote_available.is_set():
+                # Both sides are available: compute statuses and store in DB.
+                db.update_statuses(service_name, scan_ts=0)
+                records = db.get_all_records(service_name)
+                full_comparison = [
+                    {
+                        "rel": rec["rel"],
+                        "status": rec["status"],
+                        "local_mtime": rec["local_mtime"],
+                        "remote_mtime": rec["remote_mtime"],
+                    }
+                    for rec in records if rec["rel"]
+                ]
                 final_items = _merge_local_and_comparison(local_path, full_comparison)
             else:
-                # Remote unavailable: fall back to sync_history for status hints
+                # Remote unavailable: fall back to sync_history for status hints.
                 sync_history = svc.get("sync_history", [])
                 synced_set = {
                     e.get("file", "") for e in sync_history if e.get("synced") is True
@@ -885,41 +944,53 @@ class MainWindow:
             config_manager=self._config,
             rclone_manager=self._rclone,
             service_name=service_name,
-            on_saved=lambda: self._on_service_config_saved(service_name),
+            on_saved=lambda new_name=service_name: self._on_service_config_saved(
+                service_name, new_name
+            ),
             on_deleted=self._on_service_deleted,
             error_logger=self._error_logger,
         )
 
-    def _on_service_config_saved(self, old_service_name: str) -> None:
+    def _on_service_config_saved(
+        self, old_service_name: str, new_service_name: str
+    ) -> None:
         """Called when the user saves the configuration for a single service.
 
         Restarts **only** the affected service (sync + tree scan), leaving every
-        other service's threads and timers undisturbed.
+        other service's threads and timers undisturbed.  If the service was
+        renamed, the corresponding DB table is renamed before the UI rebuild.
 
-        The method calls :meth:`_refresh_tabs` to rebuild the full UI (needed
-        when any header label, interval, or name changed) and then restarts
-        only the modified service's bisync thread so the new settings take
-        effect immediately.  Other services keep running without interruption.
+        Parameters
+        ----------
+        old_service_name:
+            The service name *before* the save (captured at ``_open_config``
+            time via the closure).
+        new_service_name:
+            The service name *after* the save, passed by ``ConfigWindow`` via
+            the ``on_saved`` callback signature.
         """
+        # Rename DB table if the service name changed.
+        if new_service_name != old_service_name:
+            self._db.rename_table(old_service_name, new_service_name)
+
+        # Determine effective name for post-rebuild restart.
+        effective_name = new_service_name
+
         # Capture running state before making any changes.
         was_running = self._rclone.is_running(old_service_name)
         if was_running:
             self._rclone.stop_service(old_service_name)
 
         # Full UI rebuild (updates tab titles, labels, etc.).
-        # After this call all tree checks are restarted (side effect of
-        # _add_service_tab → _populate_sync_tree_async for each service).
         self._refresh_tabs()
 
         # Restart the bisync thread for the modified service so new settings
         # (e.g. sync_interval, local_path) take effect immediately.
-        # Only restart if the service was running before the save OR if the
-        # config now has sync_enabled=True.
-        svc = self._config.get_service(old_service_name)
+        svc = self._config.get_service(effective_name)
         if svc is not None and (was_running or svc.get("sync_enabled")):
-            self._rclone.clear_bisync_locks(old_service_name)
-            self._config.update_service(old_service_name, {"sync_enabled": True})
-            self._rclone.start_service(old_service_name)
+            self._rclone.clear_bisync_locks(effective_name)
+            self._config.update_service(effective_name, {"sync_enabled": True})
+            self._rclone.start_service(effective_name)
 
     def _open_config_at_info(self, service_name: str) -> None:
         """Open the configuration window at the 'Información del servicio' panel.
@@ -941,7 +1012,9 @@ class MainWindow:
             config_manager=self._config,
             rclone_manager=self._rclone,
             service_name=service_name,
-            on_saved=lambda: self._on_config_fixed_start_sync(service_name),
+            on_saved=lambda new_name=service_name: self._on_config_fixed_start_sync(
+                new_name
+            ),
             on_deleted=self._on_service_deleted,
             error_logger=self._error_logger,
             initial_panel=INFO_PANEL_INDEX,
@@ -1176,11 +1249,16 @@ class MainWindow:
 
     def _on_service_added(self, service_name: str) -> None:
         """Called after a new service is successfully added via the wizard."""
+        # Create the DB table for the new service so Thread 1 / Thread 2 can
+        # start writing immediately after _refresh_tabs triggers _start_tree_check.
+        self._db.ensure_table(service_name)
         self._rclone.start_service(service_name)
         self._refresh_tabs()
 
     def _on_service_deleted(self, service_name: str) -> None:
         """Called after a service is deleted from the config window."""
+        # Drop the DB table for the removed service to free disk space.
+        self._db.drop_table(service_name)
         self._refresh_tabs()
 
     # ------------------------------------------------------------------

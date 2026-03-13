@@ -4045,5 +4045,331 @@ class TestTreeScanTimingLabels(unittest.TestCase):
         self.assertEqual(time_part.count(":"), 2)
 
 
+class TestFileScanDB(unittest.TestCase):
+    """Tests for the encrypted SQLite file-scan database (src/db/file_scan_db.py).
+
+    Each test method gets its own isolated temporary directory so that tests
+    do not interfere with each other or with the real user database.
+    """
+
+    def setUp(self) -> None:
+        """Create a temp directory and open a fresh FileScanDB for each test."""
+        from src.db.file_scan_db import FileScanDB
+
+        self._tmpdir = tempfile.mkdtemp()
+        db_path = Path(self._tmpdir) / "test_scan.db"
+        key_path = Path(self._tmpdir) / "test.key"
+        self._db = FileScanDB(db_path=db_path, key_path=key_path)
+
+    def tearDown(self) -> None:
+        """Close the DB connection and clean up the temp directory."""
+        import shutil
+        try:
+            self._db.close()
+        except Exception:
+            pass
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+
+    # ------------------------------------------------------------------
+    # Table lifecycle
+    # ------------------------------------------------------------------
+
+    def test_ensure_table_creates_table(self):
+        """ensure_table() must create the table so subsequent queries succeed."""
+        self._db.ensure_table("My Service")
+        # If the table was created, get_all_records returns an empty list (not
+        # an exception).
+        records = self._db.get_all_records("My Service")
+        self.assertIsInstance(records, list)
+        self.assertEqual(len(records), 0)
+
+    def test_ensure_table_is_idempotent(self):
+        """Calling ensure_table() twice must not raise."""
+        self._db.ensure_table("ServiceA")
+        self._db.ensure_table("ServiceA")  # should not raise
+        records = self._db.get_all_records("ServiceA")
+        self.assertEqual(records, [])
+
+    def test_drop_table_removes_data(self):
+        """drop_table() must remove the table so get_all_records returns []."""
+        self._db.ensure_table("SvcDrop")
+        self._db.upsert_local_batch(
+            "SvcDrop",
+            1700000000.0,
+            {"a/b.txt": {"mtime": 1700000000.0, "size": 100}},
+        )
+        self._db.drop_table("SvcDrop")
+        records = self._db.get_all_records("SvcDrop")
+        self.assertEqual(records, [])
+
+    def test_rename_table_moves_data(self):
+        """rename_table() must preserve all rows under the new name."""
+        self._db.ensure_table("OldName")
+        self._db.upsert_local_batch(
+            "OldName",
+            1700000000.0,
+            {"file.txt": {"mtime": 1700000000.0, "size": 42}},
+        )
+        self._db.rename_table("OldName", "NewName")
+        old_records = self._db.get_all_records("OldName")
+        new_records = self._db.get_all_records("NewName")
+        self.assertEqual(len(old_records), 0)
+        self.assertEqual(len(new_records), 1)
+        self.assertEqual(new_records[0]["rel"], "file.txt")
+
+    def test_rename_table_identical_slugs_noop(self):
+        """rename_table() for names that produce the same slug must not raise."""
+        self._db.ensure_table("A B")
+        self._db.upsert_local_batch(
+            "A B",
+            1700000000.0,
+            {"x.txt": {"mtime": 1700000000.0, "size": 10}},
+        )
+        # "A_B" and "A B" both slug to "svc_a_b"
+        self._db.rename_table("A B", "A_B")
+        records = self._db.get_all_records("A B")
+        self.assertEqual(len(records), 1)
+
+    # ------------------------------------------------------------------
+    # Local batch upsert (Thread 1)
+    # ------------------------------------------------------------------
+
+    def test_upsert_local_batch_writes_fields(self):
+        """upsert_local_batch() must persist rel_path, local_mtime, local_size."""
+        self._db.ensure_table("SvcLocal")
+        self._db.upsert_local_batch(
+            "SvcLocal",
+            1700000100.0,
+            {
+                "docs/readme.txt": {"mtime": 1700000000.0, "size": 1024},
+                "img/photo.jpg": {"mtime": 1699999000.0, "size": 204800},
+            },
+        )
+        records = {r["rel"]: r for r in self._db.get_all_records("SvcLocal")}
+        self.assertIn("docs/readme.txt", records)
+        self.assertAlmostEqual(records["docs/readme.txt"]["local_mtime"], 1700000000.0)
+        self.assertEqual(records["docs/readme.txt"]["local_size"], 1024)
+        self.assertAlmostEqual(records["img/photo.jpg"]["local_mtime"], 1699999000.0)
+        self.assertEqual(records["img/photo.jpg"]["local_size"], 204800)
+
+    def test_upsert_local_batch_overwrites_on_conflict(self):
+        """A second upsert_local_batch() must overwrite existing local fields."""
+        self._db.ensure_table("SvcOver")
+        self._db.upsert_local_batch(
+            "SvcOver",
+            1700000100.0,
+            {"file.txt": {"mtime": 1700000000.0, "size": 100}},
+        )
+        # Simulate file being modified: new mtime and size
+        self._db.upsert_local_batch(
+            "SvcOver",
+            1700000200.0,
+            {"file.txt": {"mtime": 1700000150.0, "size": 200}},
+        )
+        records = self._db.get_all_records("SvcOver")
+        self.assertEqual(len(records), 1)
+        self.assertAlmostEqual(records[0]["local_mtime"], 1700000150.0)
+        self.assertEqual(records[0]["local_size"], 200)
+
+    def test_upsert_local_batch_prunes_deleted_files(self):
+        """Files absent from a new batch should have local fields cleared."""
+        self._db.ensure_table("SvcPrune")
+        # First scan: two files
+        self._db.upsert_local_batch(
+            "SvcPrune",
+            1700000100.0,
+            {
+                "keep.txt": {"mtime": 1700000000.0, "size": 10},
+                "delete.txt": {"mtime": 1699900000.0, "size": 20},
+            },
+        )
+        # Second scan: only "keep.txt" found (delete.txt was removed)
+        self._db.upsert_local_batch(
+            "SvcPrune",
+            1700000200.0,
+            {"keep.txt": {"mtime": 1700000000.0, "size": 10}},
+        )
+        records = {r["rel"]: r for r in self._db.get_all_records("SvcPrune")}
+        # "keep.txt" must still have local data
+        self.assertIn("keep.txt", records)
+        self.assertIsNotNone(records["keep.txt"]["local_mtime"])
+        # "delete.txt" should have been cleaned up (no remote data either)
+        self.assertNotIn("delete.txt", records)
+
+    # ------------------------------------------------------------------
+    # Remote batch upsert (Thread 2)
+    # ------------------------------------------------------------------
+
+    def test_upsert_remote_batch_writes_fields(self):
+        """upsert_remote_batch() must persist rel_path, remote_mtime, remote_size."""
+        self._db.ensure_table("SvcRemote")
+        self._db.upsert_remote_batch(
+            "SvcRemote",
+            1700000100.0,
+            {"cloud/data.csv": {"mtime": 1700000050.0, "size": 5000}},
+        )
+        records = self._db.get_all_records("SvcRemote")
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["rel"], "cloud/data.csv")
+        self.assertAlmostEqual(records[0]["remote_mtime"], 1700000050.0)
+        self.assertEqual(records[0]["remote_size"], 5000)
+        # Local fields not set yet
+        self.assertIsNone(records[0]["local_mtime"])
+
+    # ------------------------------------------------------------------
+    # Status computation (Thread 3)
+    # ------------------------------------------------------------------
+
+    def test_update_statuses_synced(self):
+        """Files whose local and remote mtimes differ by < tolerance → synced."""
+        from src.db.file_scan_db import _MTIME_TOLERANCE_SECS
+
+        ts = 1700000000.0
+        self._db.ensure_table("SvcStatus")
+        self._db.upsert_local_batch(
+            "SvcStatus", ts + 10, {"f.txt": {"mtime": ts, "size": 1}}
+        )
+        # Remote mtime within tolerance
+        self._db.upsert_remote_batch(
+            "SvcStatus", ts + 10, {"f.txt": {"mtime": ts + _MTIME_TOLERANCE_SECS - 0.1, "size": 1}}
+        )
+        self._db.update_statuses("SvcStatus", scan_ts=0)
+        records = self._db.get_all_records("SvcStatus")
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["status"], "synced")
+
+    def test_update_statuses_diff(self):
+        """Files whose mtimes differ by > tolerance → diff."""
+        from src.db.file_scan_db import _MTIME_TOLERANCE_SECS
+
+        ts = 1700000000.0
+        self._db.ensure_table("SvcDiff")
+        self._db.upsert_local_batch(
+            "SvcDiff", ts + 10, {"f.txt": {"mtime": ts, "size": 1}}
+        )
+        self._db.upsert_remote_batch(
+            "SvcDiff", ts + 10, {"f.txt": {"mtime": ts + _MTIME_TOLERANCE_SECS + 10, "size": 1}}
+        )
+        self._db.update_statuses("SvcDiff", scan_ts=0)
+        records = self._db.get_all_records("SvcDiff")
+        self.assertEqual(records[0]["status"], "diff")
+
+    def test_update_statuses_local_only(self):
+        """Files with only local data → local_only."""
+        ts = 1700000000.0
+        self._db.ensure_table("SvcLO")
+        self._db.upsert_local_batch(
+            "SvcLO", ts + 10, {"local.txt": {"mtime": ts, "size": 1}}
+        )
+        self._db.update_statuses("SvcLO", scan_ts=0)
+        records = self._db.get_all_records("SvcLO")
+        self.assertEqual(records[0]["status"], "local_only")
+
+    def test_update_statuses_remote_only(self):
+        """Files with only remote data → remote_only."""
+        ts = 1700000000.0
+        self._db.ensure_table("SvcRO")
+        self._db.upsert_remote_batch(
+            "SvcRO", ts + 10, {"remote.txt": {"mtime": ts, "size": 1}}
+        )
+        self._db.update_statuses("SvcRO", scan_ts=0)
+        records = self._db.get_all_records("SvcRO")
+        self.assertEqual(records[0]["status"], "remote_only")
+
+    # ------------------------------------------------------------------
+    # Encryption round-trip
+    # ------------------------------------------------------------------
+
+    def test_encryption_round_trip(self):
+        """Values written to DB must decrypt correctly on read-back."""
+        self._db.ensure_table("SvcEnc")
+        original_path = "sub/dir/my file (2024).txt"
+        original_mtime = 1700012345.678
+        original_size = 999999
+        self._db.upsert_local_batch(
+            "SvcEnc",
+            1700100000.0,
+            {original_path: {"mtime": original_mtime, "size": original_size}},
+        )
+        records = self._db.get_all_records("SvcEnc")
+        self.assertEqual(len(records), 1)
+        rec = records[0]
+        self.assertEqual(rec["rel"], original_path)
+        self.assertAlmostEqual(rec["local_mtime"], original_mtime, places=2)
+        self.assertEqual(rec["local_size"], original_size)
+
+    def test_data_encrypted_at_rest(self):
+        """The raw SQLite file must NOT contain plaintext file paths."""
+        import sqlite3 as _sqlite3
+        self._db.ensure_table("SvcRaw")
+        self._db.upsert_local_batch(
+            "SvcRaw",
+            1700000000.0,
+            {"sensitive/path/secret.txt": {"mtime": 1700000000.0, "size": 1}},
+        )
+        # Read raw bytes from the DB file to check that path is not visible
+        raw_bytes = Path(self._db._db_path).read_bytes()
+        self.assertNotIn(b"sensitive/path/secret.txt", raw_bytes)
+
+    # ------------------------------------------------------------------
+    # Key file creation
+    # ------------------------------------------------------------------
+
+    def test_key_file_created_on_init(self):
+        """A new key file must be created and contain a valid Fernet key."""
+        from cryptography.fernet import Fernet
+
+        key_path = Path(self._tmpdir) / "new.key"
+        db_path = Path(self._tmpdir) / "new.db"
+        self.assertFalse(key_path.exists())
+        from src.db.file_scan_db import FileScanDB as _DB
+        new_db = _DB(db_path=db_path, key_path=key_path)
+        try:
+            self.assertTrue(key_path.exists())
+            raw = key_path.read_bytes().strip()
+            # Must be a valid Fernet key (no exception on construction)
+            Fernet(raw)
+        finally:
+            new_db.close()
+
+    def test_same_key_used_across_instances(self):
+        """A second FileScanDB instance pointing to the same key must decrypt data
+        written by the first instance."""
+        from src.db.file_scan_db import FileScanDB as _DB
+
+        db_path = Path(self._tmpdir) / "shared.db"
+        key_path = Path(self._tmpdir) / "shared.key"
+
+        db1 = _DB(db_path=db_path, key_path=key_path)
+        db1.ensure_table("Shared")
+        db1.upsert_local_batch(
+            "Shared",
+            1700000000.0,
+            {"hello.txt": {"mtime": 1700000000.0, "size": 7}},
+        )
+        db1.close()
+
+        db2 = _DB(db_path=db_path, key_path=key_path)
+        records = db2.get_all_records("Shared")
+        db2.close()
+
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["rel"], "hello.txt")
+
+    # ------------------------------------------------------------------
+    # Helper: _table_slug
+    # ------------------------------------------------------------------
+
+    def test_table_slug_sanitizes_name(self):
+        """_table_slug() must produce a valid SQL identifier from any service name."""
+        from src.db.file_scan_db import _table_slug
+
+        self.assertEqual(_table_slug("My Service"), "svc_my_service")
+        self.assertEqual(_table_slug("OneDrive (Work)"), "svc_onedrive_work")
+        self.assertEqual(_table_slug("123"), "svc_123")
+        self.assertEqual(_table_slug("!@#"), "svc_svc")  # all symbols → fallback
+        self.assertTrue(_table_slug("A").startswith("svc_"))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -1188,11 +1188,30 @@ class RcloneManager:
     def list_remote_mtimes(self, service_name: str) -> Optional[Dict[str, float]]:
         """Return a ``{rel_path: utc_unix_timestamp}`` map for all files on the remote.
 
-        Runs ``rclone lsjson --recursive --files-only --no-mimetype`` and
-        converts the ``ModTime`` field of each entry to a UTC Unix timestamp.
+        Convenience wrapper around :meth:`list_remote_metadata` that returns
+        only the mtime values (no file sizes) to preserve backwards
+        compatibility with callers that do not need sizes.
 
         Returns ``None`` when rclone is unavailable, the service is not fully
         configured, or the remote listing command fails or times out.
+        """
+        meta = self.list_remote_metadata(service_name)
+        if meta is None:
+            return None
+        return {rel: entry["mtime"] for rel, entry in meta.items()}
+
+    def list_remote_metadata(
+        self, service_name: str
+    ) -> Optional[Dict[str, Dict]]:
+        """Return a ``{rel_path: {"mtime": float, "size": int}}`` map for all remote files.
+
+        Extends :meth:`list_remote_mtimes` by also returning the file size
+        (``"size"`` key, bytes as :class:`int`) from the ``rclone lsjson``
+        output.  Used by :meth:`~src.gui.main_window.MainWindow._start_tree_check`
+        Thread 2 to write both fields to :class:`~src.db.file_scan_db.FileScanDB`.
+
+        Returns ``None`` when the remote is unavailable or the service is not
+        fully configured (same failure conditions as :meth:`list_remote_mtimes`).
         """
         import json as _json
 
@@ -1230,15 +1249,16 @@ class RcloneManager:
         except (OSError, subprocess.TimeoutExpired, ValueError):
             return None
 
-        remote_mtimes: Dict[str, float] = {}
+        metadata: Dict[str, Dict] = {}
         for item in remote_items:
             rel = item.get("Path", "").replace("\\", "/").strip("/")
             mtime_str = item.get("ModTime", "")
+            size = item.get("Size", 0)
             if rel:
                 ts = _parse_rclone_mtime(mtime_str)
                 if ts is not None:
-                    remote_mtimes[rel] = ts
-        return remote_mtimes
+                    metadata[rel] = {"mtime": ts, "size": int(size)}
+        return metadata
 
     def check_sync_status_mtime(self, service_name: str) -> Optional[List[Dict]]:
         """Compare remote vs local files using modification timestamps.
