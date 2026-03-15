@@ -1575,6 +1575,79 @@ class TestRcloneManager(unittest.TestCase):
         self.assertEqual(parser.get("dst", "token"), token_json)
 
 
+    def test_sync_loop_passes_use_resync_false_on_first_run(self):
+        """_sync_loop must pass use_resync=False on the very first sync.
+
+        Regression test: previously _sync_loop computed use_resync=not is_first,
+        which passed False on the first run (correct) but True on every
+        subsequent run (incorrect — see the other regression test).
+        """
+        self.config.add_service("FirstLoopSvc", "onedrive", "/tmp/first_loop")
+        # first_sync_done=False (default) → is_first=True
+        captured_use_resync = []
+        stop_event = threading.Event()
+
+        def fake_do_bisync(svc, use_resync=False):
+            captured_use_resync.append(use_resync)
+            stop_event.set()
+            return True
+
+        self.rclone._do_bisync = fake_do_bisync
+        self.rclone._stop_events["FirstLoopSvc"] = stop_event
+
+        t = threading.Thread(
+            target=self.rclone._sync_loop,
+            args=("FirstLoopSvc", stop_event),
+            daemon=True,
+        )
+        t.start()
+        t.join(timeout=5)
+
+        self.assertEqual(len(captured_use_resync), 1)
+        self.assertFalse(
+            captured_use_resync[0],
+            "_sync_loop must pass use_resync=False on the first run",
+        )
+
+    def test_sync_loop_passes_use_resync_false_on_subsequent_runs(self):
+        """_sync_loop must NEVER pass use_resync=True, even after first_sync_done.
+
+        Regression test: previously _sync_loop used use_resync=not is_first,
+        causing every sync after the first to run with --resync.  On rclone
+        < v1.64 this defaults to "path1 wins" (remote wins), which silently
+        overwrites local file modifications instead of uploading them.
+        """
+        self.config.add_service("SubsequentLoopSvc", "onedrive", "/tmp/subseq_loop")
+        # Simulate a service that has already completed its first sync.
+        self.config.update_service("SubsequentLoopSvc", {"first_sync_done": True})
+        captured_use_resync = []
+        stop_event = threading.Event()
+
+        def fake_do_bisync(svc, use_resync=False):
+            captured_use_resync.append(use_resync)
+            stop_event.set()
+            return True
+
+        self.rclone._do_bisync = fake_do_bisync
+        self.rclone._stop_events["SubsequentLoopSvc"] = stop_event
+
+        t = threading.Thread(
+            target=self.rclone._sync_loop,
+            args=("SubsequentLoopSvc", stop_event),
+            daemon=True,
+        )
+        t.start()
+        t.join(timeout=5)
+
+        self.assertEqual(len(captured_use_resync), 1)
+        self.assertFalse(
+            captured_use_resync[0],
+            "_sync_loop must not pass use_resync=True on subsequent runs "
+            "(doing so causes --resync every cycle, overwriting local changes "
+            "on rclone < v1.64 where path1/remote wins by default)",
+        )
+
+
 class TestBisyncLockCleanup(unittest.TestCase):
     """Tests for the bisync stale-lock-file detection and cleanup helpers."""
 
@@ -3004,8 +3077,14 @@ class TestFirstSyncTracking(unittest.TestCase):
             import shutil
             shutil.rmtree(local, ignore_errors=True)
 
-    def test_use_resync_true_on_subsequent_runs(self):
-        """_sync_loop must include --resync in the bisync command after first_sync_done=True."""
+    def test_use_resync_false_on_subsequent_runs(self):
+        """_sync_loop must NOT include --resync in the bisync command after first_sync_done=True.
+
+        Regression test: previously _sync_loop used use_resync=not is_first which
+        caused every sync cycle after the first to run with --resync.  On rclone
+        < v1.64 that defaults to "path1 wins" (remote wins), silently overwriting
+        local file modifications instead of uploading them.
+        """
         local = tempfile.mkdtemp()
         try:
             self.config.add_service("SubResyncSvc", "onedrive", local)
@@ -3033,8 +3112,9 @@ class TestFirstSyncTracking(unittest.TestCase):
                 self.rclone._sync_loop("SubResyncSvc", stop_event)
 
             all_cmds_flat = [arg for cmd in captured_cmds for arg in cmd]
-            self.assertIn("--resync", all_cmds_flat,
-                          "--resync must be present when first_sync_done=True")
+            self.assertNotIn("--resync", all_cmds_flat,
+                             "--resync must NOT be added on subsequent sync cycles "
+                             "(doing so overwrites local changes on older rclone)")
         finally:
             import shutil
             shutil.rmtree(local, ignore_errors=True)
