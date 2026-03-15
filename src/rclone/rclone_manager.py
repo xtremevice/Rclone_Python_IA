@@ -1386,13 +1386,19 @@ class RcloneManager:
             # After the first successful sync the service config has
             # "first_sync_done": True (persisted so the distinction survives
             # restarts).  On first run we show "Sincronizando…"; on all
-            # subsequent runs we show "Actualizando cambios…" and pass
-            # use_resync=True to _do_bisync so rclone re-establishes the
-            # baseline from the current state of both directories.
+            # subsequent runs we show "Actualizando cambios…".
+            # Always pass use_resync=False: _do_bisync automatically detects a
+            # missing-state-files condition and retries with --resync when
+            # needed, while normal incremental runs use plain bisync so that
+            # both local and remote changes are tracked and uploaded correctly.
+            # (Forcing use_resync=True on subsequent runs caused rclone to run
+            # with --resync on every cycle; on rclone < v1.64 this defaults to
+            # "path1 wins" — path1 is the remote — which silently overwrites
+            # local file modifications instead of uploading them.)
             is_first = not svc.get("first_sync_done", False)
             status_in_progress = "Sincronizando…" if is_first else "Actualizando cambios…"
             self._set_status(service_name, status_in_progress)
-            success = self._do_bisync(svc, use_resync=not is_first)
+            success = self._do_bisync(svc, use_resync=False)
             if success:
                 if is_first:
                     # Persist so the next cycle (and future sessions) use the
@@ -1418,10 +1424,10 @@ class RcloneManager:
         the sync is aborted with a clear error message.
 
         When *use_resync* is ``True`` the ``--resync`` flag is added to the
-        initial command.  This is used from the second sync cycle onward, after
-        the first full sync has completed successfully, so that rclone
-        re-establishes the baseline from the current state of both directories
-        rather than comparing against potentially stale listing files.
+        initial command.  Callers should normally pass ``False`` (the default)
+        so that incremental bisync runs properly track changes on both the
+        local and remote sides.  Pass ``True`` only to explicitly force a
+        full baseline re-establishment (e.g. in a one-off recovery call).
 
         On the very first bisync run (or after an abnormal termination that
         deleted the listing files), rclone may fail with "cannot find prior

@@ -19,6 +19,7 @@ import platform
 import re
 import subprocess
 import threading
+import time
 import tkinter as tk
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -151,6 +152,12 @@ class MainWindow:
         self._tree_scan_started_vars: Dict[str, tk.StringVar] = {}
         # Per-service StringVars showing when the next scheduled scan will run.
         self._tree_scan_next_vars: Dict[str, tk.StringVar] = {}
+        # Per-service (local, remote, merger) scan-thread status StringVars.
+        self._tree_thread_status_vars: Dict[str, Tuple[tk.StringVar, tk.StringVar, tk.StringVar]] = {}
+        # Per-service StringVar showing total scan elapsed time.
+        self._tree_scan_elapsed_vars: Dict[str, tk.StringVar] = {}
+        # Per-service monotonic start time used to compute elapsed scan time.
+        self._tree_scan_wall_times: Dict[str, float] = {}
         # Whether the pystray tray icon has been started (non-Elementary only)
         self._tray_started = False
 
@@ -310,6 +317,42 @@ class MainWindow:
             fg="#555555",
             font=("Segoe UI", 9),
         ).grid(row=1, column=6, sticky="w", padx=(12, 0), pady=(4, 0))
+
+        # Row 2: per-thread scan status labels + total elapsed time
+        local_status_var = tk.StringVar(value=f"{_SCAN_LOCAL_PREFIX}—")
+        remote_status_var = tk.StringVar(value=f"{_SCAN_REMOTE_PREFIX}—")
+        merger_status_var = tk.StringVar(value=f"{_SCAN_MERGER_PREFIX}—")
+        elapsed_var = tk.StringVar(value=f"{_SCAN_ELAPSED_PREFIX}—")
+        self._tree_thread_status_vars[name] = (local_status_var, remote_status_var, merger_status_var)
+        self._tree_scan_elapsed_vars[name] = elapsed_var
+        tk.Label(
+            header,
+            textvariable=local_status_var,
+            bg="#f0f4fa",
+            fg="#555555",
+            font=("Segoe UI", 9),
+        ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(2, 0))
+        tk.Label(
+            header,
+            textvariable=remote_status_var,
+            bg="#f0f4fa",
+            fg="#555555",
+            font=("Segoe UI", 9),
+        ).grid(row=2, column=2, columnspan=2, sticky="w", padx=(12, 0), pady=(2, 0))
+        tk.Label(
+            header,
+            textvariable=merger_status_var,
+            bg="#f0f4fa",
+            fg="#555555",
+            font=("Segoe UI", 9),
+        ).grid(row=2, column=4, columnspan=2, sticky="w", padx=(12, 0), pady=(2, 0))
+        tk.Label(
+            header,
+            textvariable=elapsed_var,
+            bg="#f0f4fa",
+            fg="#555555",
+            font=("Segoe UI", 9),
+        ).grid(row=2, column=6, sticky="w", padx=(12, 0), pady=(2, 0))
 
         # Fetch storage quota in the background and update the label when ready
         self._fetch_storage_info_async(name, storage_var)
@@ -628,6 +671,18 @@ class MainWindow:
         if started_var is not None:
             started_var.set(f"{_SCAN_STARTED_PREFIX}{started_str}")
 
+        # Reset thread status labels and start the wall-clock timer.
+        self._tree_scan_wall_times[service_name] = time.monotonic()
+        elapsed_var_init = self._tree_scan_elapsed_vars.get(service_name)
+        if elapsed_var_init is not None:
+            elapsed_var_init.set(f"{_SCAN_ELAPSED_PREFIX}—")
+        status_vars_init = self._tree_thread_status_vars.get(service_name)
+        if status_vars_init is not None:
+            local_sv, remote_sv, merger_sv = status_vars_init
+            local_sv.set(f"{_SCAN_LOCAL_PREFIX}{_THREAD_SCANNING}")
+            remote_sv.set(f"{_SCAN_REMOTE_PREFIX}{_THREAD_SCANNING}")
+            merger_sv.set(f"{_SCAN_MERGER_PREFIX}{_THREAD_SCANNING}")
+
         svc = self._config.get_service(service_name)
         if svc is None:
             return
@@ -667,6 +722,10 @@ class MainWindow:
                             pass
             db.upsert_local_batch(service_name, scan_ts, local_files)
             local_done.set()
+            self._root.after(
+                0,
+                lambda g=scan_gen: self._update_thread_status(service_name, g, "local"),
+            )
 
         # ── Thread 2: remote metadata scan ─────────────────────────────────
         def _remote_worker() -> None:
@@ -676,6 +735,10 @@ class MainWindow:
                 db.upsert_remote_batch(service_name, scan_ts, remote_files)
                 remote_available.set()
             remote_done.set()
+            self._root.after(
+                0,
+                lambda g=scan_gen: self._update_thread_status(service_name, g, "remote"),
+            )
 
         # ── Thread 3: merger — reads DB, computes statuses, updates tree ────
         def _merger_worker() -> None:
@@ -736,6 +799,10 @@ class MainWindow:
             self._root.after(
                 0,
                 lambda: self._on_tree_check_done(service_name, final_items),
+            )
+            self._root.after(
+                0,
+                lambda g=scan_gen: self._update_thread_status(service_name, g, "merger"),
             )
 
         threading.Thread(
@@ -833,6 +900,34 @@ class MainWindow:
         # never overwrites a good snapshot.
         _save_tree_cache(service_name, items)
         self._schedule_tree_refresh(service_name, len(items))
+
+    def _update_thread_status(
+        self, service_name: str, gen: int, thread_name: str
+    ) -> None:
+        """Update a scan-thread status label on the main thread.
+
+        Called via ``_root.after(0, ...)`` from each worker thread once it
+        finishes.  *thread_name* is one of ``"local"``, ``"remote"``, or
+        ``"merger"``.  When the merger finishes the total elapsed scan time
+        is computed and displayed.
+        """
+        if self._tree_check_generations.get(service_name) != gen:
+            return  # a newer scan has started — discard stale update
+        status_vars = self._tree_thread_status_vars.get(service_name)
+        if status_vars is None:
+            return
+        local_sv, remote_sv, merger_sv = status_vars
+        if thread_name == "local":
+            local_sv.set(f"{_SCAN_LOCAL_PREFIX}{_THREAD_DONE}")
+        elif thread_name == "remote":
+            remote_sv.set(f"{_SCAN_REMOTE_PREFIX}{_THREAD_DONE}")
+        elif thread_name == "merger":
+            merger_sv.set(f"{_SCAN_MERGER_PREFIX}{_THREAD_DONE}")
+            start_t = self._tree_scan_wall_times.get(service_name)
+            elapsed_var = self._tree_scan_elapsed_vars.get(service_name)
+            if start_t is not None and elapsed_var is not None:
+                elapsed_sec = time.monotonic() - start_t
+                elapsed_var.set(f"{_SCAN_ELAPSED_PREFIX}{elapsed_sec:.1f}s")
 
     def _schedule_tree_refresh(self, service_name: str, item_count: int) -> None:
         """Cancel any existing scheduled refresh and queue the next one.
@@ -1245,6 +1340,9 @@ class MainWindow:
         self._file_trees.clear()
         self._tree_scan_started_vars.clear()
         self._tree_scan_next_vars.clear()
+        self._tree_thread_status_vars.clear()
+        self._tree_scan_elapsed_vars.clear()
+        self._tree_scan_wall_times.clear()
         self._build_ui()
 
     def _on_service_added(self, service_name: str) -> None:
@@ -1299,6 +1397,14 @@ _SCAN_TIME_FMT = "%H:%M:%S"
 # Label prefixes for the tree-scan timing widgets.
 _SCAN_STARTED_PREFIX = "🕐 Inicio: "
 _SCAN_NEXT_PREFIX = "⏭ Próxima: "
+
+# Label prefixes and status text for the per-thread scan progress row.
+_THREAD_SCANNING = "Escaneando"
+_THREAD_DONE = "Terminado"
+_SCAN_LOCAL_PREFIX = "💾 Local: "
+_SCAN_REMOTE_PREFIX = "☁️ Remoto: "
+_SCAN_MERGER_PREFIX = "🔄 Árbol: "
+_SCAN_ELAPSED_PREFIX = "⏱ Total: "
 
 _TREE_STATUS_LABELS: Dict[str, str] = {
     "synced":       "🟢 Ambos",
