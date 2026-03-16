@@ -1554,6 +1554,12 @@ class RcloneManager:
         # Optional verbose output
         if svc.get("verbose_sync", False):
             perf_args.append("--verbose")
+        # Propagate empty local directories to the remote so newly created
+        # folders appear on the remote side even before any files are placed
+        # inside them.  Enabled by default; can be turned off per-service via
+        # the "create_empty_src_dirs" config key.
+        if svc.get("create_empty_src_dirs", True):
+            perf_args.append("--create-empty-src-dirs")
 
         # Conflict resolution mode used during --resync retries
         resync_mode = svc.get("resync_mode", "newer")

@@ -258,6 +258,11 @@ class ConfigManager:
             "resync_mode": "newer",
             # bisync: emit verbose output (--verbose flag)
             "verbose_sync": False,
+            # bisync: create empty directories on the remote when they exist
+            # locally.  Maps to the --create-empty-src-dirs rclone flag.
+            # Enabled by default so that newly created local folders appear on
+            # the remote even before any files are placed inside them.
+            "create_empty_src_dirs": True,
             # rclone mount: whether to run a persistent mount process
             "mount_enabled": False,
             # rclone mount: local directory used as the mount point

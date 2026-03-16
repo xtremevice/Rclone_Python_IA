@@ -491,6 +491,43 @@ class TestRcloneManager(unittest.TestCase):
         self.assertTrue(len(captured_cmds) > 0)
         self.assertNotIn("--cache-dir", captured_cmds[0])
 
+    def test_create_empty_src_dirs_in_bisync_by_default(self):
+        """_do_bisync() must include --create-empty-src-dirs by default.
+
+        Without this flag rclone bisync silently skips empty local directories,
+        so a freshly created local folder never appears on the remote.
+        """
+        self.config.add_service("EmptyDirSvc", "onedrive", "/tmp/emptydir_test")
+        captured_cmds = []
+
+        def fake_run_rclone(cmd, service_name, svc, is_retry=False):
+            captured_cmds.append(cmd)
+            return True
+
+        self.rclone._run_rclone = fake_run_rclone
+        svc = self.config.get_service("EmptyDirSvc")
+        self.rclone._do_bisync(svc)
+
+        self.assertTrue(len(captured_cmds) > 0)
+        self.assertIn("--create-empty-src-dirs", captured_cmds[0])
+
+    def test_create_empty_src_dirs_can_be_disabled(self):
+        """Setting create_empty_src_dirs=False must omit --create-empty-src-dirs."""
+        self.config.add_service("NoEmptyDirSvc", "onedrive", "/tmp/noemptydir_test")
+        self.config.update_service("NoEmptyDirSvc", {"create_empty_src_dirs": False})
+        captured_cmds = []
+
+        def fake_run_rclone(cmd, service_name, svc, is_retry=False):
+            captured_cmds.append(cmd)
+            return True
+
+        self.rclone._run_rclone = fake_run_rclone
+        svc = self.config.get_service("NoEmptyDirSvc")
+        self.rclone._do_bisync(svc)
+
+        self.assertTrue(len(captured_cmds) > 0)
+        self.assertNotIn("--create-empty-src-dirs", captured_cmds[0])
+
     # ------------------------------------------------------------------ #
     # --workdir per-service isolation tests                               #
     # ------------------------------------------------------------------ #
