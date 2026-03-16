@@ -333,6 +333,101 @@ class TestRcloneManager(unittest.TestCase):
         result = self.rclone.list_remote_tree("S2")
         self.assertIsInstance(result, list)
 
+    # ------------------------------------------------------------------
+    # list_remote_metadata — tuple return API
+    # ------------------------------------------------------------------
+
+    def test_list_remote_metadata_returns_tuple(self):
+        """list_remote_metadata() must always return a 2-tuple."""
+        self.config.add_service("MetaSvc", "drive", "/tmp/meta")
+        result = self.rclone.list_remote_metadata("MetaSvc")
+        self.assertIsInstance(result, tuple)
+        self.assertEqual(len(result), 2)
+
+    def test_list_remote_metadata_unknown_service_returns_error(self):
+        """list_remote_metadata() for an unknown service must return (None, error)."""
+        meta, err = self.rclone.list_remote_metadata("DoesNotExist")
+        self.assertIsNone(meta)
+        self.assertIsNotNone(err)
+        self.assertIsInstance(err, str)
+        self.assertGreater(len(err), 0)
+
+    def test_list_remote_metadata_incomplete_config_returns_error(self):
+        """A service without remote_name must return (None, error) not raise."""
+        # Add service without setting a remote_name (defaults to empty string).
+        self.config.add_service("NoRemote", "drive", "/tmp/noremote")
+        # Ensure remote_name is empty so the guard fires.
+        self.config.update_service("NoRemote", {"remote_name": ""})
+        meta, err = self.rclone.list_remote_metadata("NoRemote")
+        self.assertIsNone(meta)
+        self.assertIsNotNone(err)
+
+    def test_list_remote_metadata_rclone_failure_returns_error_string(self):
+        """When rclone exits non-zero, the error message must be non-empty."""
+        self.config.add_service("BadSvc", "drive", "/tmp/bad")
+        self.config.update_service("BadSvc", {"remote_name": "badremote"})
+        fake_proc = MagicMock()
+        fake_proc.returncode = 1
+        fake_proc.stdout = ""
+        fake_proc.stderr = "Failed to connect to remote"
+        with patch("subprocess.run", return_value=fake_proc):
+            meta, err = self.rclone.list_remote_metadata("BadSvc")
+        self.assertIsNone(meta)
+        self.assertIsNotNone(err)
+        self.assertIn("Failed to connect", err)
+
+    def test_list_remote_metadata_rclone_success_returns_data_no_error(self):
+        """When rclone succeeds, metadata must be returned and error must be None."""
+        self.config.add_service("GoodSvc", "drive", "/tmp/good")
+        self.config.update_service("GoodSvc", {"remote_name": "myremote"})
+        payload = [
+            {"Path": "docs/readme.txt", "ModTime": "2024-01-01T00:00:00.000000000Z",
+             "Size": 1024, "IsDir": False},
+            {"Path": "docs", "ModTime": "2024-01-01T00:00:00.000000000Z",
+             "Size": 0, "IsDir": True},
+        ]
+        fake_proc = MagicMock()
+        fake_proc.returncode = 0
+        fake_proc.stdout = json.dumps(payload)
+        fake_proc.stderr = ""
+        with patch("subprocess.run", return_value=fake_proc):
+            meta, err = self.rclone.list_remote_metadata("GoodSvc")
+        self.assertIsNone(err)
+        self.assertIsNotNone(meta)
+        self.assertIn("docs/readme.txt", meta)
+        self.assertFalse(meta["docs/readme.txt"]["is_dir"])
+        self.assertIn("docs", meta)
+        self.assertTrue(meta["docs"]["is_dir"])
+
+    def test_list_remote_metadata_timeout_returns_error(self):
+        """A TimeoutExpired must return (None, descriptive error) not raise."""
+        import subprocess as _sp
+        self.config.add_service("TimeoutSvc", "drive", "/tmp/timeout")
+        self.config.update_service("TimeoutSvc", {"remote_name": "slow_remote"})
+        with patch("subprocess.run", side_effect=_sp.TimeoutExpired("cmd", 120)):
+            meta, err = self.rclone.list_remote_metadata("TimeoutSvc")
+        self.assertIsNone(meta)
+        self.assertIsNotNone(err)
+        self.assertIn("120", err)  # timeout value must appear in the message
+
+    def test_list_remote_mtimes_still_works_after_api_change(self):
+        """list_remote_mtimes() must still return a plain dict (no tuple leakage)."""
+        self.config.add_service("MtimeSvc", "drive", "/tmp/mtime")
+        self.config.update_service("MtimeSvc", {"remote_name": "myremote2"})
+        payload = [
+            {"Path": "file.txt", "ModTime": "2024-06-01T12:00:00.000000000Z",
+             "Size": 100, "IsDir": False},
+        ]
+        fake_proc = MagicMock()
+        fake_proc.returncode = 0
+        fake_proc.stdout = json.dumps(payload)
+        fake_proc.stderr = ""
+        with patch("subprocess.run", return_value=fake_proc):
+            result = self.rclone.list_remote_mtimes("MtimeSvc")
+        self.assertIsInstance(result, dict)
+        self.assertIn("file.txt", result)
+        self.assertIsInstance(result["file.txt"], float)
+
     def test_on_status_change_callback_is_called(self):
         """_set_status() should invoke the on_status_change callback."""
         received = []

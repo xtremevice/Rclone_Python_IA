@@ -744,24 +744,53 @@ class MainWindow:
                             }
                         except (OSError, ValueError):
                             pass
+            n_local_files = sum(1 for v in local_files.values() if not v.get("is_dir"))
+            n_local_dirs  = sum(1 for v in local_files.values() if v.get("is_dir"))
             db.upsert_local_batch(service_name, scan_ts, local_files)
             local_done.set()
+            local_detail = f"{n_local_files} arch., {n_local_dirs} dirs."
             self._root.after(
                 0,
-                lambda g=scan_gen: self._update_thread_status(service_name, g, "local"),
+                lambda g=scan_gen, d=local_detail: self._update_thread_status(
+                    service_name, g, "local", d
+                ),
             )
 
         # ── Thread 2: remote metadata scan ─────────────────────────────────
         def _remote_worker() -> None:
             scan_ts = datetime.now(timezone.utc).timestamp()
-            remote_files = rclone.list_remote_metadata(service_name)
+            remote_files, remote_error = rclone.list_remote_metadata(service_name)
             if remote_files is not None:
-                db.upsert_remote_batch(service_name, scan_ts, remote_files)
-                remote_available.set()
+                n_remote_files = sum(1 for v in remote_files.values() if not v.get("is_dir"))
+                n_remote_dirs  = sum(1 for v in remote_files.values() if v.get("is_dir"))
+                try:
+                    db.upsert_remote_batch(service_name, scan_ts, remote_files)
+                    remote_available.set()
+                    remote_detail = f"{n_remote_files} arch., {n_remote_dirs} dirs."
+                    self._error_logger.log(
+                        service_name,
+                        f"☁️ Escaneo remoto: {n_remote_files} archivos y "
+                        f"{n_remote_dirs} directorios encontrados y guardados en BD",
+                    )
+                except Exception as exc:  # pragma: no cover
+                    remote_detail = "Error al guardar"
+                    self._error_logger.log(
+                        service_name,
+                        f"☁️ Error al guardar datos remotos en la base de datos: {exc}",
+                    )
+            else:
+                err_msg = remote_error or "error desconocido"
+                remote_detail = "Sin datos"
+                self._error_logger.log(
+                    service_name,
+                    f"☁️ No se pudo obtener datos del remoto: {err_msg}",
+                )
             remote_done.set()
             self._root.after(
                 0,
-                lambda g=scan_gen: self._update_thread_status(service_name, g, "remote"),
+                lambda g=scan_gen, d=remote_detail: self._update_thread_status(
+                    service_name, g, "remote", d
+                ),
             )
 
         # ── Thread 3: merger — reads DB, computes statuses, updates tree ────
@@ -821,6 +850,23 @@ class MainWindow:
                     e.get("file", "") for e in sync_history if e.get("synced") is False
                 }
                 final_items = _scan_local_tree(local_path, synced_set, pending_set)
+
+            # Log a status breakdown so the user can see what the tree contains.
+            n_files = sum(1 for it in final_items if not it["is_dir"])
+            n_dirs  = sum(1 for it in final_items if it["is_dir"])
+            status_counts: Dict[str, int] = {}
+            for it in final_items:
+                if not it["is_dir"]:
+                    s = it["status"]
+                    status_counts[s] = status_counts.get(s, 0) + 1
+            breakdown = ", ".join(
+                f"{v} {k}" for k, v in sorted(status_counts.items()) if v
+            )
+            self._error_logger.log(
+                service_name,
+                f"🔄 Árbol generado: {n_files} archivos en {n_dirs} directorios"
+                + (f" [{breakdown}]" if breakdown else ""),
+            )
 
             self._root.after(
                 0,
@@ -928,7 +974,7 @@ class MainWindow:
         self._schedule_tree_refresh(service_name, len(items))
 
     def _update_thread_status(
-        self, service_name: str, gen: int, thread_name: str
+        self, service_name: str, gen: int, thread_name: str, detail: str = ""
     ) -> None:
         """Update a scan-thread status label on the main thread.
 
@@ -936,6 +982,11 @@ class MainWindow:
         finishes.  *thread_name* is one of ``"local"``, ``"remote"``, or
         ``"merger"``.  When the merger finishes the total elapsed scan time
         is computed and displayed.
+
+        *detail* is an optional string (e.g. ``"42 arch., 5 dirs."`` for a
+        successful remote scan, or ``"Sin datos remotos"`` on failure).  When
+        provided it replaces the generic ``_THREAD_DONE`` text so the user can
+        see at a glance how many entries were found.
         """
         if self._tree_check_generations.get(service_name) != gen:
             return  # a newer scan has started — discard stale update
@@ -943,12 +994,13 @@ class MainWindow:
         if status_vars is None:
             return
         local_sv, remote_sv, merger_sv = status_vars
+        done_text = detail if detail else _THREAD_DONE
         if thread_name == "local":
-            local_sv.set(f"{_SCAN_LOCAL_PREFIX}{_THREAD_DONE}")
+            local_sv.set(f"{_SCAN_LOCAL_PREFIX}{done_text}")
         elif thread_name == "remote":
-            remote_sv.set(f"{_SCAN_REMOTE_PREFIX}{_THREAD_DONE}")
+            remote_sv.set(f"{_SCAN_REMOTE_PREFIX}{done_text}")
         elif thread_name == "merger":
-            merger_sv.set(f"{_SCAN_MERGER_PREFIX}{_THREAD_DONE}")
+            merger_sv.set(f"{_SCAN_MERGER_PREFIX}{done_text}")
             start_t = self._tree_scan_wall_times.get(service_name)
             elapsed_var = self._tree_scan_elapsed_vars.get(service_name)
             if start_t is not None and elapsed_var is not None:

@@ -14,7 +14,7 @@ import shutil
 import subprocess
 import threading
 from pathlib import Path
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 
 from src.config.config_manager import ConfigManager, get_rclone_config_path, PERSONAL_VAULT_PATTERN
 
@@ -1195,16 +1195,23 @@ class RcloneManager:
         Returns ``None`` when rclone is unavailable, the service is not fully
         configured, or the remote listing command fails or times out.
         """
-        meta = self.list_remote_metadata(service_name)
+        meta, _ = self.list_remote_metadata(service_name)
         if meta is None:
             return None
         return {rel: entry["mtime"] for rel, entry in meta.items()}
 
     def list_remote_metadata(
         self, service_name: str
-    ) -> Optional[Dict[str, Dict]]:
-        """Return a ``{rel_path: {"mtime": float, "size": int, "is_dir": bool}}`` map
-        for all remote entries (files **and** directories).
+    ) -> Tuple[Optional[Dict[str, Dict]], Optional[str]]:
+        """Return ``(metadata, error_message)`` for all remote entries.
+
+        ``metadata`` is a ``{rel_path: {"mtime": float, "size": int, "is_dir": bool}}``
+        map for all remote entries (files **and** directories).  ``error_message``
+        is ``None`` on success, or a human-readable string describing the failure.
+
+        On any failure the tuple ``(None, error_message)`` is returned so
+        callers can distinguish between a successful empty listing and a real
+        error without relying on exception handling.
 
         Extends :meth:`list_remote_mtimes` by also returning the file size
         (``"size"`` key, bytes as :class:`int`) and whether the entry is a
@@ -1214,20 +1221,17 @@ class RcloneManager:
 
         Used by :meth:`~src.gui.main_window.MainWindow._start_tree_check`
         Thread 2 to write all fields to :class:`~src.db.file_scan_db.FileScanDB`.
-
-        Returns ``None`` when the remote is unavailable or the service is not
-        fully configured (same failure conditions as :meth:`list_remote_mtimes`).
         """
         import json as _json
 
         svc = self._config.get_service(service_name)
         if svc is None:
-            return None
+            return None, f"Servicio '{service_name}' no encontrado en la configuración"
         remote_name = svc.get("remote_name", "")
         remote_path = svc.get("remote_path", "/")
         local_path = svc.get("local_path", "")
         if not remote_name or not local_path:
-            return None
+            return None, "Configuración incompleta: falta remote_name o local_path"
 
         exclusions = svc.get("exclusions", [])
         remote = f"{remote_name}:{remote_path}"
@@ -1250,10 +1254,19 @@ class RcloneManager:
                 timeout=120,
             )
             if result.returncode != 0:
-                return None
+                stderr = (result.stderr or "").strip()
+                # Truncate very long rclone error messages.
+                if len(stderr) > 300:
+                    stderr = stderr[:300] + "…"
+                error_msg = stderr or f"rclone salió con código {result.returncode}"
+                return None, error_msg
             remote_items = _json.loads(result.stdout or "[]")
-        except (OSError, subprocess.TimeoutExpired, ValueError):
-            return None
+        except subprocess.TimeoutExpired:
+            return None, "Tiempo de espera agotado (>120 s) al listar el remoto"
+        except OSError as exc:
+            return None, f"No se pudo ejecutar rclone: {exc}"
+        except ValueError as exc:
+            return None, f"Respuesta JSON inválida de rclone: {exc}"
 
         metadata: Dict[str, Dict] = {}
         for item in remote_items:
@@ -1270,7 +1283,7 @@ class RcloneManager:
                 # Some backends omit ModTime for directories; use 0.0 as a
                 # sentinel meaning "exists but mtime unknown".
                 metadata[rel] = {"mtime": 0.0, "size": 0, "is_dir": True}
-        return metadata
+        return metadata, None
 
     def check_sync_status_mtime(self, service_name: str) -> Optional[List[Dict]]:
         """Compare remote vs local files using modification timestamps.
