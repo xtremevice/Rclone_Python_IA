@@ -263,6 +263,11 @@ class ConfigManager:
             # Enabled by default so that newly created local folders appear on
             # the remote even before any files are placed inside them.
             "create_empty_src_dirs": True,
+            # tree scan: timeout (seconds) for rclone lsjson --recursive used
+            # to list all remote files when refreshing the sync tree.  Remotes
+            # with many files (hundreds of thousands) can take several minutes
+            # to list; increase this value if scans are timing out.
+            "lsjson_timeout": 600,
             # rclone mount: whether to run a persistent mount process
             "mount_enabled": False,
             # rclone mount: local directory used as the mount point

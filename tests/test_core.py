@@ -429,11 +429,37 @@ class TestRcloneManager(unittest.TestCase):
         import subprocess as _sp
         self.config.add_service("TimeoutSvc", "drive", "/tmp/timeout")
         self.config.update_service("TimeoutSvc", {"remote_name": "slow_remote"})
-        with patch("subprocess.run", side_effect=_sp.TimeoutExpired("cmd", 120)):
+        with patch("subprocess.run", side_effect=_sp.TimeoutExpired("cmd", 600)) as mock_run:
             meta, err = self.rclone.list_remote_metadata("TimeoutSvc")
         self.assertIsNone(meta)
         self.assertIsNotNone(err)
-        self.assertIn("120", err)  # timeout value must appear in the message
+        self.assertIn("600", err)  # default timeout value must appear in the message
+        # subprocess.run must have been called with the default timeout of 600 s
+        _call_kwargs = mock_run.call_args
+        actual_timeout = (
+            _call_kwargs.kwargs.get("timeout")
+            if _call_kwargs.kwargs
+            else _call_kwargs[1].get("timeout")
+        )
+        self.assertEqual(actual_timeout, 600)
+
+    def test_list_remote_metadata_custom_timeout_used(self):
+        """lsjson_timeout per-service setting must change the timeout and error message."""
+        import subprocess as _sp
+        self.config.add_service("SlowSvc", "drive", "/tmp/slow")
+        self.config.update_service("SlowSvc", {"remote_name": "slow_remote2", "lsjson_timeout": 900})
+        with patch("subprocess.run", side_effect=_sp.TimeoutExpired("cmd", 900)) as mock_run:
+            meta, err = self.rclone.list_remote_metadata("SlowSvc")
+        self.assertIsNone(meta)
+        self.assertIn("900", err)
+        # The subprocess.run call must have received timeout=900
+        _call_kwargs = mock_run.call_args
+        actual_timeout = (
+            _call_kwargs.kwargs.get("timeout")
+            if _call_kwargs.kwargs
+            else _call_kwargs[1].get("timeout")
+        )
+        self.assertEqual(actual_timeout, 900)
 
     def test_list_remote_mtimes_still_works_after_api_change(self):
         """list_remote_mtimes() must still return a plain dict (no tuple leakage)."""

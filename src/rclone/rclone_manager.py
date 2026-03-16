@@ -1251,6 +1251,12 @@ class RcloneManager:
 
         exclusions = svc.get("exclusions", [])
         remote = f"{remote_name}:{remote_path}"
+        # Per-service configurable timeout; defaults to 600 s.  Large remotes
+        # (hundreds of thousands of files) can take several minutes to list.
+        try:
+            lsjson_timeout: int = int(svc.get("lsjson_timeout", 600))
+        except (TypeError, ValueError):
+            lsjson_timeout = 600
         # No --files-only: we want both files AND directories so that
         # empty remote directories also appear in the sync tree.
         cmd = _rclone_base_args(self._config) + [
@@ -1267,7 +1273,7 @@ class RcloneManager:
                 cmd,
                 capture_output=True,
                 text=True,
-                timeout=120,
+                timeout=lsjson_timeout,
             )
             if result.returncode != 0:
                 stderr = (result.stderr or "").strip()
@@ -1278,7 +1284,7 @@ class RcloneManager:
                 return None, error_msg
             remote_items = _json.loads(result.stdout or "[]")
         except subprocess.TimeoutExpired:
-            return None, "Tiempo de espera agotado (>120 s) al listar el remoto"
+            return None, f"Tiempo de espera agotado (>{lsjson_timeout} s) al listar el remoto"
         except OSError as exc:
             return None, f"No se pudo ejecutar rclone: {exc}"
         except ValueError as exc:
