@@ -4151,6 +4151,35 @@ class TestFileScanDB(unittest.TestCase):
         shutil.rmtree(self._tmpdir, ignore_errors=True)
 
     # ------------------------------------------------------------------
+    # Path discovery
+    # ------------------------------------------------------------------
+
+    def test_db_path_property_returns_path_object(self):
+        """db_path must return a Path instance pointing to the database file."""
+        self.assertIsInstance(self._db.db_path, Path)
+
+    def test_db_path_property_matches_actual_file(self):
+        """db_path must point to the SQLite file that actually exists on disk."""
+        self.assertTrue(
+            self._db.db_path.exists(),
+            f"db_path {self._db.db_path} does not exist",
+        )
+
+    def test_db_path_property_is_the_configured_path(self):
+        """db_path must return exactly the path passed to the constructor."""
+        expected = Path(self._tmpdir) / "test_scan.db"
+        self.assertEqual(self._db.db_path, expected)
+
+    def test_key_path_property_returns_path_object(self):
+        """key_path must return a Path instance pointing to the key file."""
+        self.assertIsInstance(self._db.key_path, Path)
+
+    def test_key_path_property_is_the_configured_path(self):
+        """key_path must return exactly the path passed to the constructor."""
+        expected = Path(self._tmpdir) / "test.key"
+        self.assertEqual(self._db.key_path, expected)
+
+    # ------------------------------------------------------------------
     # Table lifecycle
     # ------------------------------------------------------------------
 

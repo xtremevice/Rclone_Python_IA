@@ -128,6 +128,27 @@ class FileScanDB:
         self._lock = threading.Lock()
 
     # ------------------------------------------------------------------
+    # Path discovery
+    # ------------------------------------------------------------------
+
+    @property
+    def db_path(self) -> Path:
+        """Absolute path of the SQLite database file.
+
+        Useful for locating the database during development and testing::
+
+            from src.db.file_scan_db import FileScanDB
+            db = FileScanDB()
+            print(db.db_path)   # ~/.config/RclonePythonIA/file_scan_cache.db
+        """
+        return self._db_path
+
+    @property
+    def key_path(self) -> Path:
+        """Absolute path of the Fernet encryption key file (``db.key``)."""
+        return self._key_path
+
+    # ------------------------------------------------------------------
     # Key management
     # ------------------------------------------------------------------
 

@@ -89,6 +89,15 @@ class MainWindow:
         # Encrypted SQLite database for per-service file scan metadata.
         # Created once and shared across all service tree-check threads.
         self._db = FileScanDB()
+        # Log the DB path on startup so developers and testers can find it.
+        self._error_logger.log(
+            "Sistema",
+            f"📂 Base de datos: {self._db.db_path}",
+        )
+        self._error_logger.log(
+            "Sistema",
+            f"🔑 Clave de cifrado: {self._db.key_path}",
+        )
 
         # Root Tk window
         self._root = tk.Tk()
