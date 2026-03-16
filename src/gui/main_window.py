@@ -1627,7 +1627,11 @@ def _merge_local_and_comparison(
         comp_item = comp_map.get(rel)
         if comp_item is not None:
             # Comparison confirmed this file exists on one or both sides.
-            item["status"] = comp_item.get("status", "unknown")
+            cstatus = comp_item.get("status", "unknown")
+            # If the DB returned "unknown" (both mtimes NULL — stale/corrupt
+            # record) we still know this file IS present locally, so treat it
+            # as "local_only" rather than showing it grey.
+            item["status"] = cstatus if cstatus != "unknown" else "local_only"
             # Carry through mtime values so the columns can be populated
             if "local_mtime" in comp_item:
                 item["local_mtime"] = comp_item["local_mtime"]

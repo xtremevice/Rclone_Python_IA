@@ -3989,7 +3989,10 @@ def _merge_local_and_comparison_testable(local_path, comparison_items,
         local_file_rels.add(rel)
         comp_item = comp_map.get(rel)
         if comp_item is not None:
-            item["status"] = comp_item.get("status", "unknown")
+            cstatus = comp_item.get("status", "unknown")
+            # "unknown" in the DB means neither mtime was stored; the file IS
+            # local so fall back to "local_only" rather than showing grey.
+            item["status"] = cstatus if cstatus != "unknown" else "local_only"
             if "local_mtime" in comp_item:
                 item["local_mtime"] = comp_item["local_mtime"]
             if "remote_mtime" in comp_item:
@@ -4160,6 +4163,27 @@ class TestMergeLocalAndComparison(unittest.TestCase):
         dir_statuses = {item["rel"]: item["status"]
                         for item in result if item["is_dir"]}
         self.assertEqual(dir_statuses.get("subdir"), "local_only")
+
+    def test_unknown_in_comp_map_becomes_local_only(self):
+        """A local file whose DB record has status 'unknown' must appear as local_only.
+
+        This covers the case where the DB has a stale/corrupt record with
+        NULL mtimes for a file that IS present on the local filesystem.
+        The tree must show it in blue (local_only), not grey (unknown).
+        """
+        comp = [
+            {"rel": "file_a.txt",       "status": "unknown"},
+            {"rel": "subdir/file_b.txt", "status": "unknown"},
+            {"rel": "subdir/file_c.txt", "status": "synced"},
+        ]
+        result = self._merge(comp)
+        statuses = {item["rel"]: item["status"]
+                    for item in result if not item["is_dir"]}
+        # unknown in comp_map but locally present → must be local_only (blue)
+        self.assertEqual(statuses.get("file_a.txt"),        "local_only")
+        self.assertEqual(statuses.get("subdir/file_b.txt"), "local_only")
+        # synced should be kept as-is
+        self.assertEqual(statuses.get("subdir/file_c.txt"), "synced")
 
     # ── edge cases ───────────────────────────────────────────────────────────
 
