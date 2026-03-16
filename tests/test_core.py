@@ -3331,6 +3331,7 @@ def _build_check_tree_testable(check_items, max_files, max_dirs):
         if not rel:
             continue
         parts = rel.split("/")
+        is_item_dir = item.get("is_dir", False)
         for i in range(1, len(parts)):
             if dir_count >= max_dirs:
                 break
@@ -3343,19 +3344,30 @@ def _build_check_tree_testable(check_items, max_files, max_dirs):
                     "name": parts[i - 1], "is_dir": True, "status": "unknown",
                 })
                 dir_count += 1
-        if file_count < max_files:
-            parent_rel = "/".join(parts[:-1])
-            node = {
-                "rel": rel, "parent": parent_rel,
-                "name": parts[-1], "is_dir": False,
-                "status": item.get("status", "unknown"),
-            }
-            if "local_mtime" in item:
-                node["local_mtime"] = item["local_mtime"]
-            if "remote_mtime" in item:
-                node["remote_mtime"] = item["remote_mtime"]
-            result.append(node)
-            file_count += 1
+        if is_item_dir:
+            if rel not in seen_dirs and dir_count < max_dirs:
+                parent_rel = "/".join(parts[:-1])
+                result.append({
+                    "rel": rel, "parent": parent_rel,
+                    "name": parts[-1], "is_dir": True,
+                    "status": item.get("status", "unknown"),
+                })
+                seen_dirs.add(rel)
+                dir_count += 1
+        else:
+            if file_count < max_files:
+                parent_rel = "/".join(parts[:-1])
+                node = {
+                    "rel": rel, "parent": parent_rel,
+                    "name": parts[-1], "is_dir": False,
+                    "status": item.get("status", "unknown"),
+                }
+                if "local_mtime" in item:
+                    node["local_mtime"] = item["local_mtime"]
+                if "remote_mtime" in item:
+                    node["remote_mtime"] = item["remote_mtime"]
+                result.append(node)
+                file_count += 1
 
     _propagate_dir_status_testable(result)
     return result
@@ -3416,6 +3428,37 @@ class TestBuildCheckTreeCap(unittest.TestCase):
         result = _build_check_tree_testable(items, max_files=100, max_dirs=3)
         dir_nodes = [i for i in result if i["is_dir"]]
         self.assertLessEqual(len(dir_nodes), 3)
+
+    def test_is_dir_item_added_as_directory_node(self):
+        """An item with is_dir=True must be inserted as a directory node."""
+        items = [{"rel": "emptydir", "status": "remote_only", "is_dir": True}]
+        result = _build_check_tree_testable(items, max_files=100, max_dirs=100)
+        dir_nodes = [i for i in result if i["is_dir"]]
+        self.assertEqual(len(dir_nodes), 1)
+        self.assertEqual(dir_nodes[0]["rel"], "emptydir")
+        self.assertEqual(dir_nodes[0]["is_dir"], True)
+
+    def test_is_dir_item_not_counted_as_file(self):
+        """An item with is_dir=True must NOT consume a file slot."""
+        items = [
+            {"rel": "thedir", "status": "remote_only", "is_dir": True},
+            {"rel": "thedir/child.txt", "status": "remote_only"},
+        ]
+        result = _build_check_tree_testable(items, max_files=1, max_dirs=100)
+        # The directory node must appear
+        dir_rels = {i["rel"] for i in result if i["is_dir"]}
+        self.assertIn("thedir", dir_rels)
+        # The one file slot must also be used
+        file_nodes = [i for i in result if not i["is_dir"]]
+        self.assertEqual(len(file_nodes), 1)
+
+    def test_nested_is_dir_item_gets_parent_synthesised(self):
+        """A nested is_dir item must also have its parent directory created."""
+        items = [{"rel": "parent/child_dir", "status": "remote_only", "is_dir": True}]
+        result = _build_check_tree_testable(items, max_files=100, max_dirs=100)
+        rels = {i["rel"] for i in result if i["is_dir"]}
+        self.assertIn("parent", rels, "synthesised parent must appear")
+        self.assertIn("parent/child_dir", rels, "the directory item itself must appear")
 
 
 # ---------------------------------------------------------------------------
@@ -3727,6 +3770,7 @@ def _merge_local_and_comparison_testable(local_path, comparison_items,
     result = _do_local_scan(local_path, max_files, max_dirs)
 
     # Stage 2: overlay comparison statuses onto local file nodes
+    local_all_rels = {item["rel"] for item in result}
     local_file_rels = set()
     for item in result:
         if item["is_dir"]:
@@ -3743,11 +3787,15 @@ def _merge_local_and_comparison_testable(local_path, comparison_items,
         else:
             item["status"] = "local_only"
 
-    # Stage 3: add remote-only files not found locally
+    # Stage 3: add remote-only entries (files AND directories) not found locally
     remote_only_items = []
     for rel, ci in comp_map.items():
-        if ci.get("status") == "remote_only" and rel not in local_file_rels:
-            ro_item = {"rel": rel, "status": "remote_only"}
+        if ci.get("status") == "remote_only" and rel not in local_all_rels:
+            ro_item = {
+                "rel": rel,
+                "status": "remote_only",
+                "is_dir": ci.get("is_dir", False),
+            }
             if "remote_mtime" in ci:
                 ro_item["remote_mtime"] = ci["remote_mtime"]
             remote_only_items.append(ro_item)
@@ -3850,6 +3898,30 @@ class TestMergeLocalAndComparison(unittest.TestCase):
         rels = {item["rel"] for item in result}
         self.assertIn("remote_dir",               rels, "parent dir must be created")
         self.assertIn("remote_dir/remote_file.txt", rels)
+
+    def test_remote_only_directory_appears_in_tree(self):
+        """An is_dir=True remote_only entry must appear as a directory node."""
+        comp = [{"rel": "only_remote_dir", "status": "remote_only", "is_dir": True}]
+        result = self._merge(comp)
+        rels = {item["rel"] for item in result}
+        self.assertIn("only_remote_dir", rels)
+
+    def test_remote_only_directory_node_has_is_dir_true(self):
+        """A remote-only directory node must have is_dir=True."""
+        comp = [{"rel": "rem_dir", "status": "remote_only", "is_dir": True}]
+        result = self._merge(comp)
+        rem_dir = next((i for i in result if i["rel"] == "rem_dir"), None)
+        self.assertIsNotNone(rem_dir)
+        self.assertTrue(rem_dir["is_dir"])
+
+    def test_remote_only_empty_dir_not_duplicated_when_also_local(self):
+        """A remote-only directory already in the local tree must not be re-added."""
+        # 'subdir' exists locally (set up in setUp); if it also appears as
+        # remote_only in the comparison it must appear exactly once.
+        comp = [{"rel": "subdir", "status": "remote_only", "is_dir": True}]
+        result = self._merge(comp)
+        matches = [i for i in result if i["rel"] == "subdir"]
+        self.assertEqual(len(matches), 1)
 
     def test_local_file_not_duplicated_when_in_comparison(self):
         """A local file that also appears in comparison must not be duplicated."""
@@ -4384,6 +4456,119 @@ class TestFileScanDB(unittest.TestCase):
         self._db.update_statuses("SvcRO", scan_ts=0)
         records = self._db.get_all_records("SvcRO")
         self.assertEqual(records[0]["status"], "remote_only")
+
+    # ------------------------------------------------------------------
+    # Directory tracking (is_dir flag)
+    # ------------------------------------------------------------------
+
+    def test_upsert_local_batch_stores_is_dir_true(self):
+        """upsert_local_batch must persist is_dir=True for directory entries."""
+        ts = 1700000000.0
+        self._db.ensure_table("SvcDirLocal")
+        self._db.upsert_local_batch(
+            "SvcDirLocal", ts + 10,
+            {
+                "mydir": {"mtime": ts, "size": 0, "is_dir": True},
+                "mydir/file.txt": {"mtime": ts, "size": 42, "is_dir": False},
+            },
+        )
+        records = {r["rel"]: r for r in self._db.get_all_records("SvcDirLocal")}
+        self.assertTrue(records["mydir"]["is_dir"])
+        self.assertFalse(records["mydir/file.txt"]["is_dir"])
+
+    def test_upsert_remote_batch_stores_is_dir_true(self):
+        """upsert_remote_batch must persist is_dir=True for directory entries."""
+        ts = 1700000000.0
+        self._db.ensure_table("SvcDirRemote")
+        self._db.upsert_remote_batch(
+            "SvcDirRemote", ts + 10,
+            {
+                "remotedir": {"mtime": ts, "size": 0, "is_dir": True},
+                "remotedir/data.csv": {"mtime": ts, "size": 100, "is_dir": False},
+            },
+        )
+        records = {r["rel"]: r for r in self._db.get_all_records("SvcDirRemote")}
+        self.assertTrue(records["remotedir"]["is_dir"])
+        self.assertFalse(records["remotedir/data.csv"]["is_dir"])
+
+    def test_is_dir_defaults_to_false_when_not_provided(self):
+        """Omitting 'is_dir' key in the batch dict must default to False."""
+        ts = 1700000000.0
+        self._db.ensure_table("SvcNoDirKey")
+        self._db.upsert_local_batch(
+            "SvcNoDirKey", ts + 10,
+            {"file.txt": {"mtime": ts, "size": 10}},
+        )
+        records = self._db.get_all_records("SvcNoDirKey")
+        self.assertFalse(records[0]["is_dir"])
+
+    def test_update_statuses_directory_always_synced_when_both_sides_exist(self):
+        """A directory present on both sides must always get status 'synced',
+        regardless of mtime difference."""
+        ts = 1700000000.0
+        self._db.ensure_table("SvcDirStatus")
+        # Local directory mtime differs greatly from remote
+        self._db.upsert_local_batch(
+            "SvcDirStatus", ts + 10,
+            {"mydir": {"mtime": ts, "size": 0, "is_dir": True}},
+        )
+        self._db.upsert_remote_batch(
+            "SvcDirStatus", ts + 10,
+            {"mydir": {"mtime": ts + 3600, "size": 0, "is_dir": True}},
+        )
+        self._db.update_statuses("SvcDirStatus", scan_ts=0)
+        records = self._db.get_all_records("SvcDirStatus")
+        self.assertEqual(records[0]["status"], "synced")
+
+    def test_update_statuses_remote_only_directory(self):
+        """A directory present only on remote must get status 'remote_only'."""
+        ts = 1700000000.0
+        self._db.ensure_table("SvcDirRO")
+        self._db.upsert_remote_batch(
+            "SvcDirRO", ts + 10,
+            {"onlyremotedir": {"mtime": ts, "size": 0, "is_dir": True}},
+        )
+        self._db.update_statuses("SvcDirRO", scan_ts=0)
+        records = self._db.get_all_records("SvcDirRO")
+        self.assertEqual(records[0]["status"], "remote_only")
+
+    def test_schema_migration_adds_is_dir_enc(self):
+        """ensure_table must add is_dir_enc to tables created without it."""
+        import sqlite3 as _sqlite3
+        from pathlib import Path as _Path
+        import tempfile as _tmp
+        import os as _os
+        from src.db.file_scan_db import FileScanDB
+
+        tmpdir = _tmp.mkdtemp()
+        try:
+            db_path = _Path(tmpdir) / "old.db"
+            key_path = _Path(tmpdir) / "old.key"
+            # Create a database using the old schema (without is_dir_enc).
+            conn = _sqlite3.connect(str(db_path))
+            conn.execute("""
+                CREATE TABLE svc_test (
+                    path_hash TEXT PRIMARY KEY,
+                    rel_path_enc BLOB NOT NULL,
+                    local_size_enc BLOB, remote_size_enc BLOB,
+                    local_mtime_enc BLOB, remote_mtime_enc BLOB,
+                    local_scan_ts REAL, remote_scan_ts REAL,
+                    status_enc BLOB
+                )
+            """)
+            conn.commit()
+            conn.close()
+            # Open via FileScanDB — ensure_table should add is_dir_enc.
+            db = FileScanDB(db_path=db_path, key_path=key_path)
+            db.ensure_table("test")
+            conn2 = _sqlite3.connect(str(db_path))
+            cols = [r[1] for r in conn2.execute("PRAGMA table_info(svc_test)").fetchall()]
+            conn2.close()
+            db.close()
+            self.assertIn("is_dir_enc", cols)
+        finally:
+            import shutil as _shutil
+            _shutil.rmtree(tmpdir, ignore_errors=True)
 
     # ------------------------------------------------------------------
     # Encryption round-trip

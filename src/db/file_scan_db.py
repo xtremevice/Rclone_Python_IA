@@ -189,7 +189,15 @@ class FileScanDB:
     # ------------------------------------------------------------------
 
     def ensure_table(self, service_name: str) -> None:
-        """Create the scan-metadata table for *service_name* if it does not exist."""
+        """Create the scan-metadata table for *service_name* if it does not exist.
+
+        The table stores both files **and** directories so the tree view can
+        show remote-only directories (including empty ones) and compute
+        directory-level sync statuses correctly.
+
+        An ``is_dir_enc`` column was added in a later schema revision.
+        Existing tables are migrated automatically with ``ALTER TABLE``.
+        """
         tbl = _table_slug(service_name)
         with self._lock:
             self._conn.execute(f"""
@@ -202,9 +210,15 @@ class FileScanDB:
                     remote_mtime_enc BLOB,
                     local_scan_ts    REAL,
                     remote_scan_ts   REAL,
-                    status_enc       BLOB
+                    status_enc       BLOB,
+                    is_dir_enc       BLOB
                 )
             """)
+            # Migrate tables created before is_dir_enc was added.
+            try:
+                self._conn.execute(f'ALTER TABLE "{tbl}" ADD COLUMN is_dir_enc BLOB')
+            except sqlite3.OperationalError:
+                pass  # Column already exists — ignore
             self._conn.commit()
 
     def drop_table(self, service_name: str) -> None:
@@ -300,20 +314,24 @@ class FileScanDB:
             in the unencrypted ``local_scan_ts`` column so that stale records
             can be pruned without decrypting every row.
         files:
-            Mapping of ``rel_path → {"size": int, "mtime": float}``.
+            Mapping of ``rel_path → {"size": int, "mtime": float, "is_dir": bool}``.
+            The ``"is_dir"`` key is optional and defaults to ``False`` so that
+            callers using the old two-key format continue to work unchanged.
         """
         tbl = _table_slug(service_name)
         with self._lock:
             self._conn.executemany(
                 f"""
                 INSERT INTO "{tbl}"
-                    (path_hash, rel_path_enc, local_size_enc, local_mtime_enc, local_scan_ts)
-                VALUES (?, ?, ?, ?, ?)
+                    (path_hash, rel_path_enc, local_size_enc, local_mtime_enc,
+                     local_scan_ts, is_dir_enc)
+                VALUES (?, ?, ?, ?, ?, ?)
                 ON CONFLICT(path_hash) DO UPDATE SET
-                    rel_path_enc   = excluded.rel_path_enc,
-                    local_size_enc = excluded.local_size_enc,
+                    rel_path_enc    = excluded.rel_path_enc,
+                    local_size_enc  = excluded.local_size_enc,
                     local_mtime_enc = excluded.local_mtime_enc,
-                    local_scan_ts  = excluded.local_scan_ts
+                    local_scan_ts   = excluded.local_scan_ts,
+                    is_dir_enc      = excluded.is_dir_enc
                 """,
                 [
                     (
@@ -322,11 +340,12 @@ class FileScanDB:
                         self._enc(str(meta["size"])),
                         self._enc(str(meta["mtime"])),
                         scan_ts,
+                        self._enc("1" if meta.get("is_dir") else "0"),
                     )
                     for rel, meta in files.items()
                 ],
             )
-            # Clear local fields for files not found in this scan batch and
+            # Clear local fields for entries not found in this scan batch and
             # delete orphaned records via the shared pruning helper.
             self._prune_stale_and_orphaned(tbl, scan_ts, "local")
             self._conn.commit()
@@ -348,20 +367,23 @@ class FileScanDB:
         scan_ts:
             UTC epoch timestamp marking when this scan batch started.
         files:
-            Mapping of ``rel_path → {"size": int, "mtime": float}``.
+            Mapping of ``rel_path → {"size": int, "mtime": float, "is_dir": bool}``.
+            The ``"is_dir"`` key is optional and defaults to ``False``.
         """
         tbl = _table_slug(service_name)
         with self._lock:
             self._conn.executemany(
                 f"""
                 INSERT INTO "{tbl}"
-                    (path_hash, rel_path_enc, remote_size_enc, remote_mtime_enc, remote_scan_ts)
-                VALUES (?, ?, ?, ?, ?)
+                    (path_hash, rel_path_enc, remote_size_enc, remote_mtime_enc,
+                     remote_scan_ts, is_dir_enc)
+                VALUES (?, ?, ?, ?, ?, ?)
                 ON CONFLICT(path_hash) DO UPDATE SET
-                    rel_path_enc    = excluded.rel_path_enc,
-                    remote_size_enc = excluded.remote_size_enc,
+                    rel_path_enc     = excluded.rel_path_enc,
+                    remote_size_enc  = excluded.remote_size_enc,
                     remote_mtime_enc = excluded.remote_mtime_enc,
-                    remote_scan_ts  = excluded.remote_scan_ts
+                    remote_scan_ts   = excluded.remote_scan_ts,
+                    is_dir_enc       = excluded.is_dir_enc
                 """,
                 [
                     (
@@ -370,11 +392,12 @@ class FileScanDB:
                         self._enc(str(meta["size"])),
                         self._enc(str(meta["mtime"])),
                         scan_ts,
+                        self._enc("1" if meta.get("is_dir") else "0"),
                     )
                     for rel, meta in files.items()
                 ],
             )
-            # Clear remote fields for files no longer present on the remote
+            # Clear remote fields for entries no longer present on the remote
             # and delete orphaned records via the shared pruning helper.
             self._prune_stale_and_orphaned(tbl, scan_ts, "remote")
             self._conn.commit()
@@ -387,8 +410,11 @@ class FileScanDB:
 
         Status assignment rules:
 
-        * Both local and remote mtime present, ``|Δ| ≤ tolerance`` → ``"synced"``
-        * Both present, ``|Δ| > tolerance`` → ``"diff"``
+        * Both local and remote mtime present AND entry is a **file**,
+          ``|Δ| ≤ tolerance`` → ``"synced"``
+        * Both present AND entry is a **file**, ``|Δ| > tolerance`` → ``"diff"``
+        * Both present AND entry is a **directory** → ``"synced"``
+          (directory mtime differences are not a reliable sync indicator)
         * Only local mtime → ``"local_only"``
         * Only remote mtime → ``"remote_only"``
         * Neither → ``"unknown"``
@@ -398,8 +424,15 @@ class FileScanDB:
         for row in records:
             l_ts = self._to_float(self._dec(row["local_mtime_enc"]))
             r_ts = self._to_float(self._dec(row["remote_mtime_enc"]))
+            is_dir = (self._dec(row["is_dir_enc"]) == "1") if row["is_dir_enc"] else False
             if l_ts is not None and r_ts is not None:
-                status = "synced" if abs(l_ts - r_ts) <= _MTIME_TOLERANCE_SECS else "diff"
+                # Directories are always "synced" when they exist on both sides
+                # because a directory's mtime changes whenever its contents change
+                # and is therefore not a reliable indicator of a sync difference.
+                if is_dir:
+                    status = "synced"
+                else:
+                    status = "synced" if abs(l_ts - r_ts) <= _MTIME_TOLERANCE_SECS else "diff"
             elif l_ts is not None:
                 status = "local_only"
             elif r_ts is not None:
@@ -433,6 +466,7 @@ class FileScanDB:
         * ``"last_local_scan"``  – UTC epoch of the last local scan (:class:`float` or ``None``)
         * ``"last_remote_scan"`` – UTC epoch of the last remote scan (:class:`float` or ``None``)
         * ``"status"``        – sync status string (``"synced"``, ``"diff"``, etc.)
+        * ``"is_dir"``        – ``True`` when the entry is a directory, ``False`` for files
 
         Returns an empty list if the table does not exist.
         """
@@ -442,6 +476,7 @@ class FileScanDB:
             rel = self._dec(row["rel_path_enc"])
             if not rel:
                 continue
+            is_dir = (self._dec(row["is_dir_enc"]) == "1") if row["is_dir_enc"] else False
             result.append({
                 "rel": rel,
                 "local_size": self._to_int(self._dec(row["local_size_enc"])),
@@ -451,6 +486,7 @@ class FileScanDB:
                 "last_local_scan": row["local_scan_ts"],
                 "last_remote_scan": row["remote_scan_ts"],
                 "status": self._dec(row["status_enc"]) or "unknown",
+                "is_dir": is_dir,
             })
         return result
 

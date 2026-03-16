@@ -717,7 +717,21 @@ class MainWindow:
             local_files: Dict[str, Dict] = {}
             if local_path and os.path.isdir(local_path):
                 base = Path(local_path)
-                for dirpath, _dirs, filenames in os.walk(local_path):
+                for dirpath, dirs, filenames in os.walk(local_path):
+                    # Include directory entries so the DB tracks local directories
+                    # and the tree can compare them against remote directories.
+                    for d in dirs:
+                        full = os.path.join(dirpath, d)
+                        try:
+                            rel = str(Path(full).relative_to(base)).replace("\\", "/")
+                            st = os.stat(full)
+                            local_files[rel] = {
+                                "mtime": st.st_mtime,
+                                "size": 0,
+                                "is_dir": True,
+                            }
+                        except (OSError, ValueError):
+                            pass
                     for name in filenames:
                         full = os.path.join(dirpath, name)
                         try:
@@ -726,6 +740,7 @@ class MainWindow:
                             local_files[rel] = {
                                 "mtime": st.st_mtime,
                                 "size": st.st_size,
+                                "is_dir": False,
                             }
                         except (OSError, ValueError):
                             pass
@@ -766,6 +781,7 @@ class MainWindow:
                     "status": "local_only",
                     "local_mtime": rec["local_mtime"],
                     "remote_mtime": None,
+                    "is_dir": rec.get("is_dir", False),
                 }
                 for rec in records if rec["rel"]
             ]
@@ -790,6 +806,7 @@ class MainWindow:
                         "status": rec["status"],
                         "local_mtime": rec["local_mtime"],
                         "remote_mtime": rec["remote_mtime"],
+                        "is_dir": rec.get("is_dir", False),
                     }
                     for rec in records if rec["rel"]
                 ]
@@ -1546,6 +1563,9 @@ def _merge_local_and_comparison(
     result = _scan_local_tree(local_path, set(), set())
 
     # ── Stage 2: overlay comparison statuses onto local file nodes ───────────
+    # Track ALL local rels (both files and directories) to avoid re-adding
+    # entries that already exist locally when we process remote-only items.
+    local_all_rels: set = {item["rel"] for item in result}
     local_file_rels: set = set()
     for item in result:
         if item["is_dir"]:
@@ -1566,15 +1586,20 @@ def _merge_local_and_comparison(
             # it → it only exists on the local disk.
             item["status"] = "local_only"
 
-    # ── Stage 3: append remote-only files ───────────────────────────────────
-    # Files reported as "remote_only" by the comparison exist on the remote
-    # but were NOT found by the local scan (i.e. they are genuinely absent
-    # from the local folder).  Add them to the result so the tree shows the
-    # full picture.
+    # ── Stage 3: append remote-only entries (files AND directories) ─────────
+    # Entries reported as "remote_only" by the comparison exist on the remote
+    # but were NOT found by the local scan (genuinely absent from local folder).
+    # This includes empty remote directories which have no files to synthesise
+    # a parent node from.  Add them to the result so the tree shows the full
+    # picture.
     remote_only_items = []
     for rel, ci in comp_map.items():
-        if ci.get("status") == "remote_only" and rel not in local_file_rels:
-            ro_item: Dict = {"rel": rel, "status": "remote_only"}
+        if ci.get("status") == "remote_only" and rel not in local_all_rels:
+            ro_item: Dict = {
+                "rel": rel,
+                "status": "remote_only",
+                "is_dir": ci.get("is_dir", False),
+            }
             if "remote_mtime" in ci:
                 ro_item["remote_mtime"] = ci["remote_mtime"]
             remote_only_items.append(ro_item)
@@ -1602,9 +1627,11 @@ def _merge_local_and_comparison(
 def _build_check_tree(check_items: List[Dict]) -> List[Dict]:
     """Convert ``rclone check --combined`` output into Treeview node dicts.
 
-    Each input item has ``rel`` (POSIX path) and ``status`` keys.
-    Virtual directory nodes are synthesised from file paths so the tree
-    has proper parent–child structure.
+    Each input item has ``rel`` (POSIX path) and ``status`` keys.  Items may
+    optionally carry ``"is_dir": True`` to indicate that the entry itself is a
+    directory (e.g. a remote-only empty directory).  Virtual directory nodes
+    are synthesised from file paths so the tree has proper parent–child
+    structure.
 
     Items are ordered depth-first (parent always before its children) so they
     can be inserted into a :class:`ttk.Treeview` in a single forward pass.
@@ -1627,8 +1654,11 @@ def _build_check_tree(check_items: List[Dict]) -> List[Dict]:
             continue
 
         parts = rel.split("/")
+        is_item_dir = item.get("is_dir", False)
 
-        # Synthesise parent directory nodes (always shown, up to _MAX_TREE_DIRS)
+        # Synthesise parent directory nodes (always shown, up to _MAX_TREE_DIRS).
+        # For both files and directories we synthesise all ANCESTOR directories
+        # (i.e. all path components except the last one).
         for i in range(1, len(parts)):
             if dir_count >= _MAX_TREE_DIRS:
                 break
@@ -1645,23 +1675,39 @@ def _build_check_tree(check_items: List[Dict]) -> List[Dict]:
                 })
                 dir_count += 1
 
-        # File node (shown up to _MAX_TREE_FILES)
-        if file_count < _MAX_TREE_FILES:
-            parent_rel = "/".join(parts[:-1])
-            node: Dict = {
-                "rel": rel,
-                "parent": parent_rel,
-                "name": parts[-1],
-                "is_dir": False,
-                "status": item.get("status", "unknown"),
-            }
-            # Carry through mtime fields when present
-            if "local_mtime" in item:
-                node["local_mtime"] = item["local_mtime"]
-            if "remote_mtime" in item:
-                node["remote_mtime"] = item["remote_mtime"]
-            result.append(node)
-            file_count += 1
+        if is_item_dir:
+            # Directory entry: add it as a directory node (not a file node).
+            # This handles explicit remote-only directories (including empty
+            # ones) that would otherwise be invisible in the tree.
+            if rel not in seen_dirs and dir_count < _MAX_TREE_DIRS:
+                parent_rel = "/".join(parts[:-1])
+                result.append({
+                    "rel": rel,
+                    "parent": parent_rel,
+                    "name": parts[-1],
+                    "is_dir": True,
+                    "status": item.get("status", "unknown"),
+                })
+                seen_dirs.add(rel)
+                dir_count += 1
+        else:
+            # File node (shown up to _MAX_TREE_FILES)
+            if file_count < _MAX_TREE_FILES:
+                parent_rel = "/".join(parts[:-1])
+                node: Dict = {
+                    "rel": rel,
+                    "parent": parent_rel,
+                    "name": parts[-1],
+                    "is_dir": False,
+                    "status": item.get("status", "unknown"),
+                }
+                # Carry through mtime fields when present
+                if "local_mtime" in item:
+                    node["local_mtime"] = item["local_mtime"]
+                if "remote_mtime" in item:
+                    node["remote_mtime"] = item["remote_mtime"]
+                result.append(node)
+                file_count += 1
 
     # Colour each synthesised directory node based on its descendant files
     _propagate_dir_status(result)
@@ -1869,8 +1915,9 @@ def _fill_sync_tree(tree: ttk.Treeview, items: List[Dict]) -> None:
         icon  = "📁 " if is_dir else "📄 "
         label = _TREE_STATUS_LABELS.get(status, "❓")
         tags  = _TREE_STATUS_TAGS.get(status, ("unknown",))
-        # Auto-open top-level directories so the user immediately sees content
-        open_node = is_dir and parent == ""
+        # All nodes start collapsed so users are not overwhelmed by an
+        # automatically expanded tree and can open folders on demand.
+        open_node = False
 
         # Mtime columns: only meaningful for files; directories show nothing
         local_str  = "" if is_dir else _format_mtime(item.get("local_mtime"))

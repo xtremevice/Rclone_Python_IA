@@ -1203,12 +1203,17 @@ class RcloneManager:
     def list_remote_metadata(
         self, service_name: str
     ) -> Optional[Dict[str, Dict]]:
-        """Return a ``{rel_path: {"mtime": float, "size": int}}`` map for all remote files.
+        """Return a ``{rel_path: {"mtime": float, "size": int, "is_dir": bool}}`` map
+        for all remote entries (files **and** directories).
 
         Extends :meth:`list_remote_mtimes` by also returning the file size
-        (``"size"`` key, bytes as :class:`int`) from the ``rclone lsjson``
-        output.  Used by :meth:`~src.gui.main_window.MainWindow._start_tree_check`
-        Thread 2 to write both fields to :class:`~src.db.file_scan_db.FileScanDB`.
+        (``"size"`` key, bytes as :class:`int`) and whether the entry is a
+        directory (``"is_dir"`` key, :class:`bool`).  Directories are included
+        so the sync tree can display remote-only subdirectories (including
+        empty ones) and track directory-level sync status in the DB.
+
+        Used by :meth:`~src.gui.main_window.MainWindow._start_tree_check`
+        Thread 2 to write all fields to :class:`~src.db.file_scan_db.FileScanDB`.
 
         Returns ``None`` when the remote is unavailable or the service is not
         fully configured (same failure conditions as :meth:`list_remote_mtimes`).
@@ -1226,10 +1231,11 @@ class RcloneManager:
 
         exclusions = svc.get("exclusions", [])
         remote = f"{remote_name}:{remote_path}"
+        # No --files-only: we want both files AND directories so that
+        # empty remote directories also appear in the sync tree.
         cmd = _rclone_base_args(self._config) + [
             "lsjson",
             "--recursive",
-            "--files-only",
             "--no-mimetype",
             remote,
         ]
@@ -1252,12 +1258,18 @@ class RcloneManager:
         metadata: Dict[str, Dict] = {}
         for item in remote_items:
             rel = item.get("Path", "").replace("\\", "/").strip("/")
+            if not rel:
+                continue
+            is_dir = item.get("IsDir", False)
             mtime_str = item.get("ModTime", "")
             size = item.get("Size", 0)
-            if rel:
-                ts = _parse_rclone_mtime(mtime_str)
-                if ts is not None:
-                    metadata[rel] = {"mtime": ts, "size": int(size)}
+            ts = _parse_rclone_mtime(mtime_str)
+            if ts is not None:
+                metadata[rel] = {"mtime": ts, "size": int(size), "is_dir": is_dir}
+            elif is_dir:
+                # Some backends omit ModTime for directories; use 0.0 as a
+                # sentinel meaning "exists but mtime unknown".
+                metadata[rel] = {"mtime": 0.0, "size": 0, "is_dir": True}
         return metadata
 
     def check_sync_status_mtime(self, service_name: str) -> Optional[List[Dict]]:
