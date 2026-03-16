@@ -367,6 +367,22 @@ def _rclone_supports_resync_mode(config_manager: ConfigManager) -> bool:
     return (major, minor) >= (1, 64)
 
 
+def _rclone_supports_create_empty_src_dirs(config_manager: ConfigManager) -> bool:
+    """Return True if the installed rclone supports --create-empty-src-dirs for bisync (v1.64+).
+
+    ``--create-empty-src-dirs`` was added to ``rclone bisync`` in v1.64.  It
+    already existed for ``rclone sync``/``copy`` on much earlier versions, but
+    passing it to ``bisync`` on older releases raises "unknown flag".  When the
+    version cannot be determined we return False so the flag is safely omitted.
+    """
+    version_str = config_manager.get_rclone_version()
+    match = re.search(r"v(\d+)\.(\d+)", version_str)
+    if not match:
+        return False
+    major, minor = int(match.group(1)), int(match.group(2))
+    return (major, minor) >= (1, 64)
+
+
 class RcloneManager:
     """
     Manages rclone operations for all configured services.
@@ -1558,7 +1574,10 @@ class RcloneManager:
         # folders appear on the remote side even before any files are placed
         # inside them.  Enabled by default; can be turned off per-service via
         # the "create_empty_src_dirs" config key.
-        if svc.get("create_empty_src_dirs", True):
+        # Guard with a version check: rclone bisync only accepts this flag
+        # starting from v1.64.  Passing it to older releases raises
+        # "unknown flag: --create-empty-src-dirs".
+        if svc.get("create_empty_src_dirs", True) and _rclone_supports_create_empty_src_dirs(self._config):
             perf_args.append("--create-empty-src-dirs")
 
         # Conflict resolution mode used during --resync retries

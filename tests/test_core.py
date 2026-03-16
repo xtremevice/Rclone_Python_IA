@@ -32,6 +32,7 @@ from src.rclone.rclone_manager import (
     _extract_file_path,
     _human_size,
     _rclone_supports_resync_mode,
+    _rclone_supports_create_empty_src_dirs,
     _bisync_cache_dir,
     _bisync_workdir_for_service,
     _migrate_bisync_state,
@@ -278,6 +279,30 @@ class TestRcloneHelpers(unittest.TestCase):
         mock_cfg.get_rclone_version.return_value = "rclone not found"
         self.assertFalse(_rclone_supports_resync_mode(mock_cfg))
 
+    def test_rclone_supports_create_empty_src_dirs_true_for_v1_64(self):
+        """_rclone_supports_create_empty_src_dirs() should return True for rclone v1.64+."""
+        mock_cfg = MagicMock()
+        mock_cfg.get_rclone_version.return_value = "rclone v1.64.0"
+        self.assertTrue(_rclone_supports_create_empty_src_dirs(mock_cfg))
+
+    def test_rclone_supports_create_empty_src_dirs_true_for_v1_65(self):
+        """_rclone_supports_create_empty_src_dirs() should return True for rclone v1.65."""
+        mock_cfg = MagicMock()
+        mock_cfg.get_rclone_version.return_value = "rclone v1.65.2"
+        self.assertTrue(_rclone_supports_create_empty_src_dirs(mock_cfg))
+
+    def test_rclone_supports_create_empty_src_dirs_false_for_v1_63(self):
+        """_rclone_supports_create_empty_src_dirs() should return False for rclone v1.63."""
+        mock_cfg = MagicMock()
+        mock_cfg.get_rclone_version.return_value = "rclone v1.63.1"
+        self.assertFalse(_rclone_supports_create_empty_src_dirs(mock_cfg))
+
+    def test_rclone_supports_create_empty_src_dirs_false_when_version_unknown(self):
+        """_rclone_supports_create_empty_src_dirs() returns False when version undetectable."""
+        mock_cfg = MagicMock()
+        mock_cfg.get_rclone_version.return_value = "rclone not found"
+        self.assertFalse(_rclone_supports_create_empty_src_dirs(mock_cfg))
+
 
 class TestRcloneManager(unittest.TestCase):
     """Tests for RcloneManager using a mock ConfigManager."""
@@ -492,7 +517,7 @@ class TestRcloneManager(unittest.TestCase):
         self.assertNotIn("--cache-dir", captured_cmds[0])
 
     def test_create_empty_src_dirs_in_bisync_by_default(self):
-        """_do_bisync() must include --create-empty-src-dirs by default.
+        """_do_bisync() must include --create-empty-src-dirs by default on rclone >= v1.64.
 
         Without this flag rclone bisync silently skips empty local directories,
         so a freshly created local folder never appears on the remote.
@@ -505,14 +530,39 @@ class TestRcloneManager(unittest.TestCase):
             return True
 
         self.rclone._run_rclone = fake_run_rclone
+        # Simulate rclone >= v1.64 so the version guard allows the flag
+        self.config.get_rclone_version = lambda: "rclone v1.64.0"
         svc = self.config.get_service("EmptyDirSvc")
         self.rclone._do_bisync(svc)
 
         self.assertTrue(len(captured_cmds) > 0)
         self.assertIn("--create-empty-src-dirs", captured_cmds[0])
 
+    def test_create_empty_src_dirs_omitted_on_old_rclone(self):
+        """_do_bisync() must NOT pass --create-empty-src-dirs when rclone < v1.64.
+
+        Older versions of rclone do not support --create-empty-src-dirs for the
+        bisync subcommand and raise "unknown flag", so we must guard the flag
+        with a version check.
+        """
+        self.config.add_service("OldRcloneSvc", "onedrive", "/tmp/oldrclone_test")
+        captured_cmds = []
+
+        def fake_run_rclone(cmd, service_name, svc, is_retry=False):
+            captured_cmds.append(cmd)
+            return True
+
+        self.rclone._run_rclone = fake_run_rclone
+        # Simulate rclone < v1.64 (e.g. v1.63)
+        self.config.get_rclone_version = lambda: "rclone v1.63.1"
+        svc = self.config.get_service("OldRcloneSvc")
+        self.rclone._do_bisync(svc)
+
+        self.assertTrue(len(captured_cmds) > 0)
+        self.assertNotIn("--create-empty-src-dirs", captured_cmds[0])
+
     def test_create_empty_src_dirs_can_be_disabled(self):
-        """Setting create_empty_src_dirs=False must omit --create-empty-src-dirs."""
+        """Setting create_empty_src_dirs=False must omit --create-empty-src-dirs even on v1.64."""
         self.config.add_service("NoEmptyDirSvc", "onedrive", "/tmp/noemptydir_test")
         self.config.update_service("NoEmptyDirSvc", {"create_empty_src_dirs": False})
         captured_cmds = []
@@ -522,6 +572,8 @@ class TestRcloneManager(unittest.TestCase):
             return True
 
         self.rclone._run_rclone = fake_run_rclone
+        # Use v1.64 so the version guard would allow the flag if not disabled
+        self.config.get_rclone_version = lambda: "rclone v1.64.0"
         svc = self.config.get_service("NoEmptyDirSvc")
         self.rclone._do_bisync(svc)
 
