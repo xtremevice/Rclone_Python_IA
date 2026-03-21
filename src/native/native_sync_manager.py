@@ -66,11 +66,15 @@ _UPLOAD_CHUNK_SIZE = 10 * 1024 * 1024  # 10 MiB
 # One gibibyte in bytes
 _GIB = 1024 * 1024 * 1024
 
-# OAuth callback port range to search for an available port
-_OAUTH_PORT_RANGE = range(53682, 53700)
+# Maximum URL length to include in log lines (prevents huge next-page tokens)
+_MAX_LOG_URL_LENGTH = 120
 
 
 # ── PKCE helpers ──────────────────────────────────────────────────────────────
+
+# OAuth callback port range to search for an available port
+_OAUTH_PORT_RANGE = range(53682, 53700)
+
 
 def _pkce_verifier() -> str:
     """Generate a URL-safe PKCE code verifier (RFC 7636)."""
@@ -201,7 +205,7 @@ def _http_request(
         for k, v in headers.items():
             req.add_header(k, v)
     # Truncate URL for logging (avoid leaking huge next-page tokens)
-    _log_url = url if len(url) <= 120 else url[:117] + "…"
+    _log_url = url if len(url) <= _MAX_LOG_URL_LENGTH else url[:_MAX_LOG_URL_LENGTH - 3] + "…"
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             status = resp.status
@@ -1159,7 +1163,7 @@ class NativeSyncManager:
         try:
             remote_files = provider.list_files(remote_path)
         except Exception as exc:
-            self._emit_error(name, f"Error al listar archivos remotos: {exc}")
+            self._emit_error(name, f"Error al listar archivos remotos ({type(exc).__name__}): {exc}")
             return False
 
         local_files = _scan_local_files(local_path)
@@ -1225,7 +1229,7 @@ class NativeSyncManager:
         try:
             ok = provider.upload_file(abs_local, remote_path, rel)
         except Exception as exc:
-            self._emit_error(service_name, f"Error al subir '{rel}': {exc}")
+            self._emit_error(service_name, f"Error al subir '{rel}' ({type(exc).__name__}): {exc}")
             return False
         if ok and self.on_file_synced:
             self.on_file_synced(service_name, rel, True)
@@ -1242,7 +1246,7 @@ class NativeSyncManager:
         try:
             ok = provider.download_file(item_id, abs_local)
         except Exception as exc:
-            self._emit_error(service_name, f"Error al descargar '{rel}': {exc}")
+            self._emit_error(service_name, f"Error al descargar '{rel}' ({type(exc).__name__}): {exc}")
             return False
         if ok and self.on_file_synced:
             self.on_file_synced(service_name, rel, True)

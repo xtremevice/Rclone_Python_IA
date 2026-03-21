@@ -297,7 +297,7 @@ class SetupWizard:
 
         tk.Label(
             self._frame,
-            text="Paso 2 de 3 – Proveedor de sincronización",
+            text="Paso 2.5 de 3 – Proveedor de sincronización",
             font=("Segoe UI", 14, "bold"),
         ).pack(anchor="w", pady=(0, 10))
 
