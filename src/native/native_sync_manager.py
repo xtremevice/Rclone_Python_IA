@@ -69,6 +69,12 @@ _GIB = 1024 * 1024 * 1024
 # Maximum URL length to include in log lines (prevents huge next-page tokens)
 _MAX_LOG_URL_LENGTH = 120
 
+# Google Workspace native file MIME-type prefix.  Files whose mimeType starts
+# with this string (but are not folders) cannot be downloaded via ?alt=media —
+# they are Google Docs/Sheets/Slides that live only inside Google's servers.
+# These files are skipped during sync (same behavior as rclone --drive-skip-gdocs).
+_GDRIVE_WORKSPACE_MIME_PREFIX = "application/vnd.google-apps."
+
 
 # ── PKCE helpers ──────────────────────────────────────────────────────────────
 
@@ -725,7 +731,21 @@ class GoogleDriveProvider:
             for item in data.get("files", []):
                 name = item.get("name", "")
                 rel = f"{prefix}/{name}".lstrip("/")
-                is_dir = item.get("mimeType") == "application/vnd.google-apps.folder"
+                mime = item.get("mimeType", "")
+                is_dir = mime == "application/vnd.google-apps.folder"
+                # Skip Google Workspace native files (Docs, Sheets, Slides, etc.).
+                # They cannot be downloaded via ?alt=media and always return 403.
+                # This mirrors rclone's --drive-skip-gdocs behavior.
+                if (
+                    not is_dir
+                    and mime.startswith(_GDRIVE_WORKSPACE_MIME_PREFIX)
+                ):
+                    if self._logger:
+                        self._logger(
+                            f"⚠️ Omitiendo archivo nativo de Google Workspace "
+                            f"(no descargable, tipo: {mime}): {rel}"
+                        )
+                    continue
                 results[rel] = {
                     "id": item["id"],
                     "size": int(item.get("size", 0)) if not is_dir else 0,
@@ -960,15 +980,19 @@ class NativeSyncManager:
     # ── Provider factory ──────────────────────────────────────────────
 
     def _make_logger(self, service_name: str) -> Callable[[str], None]:
-        """Return a single-argument callable that routes log messages to both
-        ``on_api_call`` (always) and ``on_error`` (when the message starts with
-        the error prefix ``❌``), tagged with *service_name*.
+        """Return a single-argument callable that routes every log message to
+        ``on_api_call``, tagged with *service_name*.
+
+        Only ``on_api_call`` is fired here — ``on_error`` is intentionally NOT
+        called from this path.  High-level error messages are already emitted
+        via ``_emit_error`` (called from ``_upload``, ``_download``, and
+        ``_do_sync``), which calls ``on_error`` directly.  Routing ❌ messages
+        from the provider logger to ``on_error`` *as well* would cause every
+        error to appear twice in the Errores panel.
         """
         def _log(msg: str) -> None:
             if self.on_api_call:
                 self.on_api_call(service_name, msg)
-            if msg.startswith("❌") and self.on_error:
-                self.on_error(service_name, msg)
         return _log
 
     def _get_provider(self, svc: Dict):

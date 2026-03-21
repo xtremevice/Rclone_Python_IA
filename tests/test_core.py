@@ -5413,8 +5413,13 @@ class TestNativeLogging(unittest.TestCase):
         self.assertEqual(api_calls[0][0], "MySvc")
         self.assertIn("200", api_calls[0][1])
 
-    def test_make_logger_routes_errors_to_on_error_too(self):
-        """_make_logger should also call on_error for messages starting with ❌."""
+    def test_make_logger_does_not_route_to_on_error(self):
+        """_make_logger must NOT call on_error — not even for ❌ messages.
+
+        Errors are emitted via _emit_error at the sync-loop level; routing ❌
+        messages from the provider logger to on_error as well would cause each
+        error to appear twice in the Errores panel.
+        """
         from src.native.native_sync_manager import NativeSyncManager
         native = NativeSyncManager(self.config)
 
@@ -5426,12 +5431,14 @@ class TestNativeLogging(unittest.TestCase):
         logger = native._make_logger("MySvc")
         logger("❌ token refresh failed")
 
+        # on_api_call must fire exactly once
         self.assertEqual(len(api_calls), 1)
-        self.assertEqual(len(errors), 1)
-        self.assertIn("token refresh failed", errors[0][1])
+        self.assertIn("token refresh failed", api_calls[0][1])
+        # on_error must NOT be called from the logger
+        self.assertEqual(errors, [])
 
     def test_make_logger_does_not_route_ok_messages_to_on_error(self):
-        """_make_logger should NOT call on_error for non-error messages."""
+        """_make_logger should NOT call on_error for any messages."""
         from src.native.native_sync_manager import NativeSyncManager
         native = NativeSyncManager(self.config)
 
@@ -5440,7 +5447,8 @@ class TestNativeLogging(unittest.TestCase):
         native.on_error = lambda svc, msg: errors.append(msg)
 
         logger = native._make_logger("MySvc")
-        logger("GET https://example.com → 200")  # not an error
+        logger("GET https://example.com → 200")
+        logger("❌ some error")  # even error messages must not reach on_error
 
         self.assertEqual(errors, [])
 
@@ -5485,6 +5493,97 @@ class TestNativeLogging(unittest.TestCase):
         provider = native._get_provider(svc)
         self.assertIsNotNone(provider)
         self.assertIsNotNone(provider._logger)
+
+    # ------------------------------------------------------------------
+    # Google Workspace file skipping
+    # ------------------------------------------------------------------
+
+    def test_gdrive_workspace_files_skipped_in_listing(self):
+        """GoogleDriveProvider._list_folder_recursive must skip native Google Workspace
+        files (Docs, Sheets, Slides, etc.) that return 403 on ?alt=media download."""
+        from unittest.mock import patch, MagicMock
+        from src.native.native_sync_manager import GoogleDriveProvider
+
+        folder_response = {
+            "files": [
+                # Regular binary file — should be included
+                {
+                    "id": "bin1",
+                    "name": "photo.jpg",
+                    "mimeType": "image/jpeg",
+                    "modifiedTime": "2024-01-01T00:00:00Z",
+                    "size": "12345",
+                },
+                # Google Doc — must be SKIPPED
+                {
+                    "id": "gdoc1",
+                    "name": "My Document",
+                    "mimeType": "application/vnd.google-apps.document",
+                    "modifiedTime": "2024-01-01T00:00:00Z",
+                },
+                # Google Sheet — must be SKIPPED
+                {
+                    "id": "gsheet1",
+                    "name": "My Spreadsheet",
+                    "mimeType": "application/vnd.google-apps.spreadsheet",
+                    "modifiedTime": "2024-01-01T00:00:00Z",
+                },
+                # Folder — must NOT be skipped (is_dir=True)
+                {
+                    "id": "folder1",
+                    "name": "subfolder",
+                    "mimeType": "application/vnd.google-apps.folder",
+                    "modifiedTime": "2024-01-01T00:00:00Z",
+                },
+            ],
+        }
+        subfolder_response = {"files": []}
+
+        call_count = [0]
+
+        def fake_http_request(url, **kwargs):
+            call_count[0] += 1
+            if "folder1" in url or call_count[0] > 1:
+                return 200, json.dumps(subfolder_response).encode()
+            return 200, json.dumps(folder_response).encode()
+
+        logged = []
+        provider = GoogleDriveProvider("remote", logger=logged.append)
+
+        import json as _json
+        with patch("src.native.native_sync_manager._http_request", side_effect=fake_http_request):
+            with patch.object(provider, "_auth_header", return_value={}):
+                results = provider._list_folder_recursive("folder_root", "")
+
+        # Only the binary file and folder should appear
+        self.assertIn("photo.jpg", results)
+        self.assertIn("subfolder", results)
+        # Google Workspace files must be absent
+        self.assertNotIn("My Document", results)
+        self.assertNotIn("My Spreadsheet", results)
+        # A ⚠️ skip notice must have been logged for each workspace file
+        skip_logs = [m for m in logged if "⚠️" in m and "Workspace" in m]
+        self.assertEqual(len(skip_logs), 2)
+
+    def test_gdrive_workspace_constant_covers_doc_and_sheet(self):
+        """_GDRIVE_WORKSPACE_MIME_PREFIX must match common Google Workspace types."""
+        from src.native.native_sync_manager import _GDRIVE_WORKSPACE_MIME_PREFIX
+        for mime in [
+            "application/vnd.google-apps.document",
+            "application/vnd.google-apps.spreadsheet",
+            "application/vnd.google-apps.presentation",
+            "application/vnd.google-apps.form",
+            "application/vnd.google-apps.drawing",
+        ]:
+            self.assertTrue(
+                mime.startswith(_GDRIVE_WORKSPACE_MIME_PREFIX),
+                f"{mime} should start with the prefix",
+            )
+        # Folder must NOT be treated as a workspace file to skip
+        self.assertTrue(
+            "application/vnd.google-apps.folder".startswith(_GDRIVE_WORKSPACE_MIME_PREFIX)
+        )
+        # The folder is excluded by the `not is_dir` guard, not by the prefix
 
 
 if __name__ == "__main__":
