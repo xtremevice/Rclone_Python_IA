@@ -137,6 +137,7 @@ class MainWindow:
         self._rclone.on_file_synced = self._on_file_synced
         self._rclone.on_error = self._on_rclone_error
         self._rclone.on_drive_id_error = self._on_drive_id_error
+        self._rclone.on_api_call = self._on_native_api_call
 
         # Per-service Listbox widgets: service_name → tk.Listbox
         self._file_lists: Dict[str, tk.Listbox] = {}
@@ -1332,6 +1333,16 @@ class MainWindow:
         Logs the error via ErrorLogger (thread-safe: no UI update needed).
         """
         self._error_logger.log(service_name, message)
+
+    def _on_native_api_call(self, service_name: str, message: str) -> None:
+        """
+        Invoked by NativeSyncManager for every HTTP API call made on behalf of a
+        service (both successful calls and errors).
+
+        Logs the entry with a ``🔗 API`` prefix so it is clearly distinct from
+        rclone errors in the Errores panel and can be filtered / searched easily.
+        """
+        self._error_logger.log(service_name, f"🔗 API | {message}")
 
     def _on_drive_id_error(self, service_name: str) -> None:
         """

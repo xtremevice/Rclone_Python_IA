@@ -5296,5 +5296,196 @@ class TestNativeSyncManagerHelpers(unittest.TestCase):
             shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+
+# ===========================================================================
+# NativeSyncManager API-call logging tests
+# ===========================================================================
+
+class TestNativeLogging(unittest.TestCase):
+    """Tests for the native API-call / error logging pipeline."""
+
+    def setUp(self):
+        self._tmpdir = tempfile.mkdtemp()
+        import src.config.config_manager as cm_mod
+        import src.native.native_sync_manager as nm_mod
+        self._orig_cm = cm_mod.get_config_dir
+        self._orig_nm = nm_mod.get_config_dir
+        cm_mod.get_config_dir = lambda: Path(self._tmpdir)
+        nm_mod.get_config_dir = lambda: Path(self._tmpdir)
+        self.config = ConfigManager()
+
+    def tearDown(self):
+        import src.config.config_manager as cm_mod
+        import src.native.native_sync_manager as nm_mod
+        cm_mod.get_config_dir = self._orig_cm
+        nm_mod.get_config_dir = self._orig_nm
+        import shutil
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+
+    # ------------------------------------------------------------------
+    # _http_request logger parameter
+    # ------------------------------------------------------------------
+
+    def test_http_request_logger_called_on_200(self):
+        """_http_request should call logger with 'METHOD url → 200' on success."""
+        from unittest.mock import patch, MagicMock
+        from src.native.native_sync_manager import _http_request
+
+        mock_resp = MagicMock()
+        mock_resp.status = 200
+        mock_resp.read.return_value = b'{"ok": true}'
+        mock_resp.__enter__ = lambda s: s
+        mock_resp.__exit__ = MagicMock(return_value=False)
+
+        logged = []
+        with patch("urllib.request.urlopen", return_value=mock_resp):
+            status, body = _http_request(
+                "https://example.com/test",
+                method="GET",
+                logger=logged.append,
+            )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(len(logged), 1)
+        self.assertIn("GET", logged[0])
+        self.assertIn("200", logged[0])
+
+    def test_http_request_logger_called_on_http_error(self):
+        """_http_request should call logger with a ⚠️ suffix on HTTPError."""
+        import urllib.error
+        from unittest.mock import patch
+        from src.native.native_sync_manager import _http_request
+
+        def _raise(_req, timeout):
+            err = urllib.error.HTTPError(
+                url="https://example.com/fail",
+                code=403,
+                msg="Forbidden",
+                hdrs=None,  # type: ignore[arg-type]
+                fp=None,  # type: ignore[arg-type]
+            )
+            err.read = lambda: b"forbidden"
+            raise err
+
+        logged = []
+        with patch("urllib.request.urlopen", side_effect=_raise):
+            status, body = _http_request(
+                "https://example.com/fail",
+                logger=logged.append,
+            )
+
+        self.assertEqual(status, 403)
+        self.assertEqual(len(logged), 1)
+        self.assertIn("403", logged[0])
+        self.assertIn("⚠️", logged[0])
+
+    def test_http_request_no_logger_no_error(self):
+        """_http_request without a logger should still work normally."""
+        from unittest.mock import patch, MagicMock
+        from src.native.native_sync_manager import _http_request
+
+        mock_resp = MagicMock()
+        mock_resp.status = 200
+        mock_resp.read.return_value = b"ok"
+        mock_resp.__enter__ = lambda s: s
+        mock_resp.__exit__ = MagicMock(return_value=False)
+
+        with patch("urllib.request.urlopen", return_value=mock_resp):
+            status, body = _http_request("https://example.com/")
+        self.assertEqual(status, 200)
+
+    # ------------------------------------------------------------------
+    # NativeSyncManager._make_logger
+    # ------------------------------------------------------------------
+
+    def test_make_logger_routes_to_on_api_call(self):
+        """_make_logger should call on_api_call for every message."""
+        from src.native.native_sync_manager import NativeSyncManager
+        native = NativeSyncManager(self.config)
+
+        api_calls = []
+        native.on_api_call = lambda svc, msg: api_calls.append((svc, msg))
+
+        logger = native._make_logger("MySvc")
+        logger("GET https://example.com → 200")
+
+        self.assertEqual(len(api_calls), 1)
+        self.assertEqual(api_calls[0][0], "MySvc")
+        self.assertIn("200", api_calls[0][1])
+
+    def test_make_logger_routes_errors_to_on_error_too(self):
+        """_make_logger should also call on_error for messages starting with ❌."""
+        from src.native.native_sync_manager import NativeSyncManager
+        native = NativeSyncManager(self.config)
+
+        api_calls = []
+        errors = []
+        native.on_api_call = lambda svc, msg: api_calls.append((svc, msg))
+        native.on_error = lambda svc, msg: errors.append((svc, msg))
+
+        logger = native._make_logger("MySvc")
+        logger("❌ token refresh failed")
+
+        self.assertEqual(len(api_calls), 1)
+        self.assertEqual(len(errors), 1)
+        self.assertIn("token refresh failed", errors[0][1])
+
+    def test_make_logger_does_not_route_ok_messages_to_on_error(self):
+        """_make_logger should NOT call on_error for non-error messages."""
+        from src.native.native_sync_manager import NativeSyncManager
+        native = NativeSyncManager(self.config)
+
+        errors = []
+        native.on_api_call = lambda svc, msg: None
+        native.on_error = lambda svc, msg: errors.append(msg)
+
+        logger = native._make_logger("MySvc")
+        logger("GET https://example.com → 200")  # not an error
+
+        self.assertEqual(errors, [])
+
+    def test_make_logger_safe_with_no_callbacks(self):
+        """_make_logger callable should not raise even if callbacks are None."""
+        from src.native.native_sync_manager import NativeSyncManager
+        native = NativeSyncManager(self.config)
+        logger = native._make_logger("MySvc")
+        logger("some message")  # should not raise
+        logger("❌ error message")  # should not raise
+
+    # ------------------------------------------------------------------
+    # on_api_call forwarding from RcloneManager
+    # ------------------------------------------------------------------
+
+    def test_on_api_call_forwarded_to_native(self):
+        """Setting on_api_call on RcloneManager should propagate to _native."""
+        rclone = RcloneManager(self.config)
+        received = []
+        rclone.on_api_call = lambda svc, msg: received.append((svc, msg))
+        self.assertIs(rclone._native.on_api_call, rclone.on_api_call)
+
+    def test_get_provider_injects_logger(self):
+        """_get_provider() must inject a logger into the returned provider."""
+        from src.native.native_sync_manager import NativeSyncManager
+        self.config.add_service("ODSvc", "onedrive", "/tmp/od")
+        self.config.update_service("ODSvc", {"sync_provider": "nativo", "remote_name": "od_remote"})
+        native = NativeSyncManager(self.config)
+        native.on_api_call = lambda svc, msg: None
+        svc = self.config.get_service("ODSvc")
+        provider = native._get_provider(svc)
+        self.assertIsNotNone(provider)
+        self.assertIsNotNone(provider._logger)
+
+    def test_get_provider_gdrive_injects_logger(self):
+        """_get_provider() must inject a logger into GoogleDriveProvider."""
+        from src.native.native_sync_manager import NativeSyncManager
+        self.config.add_service("GDSvc", "drive", "/tmp/gd")
+        self.config.update_service("GDSvc", {"sync_provider": "nativo", "remote_name": "gd_remote"})
+        native = NativeSyncManager(self.config)
+        svc = self.config.get_service("GDSvc")
+        provider = native._get_provider(svc)
+        self.assertIsNotNone(provider)
+        self.assertIsNotNone(provider._logger)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

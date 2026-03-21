@@ -438,7 +438,7 @@ class RcloneManager:
 
     # Callback attributes to forward to the native manager automatically.
     _FORWARDED_CALLBACKS = frozenset(
-        {"on_status_change", "on_file_synced", "on_error"}
+        {"on_status_change", "on_file_synced", "on_error", "on_api_call"}
     )
 
     def __setattr__(self, name: str, value: object) -> None:

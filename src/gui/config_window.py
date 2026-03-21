@@ -36,6 +36,13 @@ if TYPE_CHECKING:
     from src.gui.error_logger import ErrorLogger
 
 
+# Human-readable API name for each platform that supports the "nativo" provider.
+_NATIVE_API_LABELS: Dict[str, str] = {
+    "onedrive": "Microsoft Graph API v1.0",
+    "drive": "Google Drive API v3",
+}
+
+
 # Mapping from human-readable interval label → seconds
 INTERVAL_OPTIONS: Dict[str, int] = {
     "1 minuto": 60,
@@ -218,10 +225,25 @@ class ConfigWindow:
     # ------------------------------------------------------------------
 
     def _panel_defaults(self) -> None:
-        """Panel showing and editing the default rclone sync options."""
-        p = self._make_panel("Configuración por defecto")
+        """Panel showing and editing the default sync options."""
+        is_native = self._svc.get("sync_provider", "rclone") == "nativo"
 
-        tk.Label(p, text="Estas opciones se aplican al ejecutar bisync para este servicio.", wraplength=450, justify="left").pack(anchor="w", pady=(0, 10))
+        title = (
+            "Configuración por defecto"
+            if not is_native
+            else "Configuración por defecto (API nativa)"
+        )
+        p = self._make_panel(title)
+
+        desc = (
+            "Estas opciones se aplican al ejecutar bisync para este servicio."
+            if not is_native
+            else (
+                "Opciones de configuración para este servicio con proveedor de API nativa. "
+                "Las opciones exclusivas de rclone (resync, caché VFS, verbose) no aplican."
+            )
+        )
+        tk.Label(p, text=desc, wraplength=450, justify="left").pack(anchor="w", pady=(0, 10))
 
         # Service name (editable; changing it renames the service)
         tk.Label(p, text="Nombre del servicio:", anchor="w").pack(anchor="w")
@@ -233,42 +255,43 @@ class ConfigWindow:
         self._remote_path_var = tk.StringVar(value=self._svc.get("remote_path", "/"))
         tk.Entry(p, textvariable=self._remote_path_var, width=40).pack(anchor="w", pady=(2, 10))
 
-        # VFS cache mode (used by the mount command; not applicable to bisync)
-        tk.Label(p, text="Modo de caché VFS (solo para montaje):", anchor="w").pack(anchor="w")
-        self._vfs_var = tk.StringVar(value=self._svc.get("vfs_cache_mode", "writes"))
-        cache_modes = ["off", "minimal", "writes", "full"]
-        ttk.Combobox(p, textvariable=self._vfs_var, values=cache_modes, state="readonly", width=20).pack(anchor="w", pady=(2, 10))
+        if not is_native:
+            # VFS cache mode (used by the mount command; not applicable to bisync)
+            tk.Label(p, text="Modo de caché VFS (solo para montaje):", anchor="w").pack(anchor="w")
+            self._vfs_var = tk.StringVar(value=self._svc.get("vfs_cache_mode", "writes"))
+            cache_modes = ["off", "minimal", "writes", "full"]
+            ttk.Combobox(p, textvariable=self._vfs_var, values=cache_modes, state="readonly", width=20).pack(anchor="w", pady=(2, 10))
 
-        # Max cache size
-        tk.Label(p, text="Tamaño máximo de caché:", anchor="w").pack(anchor="w")
-        self._cache_size_var = tk.StringVar(value=self._svc.get("vfs_cache_max_size", "10G"))
-        tk.Entry(p, textvariable=self._cache_size_var, width=15).pack(anchor="w", pady=(2, 10))
+            # Max cache size
+            tk.Label(p, text="Tamaño máximo de caché:", anchor="w").pack(anchor="w")
+            self._cache_size_var = tk.StringVar(value=self._svc.get("vfs_cache_max_size", "10G"))
+            tk.Entry(p, textvariable=self._cache_size_var, width=15).pack(anchor="w", pady=(2, 10))
 
-        # Cache directory
-        tk.Label(p, text="Directorio de caché (vacío = predeterminado de rclone):", anchor="w").pack(anchor="w")
-        cache_dir_frame = tk.Frame(p)
-        cache_dir_frame.pack(fill=tk.X, pady=(2, 10))
-        self._cache_dir_var = tk.StringVar(value=self._svc.get("vfs_cache_dir", ""))
-        tk.Entry(cache_dir_frame, textvariable=self._cache_dir_var, width=40).pack(side=tk.LEFT, fill=tk.X, expand=True)
-        tk.Button(
-            cache_dir_frame,
-            text="…",
-            command=self._browse_cache_dir,
-        ).pack(side=tk.LEFT, padx=4)
+            # Cache directory
+            tk.Label(p, text="Directorio de caché (vacío = predeterminado de rclone):", anchor="w").pack(anchor="w")
+            cache_dir_frame = tk.Frame(p)
+            cache_dir_frame.pack(fill=tk.X, pady=(2, 10))
+            self._cache_dir_var = tk.StringVar(value=self._svc.get("vfs_cache_dir", ""))
+            tk.Entry(cache_dir_frame, textvariable=self._cache_dir_var, width=40).pack(side=tk.LEFT, fill=tk.X, expand=True)
+            tk.Button(
+                cache_dir_frame,
+                text="…",
+                command=self._browse_cache_dir,
+            ).pack(side=tk.LEFT, padx=4)
 
-        # Resync checkbox
-        self._resync_var = tk.BooleanVar(value=self._svc.get("use_resync", True))
-        tk.Checkbutton(p, text="Usar --resync al detectar conflictos", variable=self._resync_var).pack(anchor="w", pady=5)
+            # Resync checkbox
+            self._resync_var = tk.BooleanVar(value=self._svc.get("use_resync", True))
+            tk.Checkbutton(p, text="Usar --resync al detectar conflictos", variable=self._resync_var).pack(anchor="w", pady=5)
 
-        # Resync mode (conflict resolution strategy used with --resync)
-        tk.Label(p, text="Modo de resolución de conflictos (--resync-mode):", anchor="w").pack(anchor="w", pady=(10, 0))
-        self._resync_mode_var = tk.StringVar(value=self._svc.get("resync_mode", "newer"))
-        resync_modes = ["newer", "older", "larger", "path1", "path2", "union"]
-        ttk.Combobox(p, textvariable=self._resync_mode_var, values=resync_modes, state="readonly", width=15).pack(anchor="w", pady=(2, 10))
+            # Resync mode (conflict resolution strategy used with --resync)
+            tk.Label(p, text="Modo de resolución de conflictos (--resync-mode):", anchor="w").pack(anchor="w", pady=(10, 0))
+            self._resync_mode_var = tk.StringVar(value=self._svc.get("resync_mode", "newer"))
+            resync_modes = ["newer", "older", "larger", "path1", "path2", "union"]
+            ttk.Combobox(p, textvariable=self._resync_mode_var, values=resync_modes, state="readonly", width=15).pack(anchor="w", pady=(2, 10))
 
-        # Verbose sync
-        self._verbose_sync_var = tk.BooleanVar(value=self._svc.get("verbose_sync", False))
-        tk.Checkbutton(p, text="Activar --verbose en sincronización (más detalles en el registro)", variable=self._verbose_sync_var).pack(anchor="w", pady=5)
+            # Verbose sync
+            self._verbose_sync_var = tk.BooleanVar(value=self._svc.get("verbose_sync", False))
+            tk.Checkbutton(p, text="Activar --verbose en sincronización (más detalles en el registro)", variable=self._verbose_sync_var).pack(anchor="w", pady=5)
 
         # ── API rate-limit / concurrency (quota control) ──────────────────────
         ttk.Separator(p, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=(12, 8))
@@ -924,6 +947,15 @@ class ConfigWindow:
             f"{interval_secs} s",
         )
         sync_running = self._rclone.is_running(self._service_name)
+        is_native = self._svc.get("sync_provider", "rclone") == "nativo"
+        platform = self._svc.get("platform", "")
+
+        # Build the last info row differently depending on the sync provider
+        if is_native:
+            api_label = _NATIVE_API_LABELS.get(platform, "API nativa")
+            version_row = ("Usando API:", api_label)
+        else:
+            version_row = ("Versión de rclone:", self._config.get_rclone_version())
 
         rows = [
             ("Nombre del servicio:", self._service_name),
@@ -933,7 +965,7 @@ class ConfigWindow:
             ("Ruta remota:", self._svc.get("remote_path", "/")),
             ("Intervalo de sync:", interval_label),
             ("Estado:", "Sincronizando activamente" if sync_running else "Detenido"),
-            ("Versión de rclone:", self._config.get_rclone_version()),
+            version_row,
         ]
 
         for label, value in rows:
@@ -942,13 +974,45 @@ class ConfigWindow:
             tk.Label(row, text=label, width=22, anchor="w", font=("Segoe UI", 9, "bold")).pack(side=tk.LEFT)
             tk.Label(row, text=value, anchor="w", wraplength=350, justify="left").pack(side=tk.LEFT)
 
-        # ── Reconnect section ────────────────────────────────────────────────
-        # Shown for all OAuth-based platforms (non-Mega).  Lets the user re-run
-        # the OAuth flow to fix a missing drive_id/drive_type in rclone.conf,
-        # which causes bisync to fail immediately with "unable to get drive_id
-        # and drive_type - if you are upgrading from older versions of rclone".
-        platform = self._svc.get("platform", "")
-        if platform and platform != "mega":
+        # ── Action section ─────────────────────────────────────────────────────
+        if is_native:
+            # Native provider: show re-authentication option only
+            sep = tk.Frame(p, height=1, bg="#cccccc")
+            sep.pack(fill=tk.X, pady=(12, 8))
+
+            tk.Label(
+                p,
+                text=(
+                    "Si la sincronización falla por token expirado o credenciales inválidas, "
+                    "usa la opción de re-autenticar para iniciar el flujo OAuth nativo de nuevo."
+                ),
+                wraplength=450,
+                justify="left",
+                fg="#555555",
+            ).pack(anchor="w", pady=(0, 8))
+
+            self._reconnect_status_var = tk.StringVar(value="")
+            tk.Label(
+                p,
+                textvariable=self._reconnect_status_var,
+                fg="gray",
+                font=("Segoe UI", 9, "italic"),
+                wraplength=450,
+                justify="left",
+            ).pack(anchor="w", pady=(0, 6))
+
+            tk.Button(
+                p,
+                text="🔄 Re-autenticar (API nativa)",
+                command=self._start_native_reauth,
+                relief=tk.FLAT,
+                bg="#0078d4",
+                fg="white",
+                font=("Segoe UI", 9, "bold"),
+            ).pack(anchor="w")
+
+        elif platform and platform != "mega":
+            # rclone provider: show drive_id search + reconnect
             sep = tk.Frame(p, height=1, bg="#cccccc")
             sep.pack(fill=tk.X, pady=(12, 8))
 
@@ -1000,6 +1064,31 @@ class ConfigWindow:
                 font=("Segoe UI", 9, "bold"),
             )
             self._reconnect_btn.pack(side=tk.LEFT)
+
+    def _start_native_reauth(self) -> None:
+        """Re-run the native OAuth PKCE flow for this service."""
+        from src.native.native_sync_manager import NativeSyncManager
+        if not hasattr(self, "_reconnect_status_var"):
+            return
+        self._reconnect_status_var.set("Abriendo el navegador para re-autenticación…")
+        platform = self._svc.get("platform", "")
+        remote_name = self._svc.get("remote_name", self._service_name)
+        native = NativeSyncManager(self._config)
+
+        def on_done(success: bool, error_msg: str) -> None:
+            def _update() -> None:
+                if success:
+                    self._reconnect_status_var.set("✅ Re-autenticación completada.")
+                else:
+                    self._reconnect_status_var.set(f"❌ Error: {error_msg}")
+            self._win.after(0, _update)
+
+        native.authenticate(
+            service_name=self._service_name,
+            platform=platform,
+            remote_name=remote_name,
+            on_done=on_done,
+        )
 
     def _start_find_drive_id(self) -> None:
         """Search known rclone config files for drive_id/drive_type in a background thread.
