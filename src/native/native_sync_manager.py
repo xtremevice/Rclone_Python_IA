@@ -273,21 +273,28 @@ class OneDriveProvider:
 
     @staticmethod
     def build_auth_url(redirect_uri: str, verifier: str) -> str:
-        """Return the Microsoft identity platform authorisation URL (PKCE)."""
-        challenge = _pkce_challenge(verifier)
+        """Return the Microsoft identity platform authorisation URL.
+
+        PKCE is intentionally omitted: the rclone public client
+        (b15665d9-…) was registered before PKCE was mandatory and
+        Microsoft's token endpoint rejects an unexpected ``code_verifier``.
+        The ``verifier`` parameter is accepted for API symmetry but unused.
+        """
         params = {
             "client_id": _ONEDRIVE_CLIENT_ID,
             "response_type": "code",
             "redirect_uri": redirect_uri,
             "scope": _ONEDRIVE_SCOPES,
-            "code_challenge": challenge,
-            "code_challenge_method": "S256",
             "prompt": "select_account",
         }
         return f"{_ONEDRIVE_AUTH_URL}?{urllib.parse.urlencode(params)}"
 
     def exchange_code(self, code: str, redirect_uri: str, verifier: str) -> bool:
-        """Exchange an authorisation code for access+refresh tokens."""
+        """Exchange an authorisation code for access+refresh tokens.
+
+        ``verifier`` is accepted for API symmetry with GoogleDriveProvider
+        but is not forwarded: no PKCE challenge was included in the auth URL.
+        """
         resp = _post_form(
             _ONEDRIVE_TOKEN_URL,
             {
@@ -295,7 +302,6 @@ class OneDriveProvider:
                 "code": code,
                 "redirect_uri": redirect_uri,
                 "grant_type": "authorization_code",
-                "code_verifier": verifier,
             },
             logger=self._logger,
         )
@@ -1063,15 +1069,24 @@ class NativeSyncManager:
         if not code:
             return False, "Tiempo de espera agotado o autenticación cancelada."
 
-        # Exchange code for tokens
+        # Exchange code for tokens – pass a logger so Microsoft error details
+        # are captured and returned to the caller instead of being silently dropped.
+        auth_errors: List[str] = []
         if platform == "onedrive":
-            provider: Any = OneDriveProvider(remote_name)
+            provider: Any = OneDriveProvider(remote_name, logger=auth_errors.append)
         else:
-            provider = GoogleDriveProvider(remote_name)
+            provider = GoogleDriveProvider(remote_name, logger=auth_errors.append)
 
-        ok = provider.exchange_code(code, redirect_uri, verifier)
+        try:
+            ok = provider.exchange_code(code, redirect_uri, verifier)
+        except OSError as exc:
+            return False, f"Error de red al intercambiar el código OAuth: {exc}"
         if not ok:
-            return False, "No se pudo obtener el token de acceso del servidor."
+            detail = "; ".join(auth_errors) if auth_errors else ""
+            msg = "No se pudo obtener el token de acceso del servidor."
+            if detail:
+                msg += f" ({detail})"
+            return False, msg
         return True, ""
 
     def has_token(self, remote_name: str) -> bool:

@@ -5605,6 +5605,46 @@ class TestNativeLogging(unittest.TestCase):
         self.assertNotIn("%2Fcallback", url, "redirect_uri must not include /callback path")
         self.assertNotIn("/callback", url, "redirect_uri must not include /callback path")
 
+    def test_onedrive_build_auth_url_has_no_pkce_params(self):
+        """OneDriveProvider.build_auth_url must NOT include PKCE parameters.
+
+        The rclone public client (b15665d9-…) was registered before PKCE was
+        mandatory; Microsoft's token endpoint returns AADSTS9002331 / invalid_request
+        when code_verifier is sent for a non-PKCE client.
+        """
+        from src.native.native_sync_manager import OneDriveProvider, _OAUTH_PORT_RANGE
+        verifier = "dummyverifier1234567890abcdef"
+        redirect_uri = f"http://localhost:{_OAUTH_PORT_RANGE.start}/"
+        url = OneDriveProvider.build_auth_url(redirect_uri, verifier)
+        self.assertNotIn("code_challenge", url, "OneDrive auth URL must not contain code_challenge")
+        self.assertNotIn("code_challenge_method", url,
+                         "OneDrive auth URL must not contain code_challenge_method")
+
+    def test_onedrive_exchange_code_has_no_code_verifier(self):
+        """OneDriveProvider.exchange_code must NOT send code_verifier.
+
+        Since build_auth_url omits code_challenge, Microsoft rejects any
+        code_verifier in the token exchange as an unexpected parameter.
+        """
+        from unittest.mock import patch
+        from src.native.native_sync_manager import OneDriveProvider
+
+        posted_fields = {}
+
+        def fake_post_form(url, fields, **kwargs):
+            posted_fields.update(fields)
+            return {"access_token": "fake", "expires_in": 3600}
+
+        provider = OneDriveProvider("test_remote")
+        with patch("src.native.native_sync_manager._post_form", side_effect=fake_post_form):
+            ok = provider.exchange_code("authcode123", "http://localhost:53682/", "verifier_xyz")
+
+        self.assertTrue(ok)
+        self.assertNotIn("code_verifier", posted_fields,
+                         "code_verifier must not be sent in OneDrive token exchange")
+        self.assertIn("code", posted_fields)
+        self.assertIn("redirect_uri", posted_fields)
+
     def test_gdrive_build_auth_url_redirect_uri_no_callback_path(self):
         """GoogleDriveProvider.build_auth_url must also use the root '/' path."""
         from src.native.native_sync_manager import GoogleDriveProvider, _OAUTH_PORT_RANGE
@@ -5614,6 +5654,20 @@ class TestNativeLogging(unittest.TestCase):
         self.assertIn("redirect_uri=http%3A%2F%2Flocalhost%3A", url)
         self.assertNotIn("%2Fcallback", url, "redirect_uri must not include /callback path")
         self.assertNotIn("/callback", url, "redirect_uri must not include /callback path")
+
+    def test_gdrive_build_auth_url_has_pkce_params(self):
+        """GoogleDriveProvider.build_auth_url MUST include PKCE parameters.
+
+        Google's client credentials flow supports and recommends PKCE.
+        """
+        from src.native.native_sync_manager import GoogleDriveProvider, _OAUTH_PORT_RANGE
+        verifier = "dummyverifier1234567890abcdef"
+        redirect_uri = f"http://localhost:{_OAUTH_PORT_RANGE.start}/"
+        url = GoogleDriveProvider.build_auth_url(redirect_uri, verifier)
+        self.assertIn("code_challenge", url,
+                      "Google Drive auth URL must contain code_challenge")
+        self.assertIn("code_challenge_method", url,
+                      "Google Drive auth URL must contain code_challenge_method")
 
     def test_do_authenticate_uses_root_redirect_uri(self):
         """_do_authenticate must pass 'http://localhost:<port>/' (root path) as
@@ -5652,6 +5706,73 @@ class TestNativeLogging(unittest.TestCase):
             "/",
             f"redirect_uri path must be '/' not '{parsed.path}'",
         )
+
+    def test_do_authenticate_returns_microsoft_error_detail(self):
+        """When token exchange fails, _do_authenticate must include Microsoft's
+        error message in the returned error string."""
+        from unittest.mock import patch, MagicMock
+        from src.native.native_sync_manager import NativeSyncManager, _OAUTH_PORT_RANGE
+
+        mock_server = MagicMock()
+        mock_server.start.return_value = True
+        mock_server.port = _OAUTH_PORT_RANGE.start
+        mock_server.wait_for_code.return_value = "auth_code_abc"
+
+        # Simulate Microsoft returning an error response (no access_token)
+        def fake_post_form(url, fields, **kwargs):
+            return {
+                "error": "invalid_request",
+                "error_description": "AADSTS9002331: code_verifier not expected.",
+            }
+
+        native = NativeSyncManager(self.config)
+
+        with patch(
+            "src.native.native_sync_manager.OneDriveProvider.build_auth_url",
+            return_value="http://no-op/",
+        ), patch(
+            "src.native.native_sync_manager._OAuthCallbackServer",
+            return_value=mock_server,
+        ), patch(
+            "src.native.native_sync_manager._post_form",
+            side_effect=fake_post_form,
+        ), patch("webbrowser.open"):
+            ok, msg = native._do_authenticate("onedrive", "remote1", timeout=5.0)
+
+        self.assertFalse(ok)
+        self.assertIn("No se pudo obtener el token", msg)
+        # The actual Microsoft error code must appear in the returned message
+        self.assertIn("invalid_request", msg,
+                      "Microsoft error code must be propagated into the error message")
+
+    def test_do_authenticate_handles_network_error(self):
+        """_do_authenticate must catch OSError from a failed token endpoint
+        connection and return a descriptive error rather than crashing."""
+        from unittest.mock import patch, MagicMock
+        from src.native.native_sync_manager import NativeSyncManager, _OAUTH_PORT_RANGE
+
+        mock_server = MagicMock()
+        mock_server.start.return_value = True
+        mock_server.port = _OAUTH_PORT_RANGE.start
+        mock_server.wait_for_code.return_value = "auth_code_xyz"
+
+        native = NativeSyncManager(self.config)
+
+        with patch(
+            "src.native.native_sync_manager.OneDriveProvider.build_auth_url",
+            return_value="http://no-op/",
+        ), patch(
+            "src.native.native_sync_manager._OAuthCallbackServer",
+            return_value=mock_server,
+        ), patch(
+            "src.native.native_sync_manager._post_form",
+            side_effect=OSError("Connection refused"),
+        ), patch("webbrowser.open"):
+            ok, msg = native._do_authenticate("onedrive", "remote1", timeout=5.0)
+
+        self.assertFalse(ok)
+        self.assertIn("Error de red", msg)
+        self.assertIn("Connection refused", msg)
 
 
 if __name__ == "__main__":
