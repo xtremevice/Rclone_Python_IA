@@ -1044,7 +1044,10 @@ class NativeSyncManager:
         if server is None or port is None:
             return False, "No se pudo encontrar un puerto libre para el servidor OAuth."
 
-        redirect_uri = f"http://localhost:{port}/callback"
+        # RFC 8252 §7.3: plain HTTP is acceptable for loopback addresses.
+        # The rclone public client IDs register exactly "http://localhost:<port>/"
+        # (root path, no extra segments) — any other path causes invalid_request.
+        redirect_uri = f"http://localhost:{port}/"
         verifier = _pkce_verifier()
 
         if platform == "onedrive":

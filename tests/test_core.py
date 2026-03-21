@@ -5585,6 +5585,74 @@ class TestNativeLogging(unittest.TestCase):
         )
         # The folder is excluded by the `not is_dir` guard, not by the prefix
 
+    # ------------------------------------------------------------------
+    # OAuth redirect_uri registration compliance
+    # ------------------------------------------------------------------
+
+    def test_onedrive_build_auth_url_redirect_uri_no_callback_path(self):
+        """OneDriveProvider.build_auth_url must use 'http://localhost:<port>/' as
+        redirect_uri — NOT 'http://localhost:<port>/callback'.
+
+        The rclone public client ID (b15665d9-…) only has 'http://localhost:53682/'
+        registered with Microsoft; any other path causes invalid_request: redirect_uri.
+        """
+        from src.native.native_sync_manager import OneDriveProvider, _OAUTH_PORT_RANGE
+        verifier = "dummyverifier1234567890abcdef"
+        redirect_uri = f"http://localhost:{_OAUTH_PORT_RANGE.start}/"
+        url = OneDriveProvider.build_auth_url(redirect_uri, verifier)
+        self.assertIn("redirect_uri=http%3A%2F%2Flocalhost%3A", url)
+        # The URL must NOT contain /callback in the redirect_uri parameter
+        self.assertNotIn("%2Fcallback", url, "redirect_uri must not include /callback path")
+        self.assertNotIn("/callback", url, "redirect_uri must not include /callback path")
+
+    def test_gdrive_build_auth_url_redirect_uri_no_callback_path(self):
+        """GoogleDriveProvider.build_auth_url must also use the root '/' path."""
+        from src.native.native_sync_manager import GoogleDriveProvider, _OAUTH_PORT_RANGE
+        verifier = "dummyverifier1234567890abcdef"
+        redirect_uri = f"http://localhost:{_OAUTH_PORT_RANGE.start}/"
+        url = GoogleDriveProvider.build_auth_url(redirect_uri, verifier)
+        self.assertIn("redirect_uri=http%3A%2F%2Flocalhost%3A", url)
+        self.assertNotIn("%2Fcallback", url, "redirect_uri must not include /callback path")
+        self.assertNotIn("/callback", url, "redirect_uri must not include /callback path")
+
+    def test_do_authenticate_uses_root_redirect_uri(self):
+        """_do_authenticate must pass 'http://localhost:<port>/' (root path) as
+        redirect_uri when calling build_auth_url — never '/callback'."""
+        from unittest.mock import patch, MagicMock
+        import urllib.parse
+        from src.native.native_sync_manager import NativeSyncManager, _OAUTH_PORT_RANGE
+
+        captured_redirect = []
+
+        def fake_build_auth_url(redirect_uri: str, verifier: str) -> str:
+            captured_redirect.append(redirect_uri)
+            return "http://no-op/"
+
+        mock_server = MagicMock()
+        mock_server.start.return_value = True
+        mock_server.port = _OAUTH_PORT_RANGE.start
+        mock_server.wait_for_code.return_value = None  # simulate timeout → returns False
+
+        native = NativeSyncManager(self.config)
+
+        with patch(
+            "src.native.native_sync_manager.OneDriveProvider.build_auth_url",
+            side_effect=fake_build_auth_url,
+        ), patch(
+            "src.native.native_sync_manager._OAuthCallbackServer",
+            return_value=mock_server,
+        ), patch("webbrowser.open"):
+            native._do_authenticate("onedrive", "remote1", timeout=0.01)
+
+        self.assertEqual(len(captured_redirect), 1)
+        uri = captured_redirect[0]
+        parsed = urllib.parse.urlparse(uri)
+        self.assertEqual(
+            parsed.path,
+            "/",
+            f"redirect_uri path must be '/' not '{parsed.path}'",
+        )
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
