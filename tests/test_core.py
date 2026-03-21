@@ -4225,6 +4225,85 @@ class TestMergeLocalAndComparison(unittest.TestCase):
         self.assertEqual(dir_statuses.get("remote_empty_dir"), "remote_only",
                          "Empty remote-only directory must be orange (remote_only), not grey")
 
+    def test_local_folder_move_shows_correct_pending_status(self):
+        """Moving a local folder shows the old path as remote_only and the new path as local_only.
+
+        Scenario:
+          • ``old_dir/moved_file.txt`` was previously synced (exists on remote).
+          • The user moved ``old_dir/`` inside a new ``new_parent/`` folder locally
+            so the file is now at ``new_parent/old_dir/moved_file.txt`` on disk.
+          • ``old_dir/`` no longer exists on the local filesystem.
+
+        Expected tree display BEFORE the next bisync run:
+          • ``old_dir/moved_file.txt``            → 🟠 remote_only  (will be deleted from remote)
+          • ``new_parent/old_dir/moved_file.txt`` → 🔵 local_only   (will be uploaded to remote)
+          • ``old_dir/``                          → 🟠 remote_only  (propagated from its files)
+          • ``new_parent/``                       → 🔵 local_only   (propagated from its files)
+          • ``new_parent/old_dir/``               → 🔵 local_only   (propagated from its files)
+
+        This validates that rclone bisync will correctly propagate the move on the
+        next sync cycle: it will delete ``old_dir/`` from the remote and upload
+        ``new_parent/old_dir/`` — no special code path is needed because bisync
+        treats the move as a delete-on-old-path + create-on-new-path operation.
+        """
+        import os as _os
+        import tempfile as _tempfile
+        import shutil as _shutil
+
+        tmpdir = _tempfile.mkdtemp()
+        try:
+            # Build the POST-MOVE local filesystem state:
+            #   new_parent/
+            #     old_dir/
+            #       moved_file.txt   ← this file was previously at old_dir/moved_file.txt
+            _os.makedirs(_os.path.join(tmpdir, "new_parent", "old_dir"))
+            open(_os.path.join(tmpdir, "new_parent", "old_dir", "moved_file.txt"), "w").close()
+
+            # Simulate the comparison data from the DB:
+            # Thread 1 cleared old_dir/moved_file.txt's local_mtime (file gone locally).
+            # Thread 2 still sees old_dir/moved_file.txt on the remote.
+            # update_statuses → "remote_only" for old_dir/moved_file.txt.
+            # Thread 1 added new_parent/old_dir/moved_file.txt with local_mtime set.
+            # Thread 2 did not find it on remote.
+            # update_statuses → "local_only" for new_parent/old_dir/moved_file.txt.
+            comp = [
+                {"rel": "old_dir/moved_file.txt",            "status": "remote_only"},
+                {"rel": "new_parent/old_dir/moved_file.txt", "status": "local_only"},
+            ]
+
+            result = _merge_local_and_comparison_testable(tmpdir, comp)
+
+            file_statuses = {item["rel"]: item["status"]
+                             for item in result if not item["is_dir"]}
+            dir_statuses = {item["rel"]: item["status"]
+                            for item in result if item["is_dir"]}
+
+            # ── file-level assertions ───────────────────────────────────────
+            self.assertEqual(
+                file_statuses.get("old_dir/moved_file.txt"), "remote_only",
+                "Old file path must be orange (remote_only = will be deleted from remote)",
+            )
+            self.assertEqual(
+                file_statuses.get("new_parent/old_dir/moved_file.txt"), "local_only",
+                "New file path must be blue (local_only = will be uploaded to remote)",
+            )
+
+            # ── directory-level assertions ─────────────────────────────────
+            self.assertEqual(
+                dir_statuses.get("old_dir"), "remote_only",
+                "Old directory must be orange (remote_only) — its only file is remote_only",
+            )
+            self.assertEqual(
+                dir_statuses.get("new_parent"), "local_only",
+                "New parent directory must be blue (local_only) — its only file is local_only",
+            )
+            self.assertEqual(
+                dir_statuses.get("new_parent/old_dir"), "local_only",
+                "Moved sub-directory must be blue (local_only) — its only file is local_only",
+            )
+        finally:
+            _shutil.rmtree(tmpdir, ignore_errors=True)
+
     # ── edge cases ───────────────────────────────────────────────────────────
 
     def test_empty_local_path(self):

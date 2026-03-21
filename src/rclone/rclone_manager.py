@@ -1595,6 +1595,24 @@ class RcloneManager:
         # First attempt: standard bisync, or bisync --resync for subsequent runs
         # --workdir isolates this service's lock files and state snapshots from
         # all other services so concurrent bisync runs don't block each other.
+        #
+        # HOW FOLDER MOVES ARE PROPAGATED
+        # ─────────────────────────────────────────────────────────────────────
+        # rclone bisync does not support --track-renames.  When the user moves a
+        # local folder (e.g. FolderA/ → Parent/FolderA/), bisync handles the
+        # change correctly on the next run via a delete + create sequence:
+        #
+        #   1. Files at the old path (FolderA/…) are missing from the local
+        #      listing but were present in the prior .lst snapshot → bisync
+        #      deletes them from the remote.
+        #   2. Files at the new path (Parent/FolderA/…) are new in the local
+        #      listing → bisync uploads them to the remote.
+        #
+        # The net result is identical to a move: the remote ends up with the
+        # files at the new location and the old location is removed.  The tree
+        # display correctly reflects the pending state between scans by showing
+        # the old path as remote_only (orange = will be deleted) and the new
+        # path as local_only (blue = will be uploaded).
         cmd = base + ["bisync", remote, local, "--workdir", str(workdir)] + perf_args + exclude_args
         if use_resync:
             # Include --resync so rclone re-establishes the baseline instead of
