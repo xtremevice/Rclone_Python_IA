@@ -19,6 +19,7 @@ import platform
 import re
 import subprocess
 import threading
+import time
 import tkinter as tk
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -88,6 +89,15 @@ class MainWindow:
         # Encrypted SQLite database for per-service file scan metadata.
         # Created once and shared across all service tree-check threads.
         self._db = FileScanDB()
+        # Log the DB path on startup so developers and testers can find it.
+        self._error_logger.log(
+            "Sistema",
+            f"📂 Base de datos: {self._db.db_path}",
+        )
+        self._error_logger.log(
+            "Sistema",
+            f"🔑 Clave de cifrado: {self._db.key_path}",
+        )
 
         # Root Tk window
         self._root = tk.Tk()
@@ -151,6 +161,12 @@ class MainWindow:
         self._tree_scan_started_vars: Dict[str, tk.StringVar] = {}
         # Per-service StringVars showing when the next scheduled scan will run.
         self._tree_scan_next_vars: Dict[str, tk.StringVar] = {}
+        # Per-service (local, remote, merger) scan-thread status StringVars.
+        self._tree_thread_status_vars: Dict[str, Tuple[tk.StringVar, tk.StringVar, tk.StringVar]] = {}
+        # Per-service StringVar showing total scan elapsed time.
+        self._tree_scan_elapsed_vars: Dict[str, tk.StringVar] = {}
+        # Per-service monotonic start time used to compute elapsed scan time.
+        self._tree_scan_wall_times: Dict[str, float] = {}
         # Whether the pystray tray icon has been started (non-Elementary only)
         self._tray_started = False
 
@@ -310,6 +326,42 @@ class MainWindow:
             fg="#555555",
             font=("Segoe UI", 9),
         ).grid(row=1, column=6, sticky="w", padx=(12, 0), pady=(4, 0))
+
+        # Row 2: per-thread scan status labels + total elapsed time
+        local_status_var = tk.StringVar(value=f"{_SCAN_LOCAL_PREFIX}—")
+        remote_status_var = tk.StringVar(value=f"{_SCAN_REMOTE_PREFIX}—")
+        merger_status_var = tk.StringVar(value=f"{_SCAN_MERGER_PREFIX}—")
+        elapsed_var = tk.StringVar(value=f"{_SCAN_ELAPSED_PREFIX}—")
+        self._tree_thread_status_vars[name] = (local_status_var, remote_status_var, merger_status_var)
+        self._tree_scan_elapsed_vars[name] = elapsed_var
+        tk.Label(
+            header,
+            textvariable=local_status_var,
+            bg="#f0f4fa",
+            fg="#555555",
+            font=("Segoe UI", 9),
+        ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(2, 0))
+        tk.Label(
+            header,
+            textvariable=remote_status_var,
+            bg="#f0f4fa",
+            fg="#555555",
+            font=("Segoe UI", 9),
+        ).grid(row=2, column=2, columnspan=2, sticky="w", padx=(12, 0), pady=(2, 0))
+        tk.Label(
+            header,
+            textvariable=merger_status_var,
+            bg="#f0f4fa",
+            fg="#555555",
+            font=("Segoe UI", 9),
+        ).grid(row=2, column=4, columnspan=2, sticky="w", padx=(12, 0), pady=(2, 0))
+        tk.Label(
+            header,
+            textvariable=elapsed_var,
+            bg="#f0f4fa",
+            fg="#555555",
+            font=("Segoe UI", 9),
+        ).grid(row=2, column=6, sticky="w", padx=(12, 0), pady=(2, 0))
 
         # Fetch storage quota in the background and update the label when ready
         self._fetch_storage_info_async(name, storage_var)
@@ -628,6 +680,18 @@ class MainWindow:
         if started_var is not None:
             started_var.set(f"{_SCAN_STARTED_PREFIX}{started_str}")
 
+        # Reset thread status labels and start the wall-clock timer.
+        self._tree_scan_wall_times[service_name] = time.monotonic()
+        elapsed_var_init = self._tree_scan_elapsed_vars.get(service_name)
+        if elapsed_var_init is not None:
+            elapsed_var_init.set(f"{_SCAN_ELAPSED_PREFIX}—")
+        status_vars_init = self._tree_thread_status_vars.get(service_name)
+        if status_vars_init is not None:
+            local_sv, remote_sv, merger_sv = status_vars_init
+            local_sv.set(f"{_SCAN_LOCAL_PREFIX}{_THREAD_SCANNING}")
+            remote_sv.set(f"{_SCAN_REMOTE_PREFIX}{_THREAD_SCANNING}")
+            merger_sv.set(f"{_SCAN_MERGER_PREFIX}{_THREAD_SCANNING}")
+
         svc = self._config.get_service(service_name)
         if svc is None:
             return
@@ -653,7 +717,21 @@ class MainWindow:
             local_files: Dict[str, Dict] = {}
             if local_path and os.path.isdir(local_path):
                 base = Path(local_path)
-                for dirpath, _dirs, filenames in os.walk(local_path):
+                for dirpath, dirs, filenames in os.walk(local_path):
+                    # Include directory entries so the DB tracks local directories
+                    # and the tree can compare them against remote directories.
+                    for d in dirs:
+                        full = os.path.join(dirpath, d)
+                        try:
+                            rel = str(Path(full).relative_to(base)).replace("\\", "/")
+                            st = os.stat(full)
+                            local_files[rel] = {
+                                "mtime": st.st_mtime,
+                                "size": 0,
+                                "is_dir": True,
+                            }
+                        except (OSError, ValueError):
+                            pass
                     for name in filenames:
                         full = os.path.join(dirpath, name)
                         try:
@@ -662,20 +740,58 @@ class MainWindow:
                             local_files[rel] = {
                                 "mtime": st.st_mtime,
                                 "size": st.st_size,
+                                "is_dir": False,
                             }
                         except (OSError, ValueError):
                             pass
+            n_local_files = sum(1 for v in local_files.values() if not v.get("is_dir"))
+            n_local_dirs  = sum(1 for v in local_files.values() if v.get("is_dir"))
             db.upsert_local_batch(service_name, scan_ts, local_files)
             local_done.set()
+            local_detail = f"{n_local_files} arch., {n_local_dirs} dirs."
+            self._root.after(
+                0,
+                lambda g=scan_gen, d=local_detail: self._update_thread_status(
+                    service_name, g, "local", d
+                ),
+            )
 
         # ── Thread 2: remote metadata scan ─────────────────────────────────
         def _remote_worker() -> None:
             scan_ts = datetime.now(timezone.utc).timestamp()
-            remote_files = rclone.list_remote_metadata(service_name)
+            remote_files, remote_error = rclone.list_remote_metadata(service_name)
             if remote_files is not None:
-                db.upsert_remote_batch(service_name, scan_ts, remote_files)
-                remote_available.set()
+                n_remote_files = sum(1 for v in remote_files.values() if not v.get("is_dir"))
+                n_remote_dirs  = sum(1 for v in remote_files.values() if v.get("is_dir"))
+                try:
+                    db.upsert_remote_batch(service_name, scan_ts, remote_files)
+                    remote_available.set()
+                    remote_detail = f"{n_remote_files} arch., {n_remote_dirs} dirs."
+                    self._error_logger.log(
+                        service_name,
+                        f"☁️ Escaneo remoto: {n_remote_files} archivos y "
+                        f"{n_remote_dirs} directorios encontrados y guardados en BD",
+                    )
+                except Exception as exc:  # pragma: no cover
+                    remote_detail = "Error al guardar"
+                    self._error_logger.log(
+                        service_name,
+                        f"☁️ Error al guardar datos remotos en la base de datos: {exc}",
+                    )
+            else:
+                err_msg = remote_error or "error desconocido"
+                remote_detail = "Sin datos"
+                self._error_logger.log(
+                    service_name,
+                    f"☁️ No se pudo obtener datos del remoto: {err_msg}",
+                )
             remote_done.set()
+            self._root.after(
+                0,
+                lambda g=scan_gen, d=remote_detail: self._update_thread_status(
+                    service_name, g, "remote", d
+                ),
+            )
 
         # ── Thread 3: merger — reads DB, computes statuses, updates tree ────
         def _merger_worker() -> None:
@@ -694,6 +810,7 @@ class MainWindow:
                     "status": "local_only",
                     "local_mtime": rec["local_mtime"],
                     "remote_mtime": None,
+                    "is_dir": rec.get("is_dir", False),
                 }
                 for rec in records if rec["rel"]
             ]
@@ -718,6 +835,7 @@ class MainWindow:
                         "status": rec["status"],
                         "local_mtime": rec["local_mtime"],
                         "remote_mtime": rec["remote_mtime"],
+                        "is_dir": rec.get("is_dir", False),
                     }
                     for rec in records if rec["rel"]
                 ]
@@ -733,9 +851,30 @@ class MainWindow:
                 }
                 final_items = _scan_local_tree(local_path, synced_set, pending_set)
 
+            # Log a status breakdown so the user can see what the tree contains.
+            n_files = sum(1 for it in final_items if not it["is_dir"])
+            n_dirs  = sum(1 for it in final_items if it["is_dir"])
+            status_counts: Dict[str, int] = {}
+            for it in final_items:
+                if not it["is_dir"]:
+                    s = it["status"]
+                    status_counts[s] = status_counts.get(s, 0) + 1
+            breakdown = ", ".join(
+                f"{v} {k}" for k, v in sorted(status_counts.items()) if v
+            )
+            self._error_logger.log(
+                service_name,
+                f"🔄 Árbol generado: {n_files} archivos en {n_dirs} directorios"
+                + (f" [{breakdown}]" if breakdown else ""),
+            )
+
             self._root.after(
                 0,
                 lambda: self._on_tree_check_done(service_name, final_items),
+            )
+            self._root.after(
+                0,
+                lambda g=scan_gen: self._update_thread_status(service_name, g, "merger"),
             )
 
         threading.Thread(
@@ -833,6 +972,40 @@ class MainWindow:
         # never overwrites a good snapshot.
         _save_tree_cache(service_name, items)
         self._schedule_tree_refresh(service_name, len(items))
+
+    def _update_thread_status(
+        self, service_name: str, gen: int, thread_name: str, detail: str = ""
+    ) -> None:
+        """Update a scan-thread status label on the main thread.
+
+        Called via ``_root.after(0, ...)`` from each worker thread once it
+        finishes.  *thread_name* is one of ``"local"``, ``"remote"``, or
+        ``"merger"``.  When the merger finishes the total elapsed scan time
+        is computed and displayed.
+
+        *detail* is an optional string (e.g. ``"42 arch., 5 dirs."`` for a
+        successful remote scan, or ``"Sin datos remotos"`` on failure).  When
+        provided it replaces the generic ``_THREAD_DONE`` text so the user can
+        see at a glance how many entries were found.
+        """
+        if self._tree_check_generations.get(service_name) != gen:
+            return  # a newer scan has started — discard stale update
+        status_vars = self._tree_thread_status_vars.get(service_name)
+        if status_vars is None:
+            return
+        local_sv, remote_sv, merger_sv = status_vars
+        done_text = detail if detail else _THREAD_DONE
+        if thread_name == "local":
+            local_sv.set(f"{_SCAN_LOCAL_PREFIX}{done_text}")
+        elif thread_name == "remote":
+            remote_sv.set(f"{_SCAN_REMOTE_PREFIX}{done_text}")
+        elif thread_name == "merger":
+            merger_sv.set(f"{_SCAN_MERGER_PREFIX}{done_text}")
+            start_t = self._tree_scan_wall_times.get(service_name)
+            elapsed_var = self._tree_scan_elapsed_vars.get(service_name)
+            if start_t is not None and elapsed_var is not None:
+                elapsed_sec = time.monotonic() - start_t
+                elapsed_var.set(f"{_SCAN_ELAPSED_PREFIX}{elapsed_sec:.1f}s")
 
     def _schedule_tree_refresh(self, service_name: str, item_count: int) -> None:
         """Cancel any existing scheduled refresh and queue the next one.
@@ -1245,6 +1418,9 @@ class MainWindow:
         self._file_trees.clear()
         self._tree_scan_started_vars.clear()
         self._tree_scan_next_vars.clear()
+        self._tree_thread_status_vars.clear()
+        self._tree_scan_elapsed_vars.clear()
+        self._tree_scan_wall_times.clear()
         self._build_ui()
 
     def _on_service_added(self, service_name: str) -> None:
@@ -1299,6 +1475,14 @@ _SCAN_TIME_FMT = "%H:%M:%S"
 # Label prefixes for the tree-scan timing widgets.
 _SCAN_STARTED_PREFIX = "🕐 Inicio: "
 _SCAN_NEXT_PREFIX = "⏭ Próxima: "
+
+# Label prefixes and status text for the per-thread scan progress row.
+_THREAD_SCANNING = "Escaneando"
+_THREAD_DONE = "Terminado"
+_SCAN_LOCAL_PREFIX = "💾 Local: "
+_SCAN_REMOTE_PREFIX = "☁️ Remoto: "
+_SCAN_MERGER_PREFIX = "🔄 Árbol: "
+_SCAN_ELAPSED_PREFIX = "⏱ Total: "
 
 _TREE_STATUS_LABELS: Dict[str, str] = {
     "synced":       "🟢 Ambos",
@@ -1431,6 +1615,9 @@ def _merge_local_and_comparison(
     result = _scan_local_tree(local_path, set(), set())
 
     # ── Stage 2: overlay comparison statuses onto local file nodes ───────────
+    # Track ALL local rels (both files and directories) to avoid re-adding
+    # entries that already exist locally when we process remote-only items.
+    local_all_rels: set = {item["rel"] for item in result}
     local_file_rels: set = set()
     for item in result:
         if item["is_dir"]:
@@ -1440,7 +1627,11 @@ def _merge_local_and_comparison(
         comp_item = comp_map.get(rel)
         if comp_item is not None:
             # Comparison confirmed this file exists on one or both sides.
-            item["status"] = comp_item.get("status", "unknown")
+            cstatus = comp_item.get("status", "unknown")
+            # If the DB returned "unknown" (both mtimes NULL — stale/corrupt
+            # record) we still know this file IS present locally, so treat it
+            # as "local_only" rather than showing it grey.
+            item["status"] = cstatus if cstatus != "unknown" else "local_only"
             # Carry through mtime values so the columns can be populated
             if "local_mtime" in comp_item:
                 item["local_mtime"] = comp_item["local_mtime"]
@@ -1451,15 +1642,20 @@ def _merge_local_and_comparison(
             # it → it only exists on the local disk.
             item["status"] = "local_only"
 
-    # ── Stage 3: append remote-only files ───────────────────────────────────
-    # Files reported as "remote_only" by the comparison exist on the remote
-    # but were NOT found by the local scan (i.e. they are genuinely absent
-    # from the local folder).  Add them to the result so the tree shows the
-    # full picture.
+    # ── Stage 3: append remote-only entries (files AND directories) ─────────
+    # Entries reported as "remote_only" by the comparison exist on the remote
+    # but were NOT found by the local scan (genuinely absent from local folder).
+    # This includes empty remote directories which have no files to synthesise
+    # a parent node from.  Add them to the result so the tree shows the full
+    # picture.
     remote_only_items = []
     for rel, ci in comp_map.items():
-        if ci.get("status") == "remote_only" and rel not in local_file_rels:
-            ro_item: Dict = {"rel": rel, "status": "remote_only"}
+        if ci.get("status") == "remote_only" and rel not in local_all_rels:
+            ro_item: Dict = {
+                "rel": rel,
+                "status": "remote_only",
+                "is_dir": ci.get("is_dir", False),
+            }
             if "remote_mtime" in ci:
                 ro_item["remote_mtime"] = ci["remote_mtime"]
             remote_only_items.append(ro_item)
@@ -1481,15 +1677,30 @@ def _merge_local_and_comparison(
             item["status"] = "unknown"
     _propagate_dir_status(result)
 
+    # ── Stage 5: fix empty directories that are still "unknown" ──────────────
+    # _propagate_dir_status leaves a directory as "unknown" when it has no
+    # descendant files with a known status (e.g. the directory is truly empty
+    # or contains only sub-directories that are themselves empty).  We know
+    # whether each such directory is local or remote, so we can colour it
+    # correctly instead of leaving it grey:
+    #
+    #   • In local_all_rels → directory exists on the local disk → "local_only"
+    #   • Not in local_all_rels → came from Stage 3 (remote-only entry) → "remote_only"
+    for item in result:
+        if item["is_dir"] and item["status"] == "unknown":
+            item["status"] = "local_only" if item["rel"] in local_all_rels else "remote_only"
+
     return result
 
 
 def _build_check_tree(check_items: List[Dict]) -> List[Dict]:
     """Convert ``rclone check --combined`` output into Treeview node dicts.
 
-    Each input item has ``rel`` (POSIX path) and ``status`` keys.
-    Virtual directory nodes are synthesised from file paths so the tree
-    has proper parent–child structure.
+    Each input item has ``rel`` (POSIX path) and ``status`` keys.  Items may
+    optionally carry ``"is_dir": True`` to indicate that the entry itself is a
+    directory (e.g. a remote-only empty directory).  Virtual directory nodes
+    are synthesised from file paths so the tree has proper parent–child
+    structure.
 
     Items are ordered depth-first (parent always before its children) so they
     can be inserted into a :class:`ttk.Treeview` in a single forward pass.
@@ -1512,8 +1723,11 @@ def _build_check_tree(check_items: List[Dict]) -> List[Dict]:
             continue
 
         parts = rel.split("/")
+        is_item_dir = item.get("is_dir", False)
 
-        # Synthesise parent directory nodes (always shown, up to _MAX_TREE_DIRS)
+        # Synthesise parent directory nodes (always shown, up to _MAX_TREE_DIRS).
+        # For both files and directories we synthesise all ANCESTOR directories
+        # (i.e. all path components except the last one).
         for i in range(1, len(parts)):
             if dir_count >= _MAX_TREE_DIRS:
                 break
@@ -1530,23 +1744,39 @@ def _build_check_tree(check_items: List[Dict]) -> List[Dict]:
                 })
                 dir_count += 1
 
-        # File node (shown up to _MAX_TREE_FILES)
-        if file_count < _MAX_TREE_FILES:
-            parent_rel = "/".join(parts[:-1])
-            node: Dict = {
-                "rel": rel,
-                "parent": parent_rel,
-                "name": parts[-1],
-                "is_dir": False,
-                "status": item.get("status", "unknown"),
-            }
-            # Carry through mtime fields when present
-            if "local_mtime" in item:
-                node["local_mtime"] = item["local_mtime"]
-            if "remote_mtime" in item:
-                node["remote_mtime"] = item["remote_mtime"]
-            result.append(node)
-            file_count += 1
+        if is_item_dir:
+            # Directory entry: add it as a directory node (not a file node).
+            # This handles explicit remote-only directories (including empty
+            # ones) that would otherwise be invisible in the tree.
+            if rel not in seen_dirs and dir_count < _MAX_TREE_DIRS:
+                parent_rel = "/".join(parts[:-1])
+                result.append({
+                    "rel": rel,
+                    "parent": parent_rel,
+                    "name": parts[-1],
+                    "is_dir": True,
+                    "status": item.get("status", "unknown"),
+                })
+                seen_dirs.add(rel)
+                dir_count += 1
+        else:
+            # File node (shown up to _MAX_TREE_FILES)
+            if file_count < _MAX_TREE_FILES:
+                parent_rel = "/".join(parts[:-1])
+                node: Dict = {
+                    "rel": rel,
+                    "parent": parent_rel,
+                    "name": parts[-1],
+                    "is_dir": False,
+                    "status": item.get("status", "unknown"),
+                }
+                # Carry through mtime fields when present
+                if "local_mtime" in item:
+                    node["local_mtime"] = item["local_mtime"]
+                if "remote_mtime" in item:
+                    node["remote_mtime"] = item["remote_mtime"]
+                result.append(node)
+                file_count += 1
 
     # Colour each synthesised directory node based on its descendant files
     _propagate_dir_status(result)
@@ -1643,6 +1873,12 @@ def _scan_local_tree(
     _walk(base, "")
     # Colour each directory node based on its descendant files
     _propagate_dir_status(result)
+    # Any directory still "unknown" after propagation is empty on the local disk
+    # (no files to inherit a colour from).  It IS present locally, so show it
+    # as "local_only" (blue) rather than the uninformative grey "unknown".
+    for item in result:
+        if item["is_dir"] and item["status"] == "unknown":
+            item["status"] = "local_only"
     return result
 
 
@@ -1754,8 +1990,9 @@ def _fill_sync_tree(tree: ttk.Treeview, items: List[Dict]) -> None:
         icon  = "📁 " if is_dir else "📄 "
         label = _TREE_STATUS_LABELS.get(status, "❓")
         tags  = _TREE_STATUS_TAGS.get(status, ("unknown",))
-        # Auto-open top-level directories so the user immediately sees content
-        open_node = is_dir and parent == ""
+        # All nodes start collapsed so users are not overwhelmed by an
+        # automatically expanded tree and can open folders on demand.
+        open_node = False
 
         # Mtime columns: only meaningful for files; directories show nothing
         local_str  = "" if is_dir else _format_mtime(item.get("local_mtime"))

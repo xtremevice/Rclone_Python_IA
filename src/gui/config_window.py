@@ -779,6 +779,31 @@ class ConfigWindow:
             p, from_=1, to=120, textvariable=self._tree_large_var, width=8
         ).pack(anchor="w", pady=(2, 15))
 
+        # ── Remote listing timeout ─────────────────────────────────────
+        tk.Label(
+            p,
+            text="Tiempo de espera al listar remoto:",
+            anchor="w",
+            font=("Segoe UI", 10, "bold"),
+        ).pack(anchor="w", pady=(10, 5))
+        tk.Label(
+            p,
+            text=(
+                "Tiempo máximo (minutos) para obtener la lista de archivos del "
+                "remoto.\nAumenta este valor si el árbol reporta tiempo de espera "
+                "agotado."
+            ),
+            anchor="w",
+            justify=tk.LEFT,
+            wraplength=350,
+        ).pack(anchor="w")
+        self._lsjson_timeout_var = tk.IntVar(
+            value=max(1, self._svc.get("lsjson_timeout", 600) // 60)
+        )
+        tk.Spinbox(
+            p, from_=1, to=120, textvariable=self._lsjson_timeout_var, width=8
+        ).pack(anchor="w", pady=(2, 15))
+
         # Startup options
         tk.Label(p, text="Opciones de inicio:", anchor="w", font=("Segoe UI", 10, "bold")).pack(anchor="w", pady=(10, 5))
 
@@ -1519,6 +1544,11 @@ class ConfigWindow:
         if hasattr(self, "_tree_large_var"):
             try:
                 updates["tree_refresh_large_secs"] = max(1, int(self._tree_large_var.get())) * 60
+            except (tk.TclError, ValueError):
+                pass
+        if hasattr(self, "_lsjson_timeout_var"):
+            try:
+                updates["lsjson_timeout"] = max(1, int(self._lsjson_timeout_var.get())) * 60
             except (tk.TclError, ValueError):
                 pass
         if hasattr(self, "_startup_var"):

@@ -32,6 +32,7 @@ from src.rclone.rclone_manager import (
     _extract_file_path,
     _human_size,
     _rclone_supports_resync_mode,
+    _rclone_supports_create_empty_src_dirs,
     _bisync_cache_dir,
     _bisync_workdir_for_service,
     _migrate_bisync_state,
@@ -278,6 +279,30 @@ class TestRcloneHelpers(unittest.TestCase):
         mock_cfg.get_rclone_version.return_value = "rclone not found"
         self.assertFalse(_rclone_supports_resync_mode(mock_cfg))
 
+    def test_rclone_supports_create_empty_src_dirs_true_for_v1_64(self):
+        """_rclone_supports_create_empty_src_dirs() should return True for rclone v1.64+."""
+        mock_cfg = MagicMock()
+        mock_cfg.get_rclone_version.return_value = "rclone v1.64.0"
+        self.assertTrue(_rclone_supports_create_empty_src_dirs(mock_cfg))
+
+    def test_rclone_supports_create_empty_src_dirs_true_for_v1_65(self):
+        """_rclone_supports_create_empty_src_dirs() should return True for rclone v1.65."""
+        mock_cfg = MagicMock()
+        mock_cfg.get_rclone_version.return_value = "rclone v1.65.2"
+        self.assertTrue(_rclone_supports_create_empty_src_dirs(mock_cfg))
+
+    def test_rclone_supports_create_empty_src_dirs_false_for_v1_63(self):
+        """_rclone_supports_create_empty_src_dirs() should return False for rclone v1.63."""
+        mock_cfg = MagicMock()
+        mock_cfg.get_rclone_version.return_value = "rclone v1.63.1"
+        self.assertFalse(_rclone_supports_create_empty_src_dirs(mock_cfg))
+
+    def test_rclone_supports_create_empty_src_dirs_false_when_version_unknown(self):
+        """_rclone_supports_create_empty_src_dirs() returns False when version undetectable."""
+        mock_cfg = MagicMock()
+        mock_cfg.get_rclone_version.return_value = "rclone not found"
+        self.assertFalse(_rclone_supports_create_empty_src_dirs(mock_cfg))
+
 
 class TestRcloneManager(unittest.TestCase):
     """Tests for RcloneManager using a mock ConfigManager."""
@@ -332,6 +357,127 @@ class TestRcloneManager(unittest.TestCase):
         # rclone is not installed in CI, so we expect an empty list
         result = self.rclone.list_remote_tree("S2")
         self.assertIsInstance(result, list)
+
+    # ------------------------------------------------------------------
+    # list_remote_metadata — tuple return API
+    # ------------------------------------------------------------------
+
+    def test_list_remote_metadata_returns_tuple(self):
+        """list_remote_metadata() must always return a 2-tuple."""
+        self.config.add_service("MetaSvc", "drive", "/tmp/meta")
+        result = self.rclone.list_remote_metadata("MetaSvc")
+        self.assertIsInstance(result, tuple)
+        self.assertEqual(len(result), 2)
+
+    def test_list_remote_metadata_unknown_service_returns_error(self):
+        """list_remote_metadata() for an unknown service must return (None, error)."""
+        meta, err = self.rclone.list_remote_metadata("DoesNotExist")
+        self.assertIsNone(meta)
+        self.assertIsNotNone(err)
+        self.assertIsInstance(err, str)
+        self.assertGreater(len(err), 0)
+
+    def test_list_remote_metadata_incomplete_config_returns_error(self):
+        """A service without remote_name must return (None, error) not raise."""
+        # Add service without setting a remote_name (defaults to empty string).
+        self.config.add_service("NoRemote", "drive", "/tmp/noremote")
+        # Ensure remote_name is empty so the guard fires.
+        self.config.update_service("NoRemote", {"remote_name": ""})
+        meta, err = self.rclone.list_remote_metadata("NoRemote")
+        self.assertIsNone(meta)
+        self.assertIsNotNone(err)
+
+    def test_list_remote_metadata_rclone_failure_returns_error_string(self):
+        """When rclone exits non-zero, the error message must be non-empty."""
+        self.config.add_service("BadSvc", "drive", "/tmp/bad")
+        self.config.update_service("BadSvc", {"remote_name": "badremote"})
+        fake_proc = MagicMock()
+        fake_proc.returncode = 1
+        fake_proc.stdout = ""
+        fake_proc.stderr = "Failed to connect to remote"
+        with patch("subprocess.run", return_value=fake_proc):
+            meta, err = self.rclone.list_remote_metadata("BadSvc")
+        self.assertIsNone(meta)
+        self.assertIsNotNone(err)
+        self.assertIn("Failed to connect", err)
+
+    def test_list_remote_metadata_rclone_success_returns_data_no_error(self):
+        """When rclone succeeds, metadata must be returned and error must be None."""
+        self.config.add_service("GoodSvc", "drive", "/tmp/good")
+        self.config.update_service("GoodSvc", {"remote_name": "myremote"})
+        payload = [
+            {"Path": "docs/readme.txt", "ModTime": "2024-01-01T00:00:00.000000000Z",
+             "Size": 1024, "IsDir": False},
+            {"Path": "docs", "ModTime": "2024-01-01T00:00:00.000000000Z",
+             "Size": 0, "IsDir": True},
+        ]
+        fake_proc = MagicMock()
+        fake_proc.returncode = 0
+        fake_proc.stdout = json.dumps(payload)
+        fake_proc.stderr = ""
+        with patch("subprocess.run", return_value=fake_proc):
+            meta, err = self.rclone.list_remote_metadata("GoodSvc")
+        self.assertIsNone(err)
+        self.assertIsNotNone(meta)
+        self.assertIn("docs/readme.txt", meta)
+        self.assertFalse(meta["docs/readme.txt"]["is_dir"])
+        self.assertIn("docs", meta)
+        self.assertTrue(meta["docs"]["is_dir"])
+
+    def test_list_remote_metadata_timeout_returns_error(self):
+        """A TimeoutExpired must return (None, descriptive error) not raise."""
+        import subprocess as _sp
+        self.config.add_service("TimeoutSvc", "drive", "/tmp/timeout")
+        self.config.update_service("TimeoutSvc", {"remote_name": "slow_remote"})
+        with patch("subprocess.run", side_effect=_sp.TimeoutExpired("cmd", 600)) as mock_run:
+            meta, err = self.rclone.list_remote_metadata("TimeoutSvc")
+        self.assertIsNone(meta)
+        self.assertIsNotNone(err)
+        self.assertIn("600", err)  # default timeout value must appear in the message
+        # subprocess.run must have been called with the default timeout of 600 s
+        _call_kwargs = mock_run.call_args
+        actual_timeout = (
+            _call_kwargs.kwargs.get("timeout")
+            if _call_kwargs.kwargs
+            else _call_kwargs[1].get("timeout")
+        )
+        self.assertEqual(actual_timeout, 600)
+
+    def test_list_remote_metadata_custom_timeout_used(self):
+        """lsjson_timeout per-service setting must change the timeout and error message."""
+        import subprocess as _sp
+        self.config.add_service("SlowSvc", "drive", "/tmp/slow")
+        self.config.update_service("SlowSvc", {"remote_name": "slow_remote2", "lsjson_timeout": 900})
+        with patch("subprocess.run", side_effect=_sp.TimeoutExpired("cmd", 900)) as mock_run:
+            meta, err = self.rclone.list_remote_metadata("SlowSvc")
+        self.assertIsNone(meta)
+        self.assertIn("900", err)
+        # The subprocess.run call must have received timeout=900
+        _call_kwargs = mock_run.call_args
+        actual_timeout = (
+            _call_kwargs.kwargs.get("timeout")
+            if _call_kwargs.kwargs
+            else _call_kwargs[1].get("timeout")
+        )
+        self.assertEqual(actual_timeout, 900)
+
+    def test_list_remote_mtimes_still_works_after_api_change(self):
+        """list_remote_mtimes() must still return a plain dict (no tuple leakage)."""
+        self.config.add_service("MtimeSvc", "drive", "/tmp/mtime")
+        self.config.update_service("MtimeSvc", {"remote_name": "myremote2"})
+        payload = [
+            {"Path": "file.txt", "ModTime": "2024-06-01T12:00:00.000000000Z",
+             "Size": 100, "IsDir": False},
+        ]
+        fake_proc = MagicMock()
+        fake_proc.returncode = 0
+        fake_proc.stdout = json.dumps(payload)
+        fake_proc.stderr = ""
+        with patch("subprocess.run", return_value=fake_proc):
+            result = self.rclone.list_remote_mtimes("MtimeSvc")
+        self.assertIsInstance(result, dict)
+        self.assertIn("file.txt", result)
+        self.assertIsInstance(result["file.txt"], float)
 
     def test_on_status_change_callback_is_called(self):
         """_set_status() should invoke the on_status_change callback."""
@@ -395,6 +541,70 @@ class TestRcloneManager(unittest.TestCase):
 
         self.assertTrue(len(captured_cmds) > 0)
         self.assertNotIn("--cache-dir", captured_cmds[0])
+
+    def test_create_empty_src_dirs_in_bisync_by_default(self):
+        """_do_bisync() must include --create-empty-src-dirs by default on rclone >= v1.64.
+
+        Without this flag rclone bisync silently skips empty local directories,
+        so a freshly created local folder never appears on the remote.
+        """
+        self.config.add_service("EmptyDirSvc", "onedrive", "/tmp/emptydir_test")
+        captured_cmds = []
+
+        def fake_run_rclone(cmd, service_name, svc, is_retry=False):
+            captured_cmds.append(cmd)
+            return True
+
+        self.rclone._run_rclone = fake_run_rclone
+        # Simulate rclone >= v1.64 so the version guard allows the flag
+        self.config.get_rclone_version = lambda: "rclone v1.64.0"
+        svc = self.config.get_service("EmptyDirSvc")
+        self.rclone._do_bisync(svc)
+
+        self.assertTrue(len(captured_cmds) > 0)
+        self.assertIn("--create-empty-src-dirs", captured_cmds[0])
+
+    def test_create_empty_src_dirs_omitted_on_old_rclone(self):
+        """_do_bisync() must NOT pass --create-empty-src-dirs when rclone < v1.64.
+
+        Older versions of rclone do not support --create-empty-src-dirs for the
+        bisync subcommand and raise "unknown flag", so we must guard the flag
+        with a version check.
+        """
+        self.config.add_service("OldRcloneSvc", "onedrive", "/tmp/oldrclone_test")
+        captured_cmds = []
+
+        def fake_run_rclone(cmd, service_name, svc, is_retry=False):
+            captured_cmds.append(cmd)
+            return True
+
+        self.rclone._run_rclone = fake_run_rclone
+        # Simulate rclone < v1.64 (e.g. v1.63)
+        self.config.get_rclone_version = lambda: "rclone v1.63.1"
+        svc = self.config.get_service("OldRcloneSvc")
+        self.rclone._do_bisync(svc)
+
+        self.assertTrue(len(captured_cmds) > 0)
+        self.assertNotIn("--create-empty-src-dirs", captured_cmds[0])
+
+    def test_create_empty_src_dirs_can_be_disabled(self):
+        """Setting create_empty_src_dirs=False must omit --create-empty-src-dirs even on v1.64."""
+        self.config.add_service("NoEmptyDirSvc", "onedrive", "/tmp/noemptydir_test")
+        self.config.update_service("NoEmptyDirSvc", {"create_empty_src_dirs": False})
+        captured_cmds = []
+
+        def fake_run_rclone(cmd, service_name, svc, is_retry=False):
+            captured_cmds.append(cmd)
+            return True
+
+        self.rclone._run_rclone = fake_run_rclone
+        # Use v1.64 so the version guard would allow the flag if not disabled
+        self.config.get_rclone_version = lambda: "rclone v1.64.0"
+        svc = self.config.get_service("NoEmptyDirSvc")
+        self.rclone._do_bisync(svc)
+
+        self.assertTrue(len(captured_cmds) > 0)
+        self.assertNotIn("--create-empty-src-dirs", captured_cmds[0])
 
     # ------------------------------------------------------------------ #
     # --workdir per-service isolation tests                               #
@@ -1573,6 +1783,79 @@ class TestRcloneManager(unittest.TestCase):
         parser = configparser.RawConfigParser()
         parser.read(str(self.config.rclone_config_path()), encoding="utf-8")
         self.assertEqual(parser.get("dst", "token"), token_json)
+
+
+    def test_sync_loop_passes_use_resync_false_on_first_run(self):
+        """_sync_loop must pass use_resync=False on the very first sync.
+
+        Regression test: previously _sync_loop computed use_resync=not is_first,
+        which passed False on the first run (correct) but True on every
+        subsequent run (incorrect — see the other regression test).
+        """
+        self.config.add_service("FirstLoopSvc", "onedrive", "/tmp/first_loop")
+        # first_sync_done=False (default) → is_first=True
+        captured_use_resync = []
+        stop_event = threading.Event()
+
+        def fake_do_bisync(svc, use_resync=False):
+            captured_use_resync.append(use_resync)
+            stop_event.set()
+            return True
+
+        self.rclone._do_bisync = fake_do_bisync
+        self.rclone._stop_events["FirstLoopSvc"] = stop_event
+
+        t = threading.Thread(
+            target=self.rclone._sync_loop,
+            args=("FirstLoopSvc", stop_event),
+            daemon=True,
+        )
+        t.start()
+        t.join(timeout=5)
+
+        self.assertEqual(len(captured_use_resync), 1)
+        self.assertFalse(
+            captured_use_resync[0],
+            "_sync_loop must pass use_resync=False on the first run",
+        )
+
+    def test_sync_loop_passes_use_resync_false_on_subsequent_runs(self):
+        """_sync_loop must NEVER pass use_resync=True, even after first_sync_done.
+
+        Regression test: previously _sync_loop used use_resync=not is_first,
+        causing every sync after the first to run with --resync.  On rclone
+        < v1.64 this defaults to "path1 wins" (remote wins), which silently
+        overwrites local file modifications instead of uploading them.
+        """
+        self.config.add_service("SubsequentLoopSvc", "onedrive", "/tmp/subseq_loop")
+        # Simulate a service that has already completed its first sync.
+        self.config.update_service("SubsequentLoopSvc", {"first_sync_done": True})
+        captured_use_resync = []
+        stop_event = threading.Event()
+
+        def fake_do_bisync(svc, use_resync=False):
+            captured_use_resync.append(use_resync)
+            stop_event.set()
+            return True
+
+        self.rclone._do_bisync = fake_do_bisync
+        self.rclone._stop_events["SubsequentLoopSvc"] = stop_event
+
+        t = threading.Thread(
+            target=self.rclone._sync_loop,
+            args=("SubsequentLoopSvc", stop_event),
+            daemon=True,
+        )
+        t.start()
+        t.join(timeout=5)
+
+        self.assertEqual(len(captured_use_resync), 1)
+        self.assertFalse(
+            captured_use_resync[0],
+            "_sync_loop must not pass use_resync=True on subsequent runs "
+            "(doing so causes --resync every cycle, overwriting local changes "
+            "on rclone < v1.64 where path1/remote wins by default)",
+        )
 
 
 class TestBisyncLockCleanup(unittest.TestCase):
@@ -3004,8 +3287,14 @@ class TestFirstSyncTracking(unittest.TestCase):
             import shutil
             shutil.rmtree(local, ignore_errors=True)
 
-    def test_use_resync_true_on_subsequent_runs(self):
-        """_sync_loop must include --resync in the bisync command after first_sync_done=True."""
+    def test_use_resync_false_on_subsequent_runs(self):
+        """_sync_loop must NOT include --resync in the bisync command after first_sync_done=True.
+
+        Regression test: previously _sync_loop used use_resync=not is_first which
+        caused every sync cycle after the first to run with --resync.  On rclone
+        < v1.64 that defaults to "path1 wins" (remote wins), silently overwriting
+        local file modifications instead of uploading them.
+        """
         local = tempfile.mkdtemp()
         try:
             self.config.add_service("SubResyncSvc", "onedrive", local)
@@ -3033,8 +3322,9 @@ class TestFirstSyncTracking(unittest.TestCase):
                 self.rclone._sync_loop("SubResyncSvc", stop_event)
 
             all_cmds_flat = [arg for cmd in captured_cmds for arg in cmd]
-            self.assertIn("--resync", all_cmds_flat,
-                          "--resync must be present when first_sync_done=True")
+            self.assertNotIn("--resync", all_cmds_flat,
+                             "--resync must NOT be added on subsequent sync cycles "
+                             "(doing so overwrites local changes on older rclone)")
         finally:
             import shutil
             shutil.rmtree(local, ignore_errors=True)
@@ -3251,6 +3541,7 @@ def _build_check_tree_testable(check_items, max_files, max_dirs):
         if not rel:
             continue
         parts = rel.split("/")
+        is_item_dir = item.get("is_dir", False)
         for i in range(1, len(parts)):
             if dir_count >= max_dirs:
                 break
@@ -3263,19 +3554,30 @@ def _build_check_tree_testable(check_items, max_files, max_dirs):
                     "name": parts[i - 1], "is_dir": True, "status": "unknown",
                 })
                 dir_count += 1
-        if file_count < max_files:
-            parent_rel = "/".join(parts[:-1])
-            node = {
-                "rel": rel, "parent": parent_rel,
-                "name": parts[-1], "is_dir": False,
-                "status": item.get("status", "unknown"),
-            }
-            if "local_mtime" in item:
-                node["local_mtime"] = item["local_mtime"]
-            if "remote_mtime" in item:
-                node["remote_mtime"] = item["remote_mtime"]
-            result.append(node)
-            file_count += 1
+        if is_item_dir:
+            if rel not in seen_dirs and dir_count < max_dirs:
+                parent_rel = "/".join(parts[:-1])
+                result.append({
+                    "rel": rel, "parent": parent_rel,
+                    "name": parts[-1], "is_dir": True,
+                    "status": item.get("status", "unknown"),
+                })
+                seen_dirs.add(rel)
+                dir_count += 1
+        else:
+            if file_count < max_files:
+                parent_rel = "/".join(parts[:-1])
+                node = {
+                    "rel": rel, "parent": parent_rel,
+                    "name": parts[-1], "is_dir": False,
+                    "status": item.get("status", "unknown"),
+                }
+                if "local_mtime" in item:
+                    node["local_mtime"] = item["local_mtime"]
+                if "remote_mtime" in item:
+                    node["remote_mtime"] = item["remote_mtime"]
+                result.append(node)
+                file_count += 1
 
     _propagate_dir_status_testable(result)
     return result
@@ -3336,6 +3638,37 @@ class TestBuildCheckTreeCap(unittest.TestCase):
         result = _build_check_tree_testable(items, max_files=100, max_dirs=3)
         dir_nodes = [i for i in result if i["is_dir"]]
         self.assertLessEqual(len(dir_nodes), 3)
+
+    def test_is_dir_item_added_as_directory_node(self):
+        """An item with is_dir=True must be inserted as a directory node."""
+        items = [{"rel": "emptydir", "status": "remote_only", "is_dir": True}]
+        result = _build_check_tree_testable(items, max_files=100, max_dirs=100)
+        dir_nodes = [i for i in result if i["is_dir"]]
+        self.assertEqual(len(dir_nodes), 1)
+        self.assertEqual(dir_nodes[0]["rel"], "emptydir")
+        self.assertEqual(dir_nodes[0]["is_dir"], True)
+
+    def test_is_dir_item_not_counted_as_file(self):
+        """An item with is_dir=True must NOT consume a file slot."""
+        items = [
+            {"rel": "thedir", "status": "remote_only", "is_dir": True},
+            {"rel": "thedir/child.txt", "status": "remote_only"},
+        ]
+        result = _build_check_tree_testable(items, max_files=1, max_dirs=100)
+        # The directory node must appear
+        dir_rels = {i["rel"] for i in result if i["is_dir"]}
+        self.assertIn("thedir", dir_rels)
+        # The one file slot must also be used
+        file_nodes = [i for i in result if not i["is_dir"]]
+        self.assertEqual(len(file_nodes), 1)
+
+    def test_nested_is_dir_item_gets_parent_synthesised(self):
+        """A nested is_dir item must also have its parent directory created."""
+        items = [{"rel": "parent/child_dir", "status": "remote_only", "is_dir": True}]
+        result = _build_check_tree_testable(items, max_files=100, max_dirs=100)
+        rels = {i["rel"] for i in result if i["is_dir"]}
+        self.assertIn("parent", rels, "synthesised parent must appear")
+        self.assertIn("parent/child_dir", rels, "the directory item itself must appear")
 
 
 # ---------------------------------------------------------------------------
@@ -3647,6 +3980,7 @@ def _merge_local_and_comparison_testable(local_path, comparison_items,
     result = _do_local_scan(local_path, max_files, max_dirs)
 
     # Stage 2: overlay comparison statuses onto local file nodes
+    local_all_rels = {item["rel"] for item in result}
     local_file_rels = set()
     for item in result:
         if item["is_dir"]:
@@ -3655,7 +3989,10 @@ def _merge_local_and_comparison_testable(local_path, comparison_items,
         local_file_rels.add(rel)
         comp_item = comp_map.get(rel)
         if comp_item is not None:
-            item["status"] = comp_item.get("status", "unknown")
+            cstatus = comp_item.get("status", "unknown")
+            # "unknown" in the DB means neither mtime was stored; the file IS
+            # local so fall back to "local_only" rather than showing grey.
+            item["status"] = cstatus if cstatus != "unknown" else "local_only"
             if "local_mtime" in comp_item:
                 item["local_mtime"] = comp_item["local_mtime"]
             if "remote_mtime" in comp_item:
@@ -3663,11 +4000,15 @@ def _merge_local_and_comparison_testable(local_path, comparison_items,
         else:
             item["status"] = "local_only"
 
-    # Stage 3: add remote-only files not found locally
+    # Stage 3: add remote-only entries (files AND directories) not found locally
     remote_only_items = []
     for rel, ci in comp_map.items():
-        if ci.get("status") == "remote_only" and rel not in local_file_rels:
-            ro_item = {"rel": rel, "status": "remote_only"}
+        if ci.get("status") == "remote_only" and rel not in local_all_rels:
+            ro_item = {
+                "rel": rel,
+                "status": "remote_only",
+                "is_dir": ci.get("is_dir", False),
+            }
             if "remote_mtime" in ci:
                 ro_item["remote_mtime"] = ci["remote_mtime"]
             remote_only_items.append(ro_item)
@@ -3683,6 +4024,12 @@ def _merge_local_and_comparison_testable(local_path, comparison_items,
         if item["is_dir"]:
             item["status"] = "unknown"
     _propagate_dir_status_testable(result)
+
+    # Stage 5: fix empty directories still "unknown" after propagation
+    for item in result:
+        if item["is_dir"] and item["status"] == "unknown":
+            item["status"] = "local_only" if item["rel"] in local_all_rels else "remote_only"
+
     return result
 
 
@@ -3771,6 +4118,30 @@ class TestMergeLocalAndComparison(unittest.TestCase):
         self.assertIn("remote_dir",               rels, "parent dir must be created")
         self.assertIn("remote_dir/remote_file.txt", rels)
 
+    def test_remote_only_directory_appears_in_tree(self):
+        """An is_dir=True remote_only entry must appear as a directory node."""
+        comp = [{"rel": "only_remote_dir", "status": "remote_only", "is_dir": True}]
+        result = self._merge(comp)
+        rels = {item["rel"] for item in result}
+        self.assertIn("only_remote_dir", rels)
+
+    def test_remote_only_directory_node_has_is_dir_true(self):
+        """A remote-only directory node must have is_dir=True."""
+        comp = [{"rel": "rem_dir", "status": "remote_only", "is_dir": True}]
+        result = self._merge(comp)
+        rem_dir = next((i for i in result if i["rel"] == "rem_dir"), None)
+        self.assertIsNotNone(rem_dir)
+        self.assertTrue(rem_dir["is_dir"])
+
+    def test_remote_only_empty_dir_not_duplicated_when_also_local(self):
+        """A remote-only directory already in the local tree must not be re-added."""
+        # 'subdir' exists locally (set up in setUp); if it also appears as
+        # remote_only in the comparison it must appear exactly once.
+        comp = [{"rel": "subdir", "status": "remote_only", "is_dir": True}]
+        result = self._merge(comp)
+        matches = [i for i in result if i["rel"] == "subdir"]
+        self.assertEqual(len(matches), 1)
+
     def test_local_file_not_duplicated_when_in_comparison(self):
         """A local file that also appears in comparison must not be duplicated."""
         comp = [{"rel": "file_a.txt", "status": "synced"}]
@@ -3798,6 +4169,140 @@ class TestMergeLocalAndComparison(unittest.TestCase):
         dir_statuses = {item["rel"]: item["status"]
                         for item in result if item["is_dir"]}
         self.assertEqual(dir_statuses.get("subdir"), "local_only")
+
+    def test_unknown_in_comp_map_becomes_local_only(self):
+        """A local file whose DB record has status 'unknown' must appear as local_only.
+
+        This covers the case where the DB has a stale/corrupt record with
+        NULL mtimes for a file that IS present on the local filesystem.
+        The tree must show it in blue (local_only), not grey (unknown).
+        """
+        comp = [
+            {"rel": "file_a.txt",       "status": "unknown"},
+            {"rel": "subdir/file_b.txt", "status": "unknown"},
+            {"rel": "subdir/file_c.txt", "status": "synced"},
+        ]
+        result = self._merge(comp)
+        statuses = {item["rel"]: item["status"]
+                    for item in result if not item["is_dir"]}
+        # unknown in comp_map but locally present → must be local_only (blue)
+        self.assertEqual(statuses.get("file_a.txt"),        "local_only")
+        self.assertEqual(statuses.get("subdir/file_b.txt"), "local_only")
+        # synced should be kept as-is
+        self.assertEqual(statuses.get("subdir/file_c.txt"), "synced")
+
+    def test_empty_local_dir_is_local_only(self):
+        """An empty local directory must be coloured local_only (blue), not grey.
+
+        Stage 5 of the merge must fix up directories that _propagate_dir_status
+        left as 'unknown' because they have no descendant files.  If the
+        directory IS in the local filesystem it should be blue, not grey.
+        """
+        # Create an extra empty subdirectory alongside the existing 'subdir'
+        import os as _os
+        empty_dir = _os.path.join(self._root, "empty_folder")
+        _os.makedirs(empty_dir, exist_ok=True)
+        # No comparison items: all files are local_only, empty_folder has no files
+        result = self._merge([])
+        dir_statuses = {item["rel"]: item["status"]
+                        for item in result if item["is_dir"]}
+        self.assertEqual(dir_statuses.get("empty_folder"), "local_only",
+                         "Empty local directory must be blue (local_only), not grey (unknown)")
+
+    def test_empty_remote_only_dir_is_remote_only(self):
+        """An empty remote-only directory must be coloured remote_only (orange).
+
+        Stage 5 of the merge must assign 'remote_only' to empty directories
+        that came from Stage 3 (not in the local filesystem).
+        """
+        comp = [
+            # Simulate a remote-only empty directory that was recorded in the DB
+            {"rel": "remote_empty_dir", "status": "remote_only", "is_dir": True},
+        ]
+        result = self._merge(comp)
+        dir_statuses = {item["rel"]: item["status"]
+                        for item in result if item["is_dir"]}
+        self.assertEqual(dir_statuses.get("remote_empty_dir"), "remote_only",
+                         "Empty remote-only directory must be orange (remote_only), not grey")
+
+    def test_local_folder_move_shows_correct_pending_status(self):
+        """Moving a local folder shows the old path as remote_only and the new path as local_only.
+
+        Scenario:
+          • ``old_dir/moved_file.txt`` was previously synced (exists on remote).
+          • The user moved ``old_dir/`` inside a new ``new_parent/`` folder locally
+            so the file is now at ``new_parent/old_dir/moved_file.txt`` on disk.
+          • ``old_dir/`` no longer exists on the local filesystem.
+
+        Expected tree display BEFORE the next bisync run:
+          • ``old_dir/moved_file.txt``            → 🟠 remote_only  (will be deleted from remote)
+          • ``new_parent/old_dir/moved_file.txt`` → 🔵 local_only   (will be uploaded to remote)
+          • ``old_dir/``                          → 🟠 remote_only  (propagated from its files)
+          • ``new_parent/``                       → 🔵 local_only   (propagated from its files)
+          • ``new_parent/old_dir/``               → 🔵 local_only   (propagated from its files)
+
+        This validates that rclone bisync will correctly propagate the move on the
+        next sync cycle: it will delete ``old_dir/`` from the remote and upload
+        ``new_parent/old_dir/`` — no special code path is needed because bisync
+        treats the move as a delete-on-old-path + create-on-new-path operation.
+        """
+        import os as _os
+        import tempfile as _tempfile
+        import shutil as _shutil
+
+        tmpdir = _tempfile.mkdtemp()
+        try:
+            # Build the POST-MOVE local filesystem state:
+            #   new_parent/
+            #     old_dir/
+            #       moved_file.txt   ← this file was previously at old_dir/moved_file.txt
+            _os.makedirs(_os.path.join(tmpdir, "new_parent", "old_dir"))
+            open(_os.path.join(tmpdir, "new_parent", "old_dir", "moved_file.txt"), "w").close()
+
+            # Simulate the comparison data from the DB:
+            # Thread 1 cleared old_dir/moved_file.txt's local_mtime (file gone locally).
+            # Thread 2 still sees old_dir/moved_file.txt on the remote.
+            # update_statuses → "remote_only" for old_dir/moved_file.txt.
+            # Thread 1 added new_parent/old_dir/moved_file.txt with local_mtime set.
+            # Thread 2 did not find it on remote.
+            # update_statuses → "local_only" for new_parent/old_dir/moved_file.txt.
+            comp = [
+                {"rel": "old_dir/moved_file.txt",            "status": "remote_only"},
+                {"rel": "new_parent/old_dir/moved_file.txt", "status": "local_only"},
+            ]
+
+            result = _merge_local_and_comparison_testable(tmpdir, comp)
+
+            file_statuses = {item["rel"]: item["status"]
+                             for item in result if not item["is_dir"]}
+            dir_statuses = {item["rel"]: item["status"]
+                            for item in result if item["is_dir"]}
+
+            # ── file-level assertions ───────────────────────────────────────
+            self.assertEqual(
+                file_statuses.get("old_dir/moved_file.txt"), "remote_only",
+                "Old file path must be orange (remote_only = will be deleted from remote)",
+            )
+            self.assertEqual(
+                file_statuses.get("new_parent/old_dir/moved_file.txt"), "local_only",
+                "New file path must be blue (local_only = will be uploaded to remote)",
+            )
+
+            # ── directory-level assertions ─────────────────────────────────
+            self.assertEqual(
+                dir_statuses.get("old_dir"), "remote_only",
+                "Old directory must be orange (remote_only) — its only file is remote_only",
+            )
+            self.assertEqual(
+                dir_statuses.get("new_parent"), "local_only",
+                "New parent directory must be blue (local_only) — its only file is local_only",
+            )
+            self.assertEqual(
+                dir_statuses.get("new_parent/old_dir"), "local_only",
+                "Moved sub-directory must be blue (local_only) — its only file is local_only",
+            )
+        finally:
+            _shutil.rmtree(tmpdir, ignore_errors=True)
 
     # ── edge cases ───────────────────────────────────────────────────────────
 
@@ -4071,6 +4576,35 @@ class TestFileScanDB(unittest.TestCase):
         shutil.rmtree(self._tmpdir, ignore_errors=True)
 
     # ------------------------------------------------------------------
+    # Path discovery
+    # ------------------------------------------------------------------
+
+    def test_db_path_property_returns_path_object(self):
+        """db_path must return a Path instance pointing to the database file."""
+        self.assertIsInstance(self._db.db_path, Path)
+
+    def test_db_path_property_matches_actual_file(self):
+        """db_path must point to the SQLite file that actually exists on disk."""
+        self.assertTrue(
+            self._db.db_path.exists(),
+            f"db_path {self._db.db_path} does not exist",
+        )
+
+    def test_db_path_property_is_the_configured_path(self):
+        """db_path must return exactly the path passed to the constructor."""
+        expected = Path(self._tmpdir) / "test_scan.db"
+        self.assertEqual(self._db.db_path, expected)
+
+    def test_key_path_property_returns_path_object(self):
+        """key_path must return a Path instance pointing to the key file."""
+        self.assertIsInstance(self._db.key_path, Path)
+
+    def test_key_path_property_is_the_configured_path(self):
+        """key_path must return exactly the path passed to the constructor."""
+        expected = Path(self._tmpdir) / "test.key"
+        self.assertEqual(self._db.key_path, expected)
+
+    # ------------------------------------------------------------------
     # Table lifecycle
     # ------------------------------------------------------------------
 
@@ -4275,6 +4809,119 @@ class TestFileScanDB(unittest.TestCase):
         self._db.update_statuses("SvcRO", scan_ts=0)
         records = self._db.get_all_records("SvcRO")
         self.assertEqual(records[0]["status"], "remote_only")
+
+    # ------------------------------------------------------------------
+    # Directory tracking (is_dir flag)
+    # ------------------------------------------------------------------
+
+    def test_upsert_local_batch_stores_is_dir_true(self):
+        """upsert_local_batch must persist is_dir=True for directory entries."""
+        ts = 1700000000.0
+        self._db.ensure_table("SvcDirLocal")
+        self._db.upsert_local_batch(
+            "SvcDirLocal", ts + 10,
+            {
+                "mydir": {"mtime": ts, "size": 0, "is_dir": True},
+                "mydir/file.txt": {"mtime": ts, "size": 42, "is_dir": False},
+            },
+        )
+        records = {r["rel"]: r for r in self._db.get_all_records("SvcDirLocal")}
+        self.assertTrue(records["mydir"]["is_dir"])
+        self.assertFalse(records["mydir/file.txt"]["is_dir"])
+
+    def test_upsert_remote_batch_stores_is_dir_true(self):
+        """upsert_remote_batch must persist is_dir=True for directory entries."""
+        ts = 1700000000.0
+        self._db.ensure_table("SvcDirRemote")
+        self._db.upsert_remote_batch(
+            "SvcDirRemote", ts + 10,
+            {
+                "remotedir": {"mtime": ts, "size": 0, "is_dir": True},
+                "remotedir/data.csv": {"mtime": ts, "size": 100, "is_dir": False},
+            },
+        )
+        records = {r["rel"]: r for r in self._db.get_all_records("SvcDirRemote")}
+        self.assertTrue(records["remotedir"]["is_dir"])
+        self.assertFalse(records["remotedir/data.csv"]["is_dir"])
+
+    def test_is_dir_defaults_to_false_when_not_provided(self):
+        """Omitting 'is_dir' key in the batch dict must default to False."""
+        ts = 1700000000.0
+        self._db.ensure_table("SvcNoDirKey")
+        self._db.upsert_local_batch(
+            "SvcNoDirKey", ts + 10,
+            {"file.txt": {"mtime": ts, "size": 10}},
+        )
+        records = self._db.get_all_records("SvcNoDirKey")
+        self.assertFalse(records[0]["is_dir"])
+
+    def test_update_statuses_directory_always_synced_when_both_sides_exist(self):
+        """A directory present on both sides must always get status 'synced',
+        regardless of mtime difference."""
+        ts = 1700000000.0
+        self._db.ensure_table("SvcDirStatus")
+        # Local directory mtime differs greatly from remote
+        self._db.upsert_local_batch(
+            "SvcDirStatus", ts + 10,
+            {"mydir": {"mtime": ts, "size": 0, "is_dir": True}},
+        )
+        self._db.upsert_remote_batch(
+            "SvcDirStatus", ts + 10,
+            {"mydir": {"mtime": ts + 3600, "size": 0, "is_dir": True}},
+        )
+        self._db.update_statuses("SvcDirStatus", scan_ts=0)
+        records = self._db.get_all_records("SvcDirStatus")
+        self.assertEqual(records[0]["status"], "synced")
+
+    def test_update_statuses_remote_only_directory(self):
+        """A directory present only on remote must get status 'remote_only'."""
+        ts = 1700000000.0
+        self._db.ensure_table("SvcDirRO")
+        self._db.upsert_remote_batch(
+            "SvcDirRO", ts + 10,
+            {"onlyremotedir": {"mtime": ts, "size": 0, "is_dir": True}},
+        )
+        self._db.update_statuses("SvcDirRO", scan_ts=0)
+        records = self._db.get_all_records("SvcDirRO")
+        self.assertEqual(records[0]["status"], "remote_only")
+
+    def test_schema_migration_adds_is_dir_enc(self):
+        """ensure_table must add is_dir_enc to tables created without it."""
+        import sqlite3 as _sqlite3
+        from pathlib import Path as _Path
+        import tempfile as _tmp
+        import os as _os
+        from src.db.file_scan_db import FileScanDB
+
+        tmpdir = _tmp.mkdtemp()
+        try:
+            db_path = _Path(tmpdir) / "old.db"
+            key_path = _Path(tmpdir) / "old.key"
+            # Create a database using the old schema (without is_dir_enc).
+            conn = _sqlite3.connect(str(db_path))
+            conn.execute("""
+                CREATE TABLE svc_test (
+                    path_hash TEXT PRIMARY KEY,
+                    rel_path_enc BLOB NOT NULL,
+                    local_size_enc BLOB, remote_size_enc BLOB,
+                    local_mtime_enc BLOB, remote_mtime_enc BLOB,
+                    local_scan_ts REAL, remote_scan_ts REAL,
+                    status_enc BLOB
+                )
+            """)
+            conn.commit()
+            conn.close()
+            # Open via FileScanDB — ensure_table should add is_dir_enc.
+            db = FileScanDB(db_path=db_path, key_path=key_path)
+            db.ensure_table("test")
+            conn2 = _sqlite3.connect(str(db_path))
+            cols = [r[1] for r in conn2.execute("PRAGMA table_info(svc_test)").fetchall()]
+            conn2.close()
+            db.close()
+            self.assertIn("is_dir_enc", cols)
+        finally:
+            import shutil as _shutil
+            _shutil.rmtree(tmpdir, ignore_errors=True)
 
     # ------------------------------------------------------------------
     # Encryption round-trip

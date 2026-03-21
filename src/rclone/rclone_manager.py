@@ -14,7 +14,7 @@ import shutil
 import subprocess
 import threading
 from pathlib import Path
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 
 from src.config.config_manager import ConfigManager, get_rclone_config_path, PERSONAL_VAULT_PATTERN
 
@@ -358,6 +358,22 @@ def _rclone_supports_resync_mode(config_manager: ConfigManager) -> bool:
     ``--resync-mode`` was introduced in rclone v1.64.  On earlier versions the
     flag is unknown and causes a fatal error.  When the version cannot be
     determined we return False so the flag is safely omitted.
+    """
+    version_str = config_manager.get_rclone_version()
+    match = re.search(r"v(\d+)\.(\d+)", version_str)
+    if not match:
+        return False
+    major, minor = int(match.group(1)), int(match.group(2))
+    return (major, minor) >= (1, 64)
+
+
+def _rclone_supports_create_empty_src_dirs(config_manager: ConfigManager) -> bool:
+    """Return True if the installed rclone supports --create-empty-src-dirs for bisync (v1.64+).
+
+    ``--create-empty-src-dirs`` was added to ``rclone bisync`` in v1.64.  It
+    already existed for ``rclone sync``/``copy`` on much earlier versions, but
+    passing it to ``bisync`` on older releases raises "unknown flag".  When the
+    version cannot be determined we return False so the flag is safely omitted.
     """
     version_str = config_manager.get_rclone_version()
     match = re.search(r"v(\d+)\.(\d+)", version_str)
@@ -1195,41 +1211,57 @@ class RcloneManager:
         Returns ``None`` when rclone is unavailable, the service is not fully
         configured, or the remote listing command fails or times out.
         """
-        meta = self.list_remote_metadata(service_name)
+        meta, _ = self.list_remote_metadata(service_name)
         if meta is None:
             return None
         return {rel: entry["mtime"] for rel, entry in meta.items()}
 
     def list_remote_metadata(
         self, service_name: str
-    ) -> Optional[Dict[str, Dict]]:
-        """Return a ``{rel_path: {"mtime": float, "size": int}}`` map for all remote files.
+    ) -> Tuple[Optional[Dict[str, Dict]], Optional[str]]:
+        """Return ``(metadata, error_message)`` for all remote entries.
+
+        ``metadata`` is a ``{rel_path: {"mtime": float, "size": int, "is_dir": bool}}``
+        map for all remote entries (files **and** directories).  ``error_message``
+        is ``None`` on success, or a human-readable string describing the failure.
+
+        On any failure the tuple ``(None, error_message)`` is returned so
+        callers can distinguish between a successful empty listing and a real
+        error without relying on exception handling.
 
         Extends :meth:`list_remote_mtimes` by also returning the file size
-        (``"size"`` key, bytes as :class:`int`) from the ``rclone lsjson``
-        output.  Used by :meth:`~src.gui.main_window.MainWindow._start_tree_check`
-        Thread 2 to write both fields to :class:`~src.db.file_scan_db.FileScanDB`.
+        (``"size"`` key, bytes as :class:`int`) and whether the entry is a
+        directory (``"is_dir"`` key, :class:`bool`).  Directories are included
+        so the sync tree can display remote-only subdirectories (including
+        empty ones) and track directory-level sync status in the DB.
 
-        Returns ``None`` when the remote is unavailable or the service is not
-        fully configured (same failure conditions as :meth:`list_remote_mtimes`).
+        Used by :meth:`~src.gui.main_window.MainWindow._start_tree_check`
+        Thread 2 to write all fields to :class:`~src.db.file_scan_db.FileScanDB`.
         """
         import json as _json
 
         svc = self._config.get_service(service_name)
         if svc is None:
-            return None
+            return None, f"Servicio '{service_name}' no encontrado en la configuración"
         remote_name = svc.get("remote_name", "")
         remote_path = svc.get("remote_path", "/")
         local_path = svc.get("local_path", "")
         if not remote_name or not local_path:
-            return None
+            return None, "Configuración incompleta: falta remote_name o local_path"
 
         exclusions = svc.get("exclusions", [])
         remote = f"{remote_name}:{remote_path}"
+        # Per-service configurable timeout; defaults to 600 s.  Large remotes
+        # (hundreds of thousands of files) can take several minutes to list.
+        try:
+            lsjson_timeout: int = int(svc.get("lsjson_timeout", 600))
+        except (TypeError, ValueError):
+            lsjson_timeout = 600
+        # No --files-only: we want both files AND directories so that
+        # empty remote directories also appear in the sync tree.
         cmd = _rclone_base_args(self._config) + [
             "lsjson",
             "--recursive",
-            "--files-only",
             "--no-mimetype",
             remote,
         ]
@@ -1241,24 +1273,39 @@ class RcloneManager:
                 cmd,
                 capture_output=True,
                 text=True,
-                timeout=120,
+                timeout=lsjson_timeout,
             )
             if result.returncode != 0:
-                return None
+                stderr = (result.stderr or "").strip()
+                # Truncate very long rclone error messages.
+                if len(stderr) > 300:
+                    stderr = stderr[:300] + "…"
+                error_msg = stderr or f"rclone salió con código {result.returncode}"
+                return None, error_msg
             remote_items = _json.loads(result.stdout or "[]")
-        except (OSError, subprocess.TimeoutExpired, ValueError):
-            return None
+        except subprocess.TimeoutExpired:
+            return None, f"Tiempo de espera agotado (>{lsjson_timeout} s) al listar el remoto"
+        except OSError as exc:
+            return None, f"No se pudo ejecutar rclone: {exc}"
+        except ValueError as exc:
+            return None, f"Respuesta JSON inválida de rclone: {exc}"
 
         metadata: Dict[str, Dict] = {}
         for item in remote_items:
             rel = item.get("Path", "").replace("\\", "/").strip("/")
+            if not rel:
+                continue
+            is_dir = item.get("IsDir", False)
             mtime_str = item.get("ModTime", "")
             size = item.get("Size", 0)
-            if rel:
-                ts = _parse_rclone_mtime(mtime_str)
-                if ts is not None:
-                    metadata[rel] = {"mtime": ts, "size": int(size)}
-        return metadata
+            ts = _parse_rclone_mtime(mtime_str)
+            if ts is not None:
+                metadata[rel] = {"mtime": ts, "size": int(size), "is_dir": is_dir}
+            elif is_dir:
+                # Some backends omit ModTime for directories; use 0.0 as a
+                # sentinel meaning "exists but mtime unknown".
+                metadata[rel] = {"mtime": 0.0, "size": 0, "is_dir": True}
+        return metadata, None
 
     def check_sync_status_mtime(self, service_name: str) -> Optional[List[Dict]]:
         """Compare remote vs local files using modification timestamps.
@@ -1386,13 +1433,19 @@ class RcloneManager:
             # After the first successful sync the service config has
             # "first_sync_done": True (persisted so the distinction survives
             # restarts).  On first run we show "Sincronizando…"; on all
-            # subsequent runs we show "Actualizando cambios…" and pass
-            # use_resync=True to _do_bisync so rclone re-establishes the
-            # baseline from the current state of both directories.
+            # subsequent runs we show "Actualizando cambios…".
+            # Always pass use_resync=False: _do_bisync automatically detects a
+            # missing-state-files condition and retries with --resync when
+            # needed, while normal incremental runs use plain bisync so that
+            # both local and remote changes are tracked and uploaded correctly.
+            # (Forcing use_resync=True on subsequent runs caused rclone to run
+            # with --resync on every cycle; on rclone < v1.64 this defaults to
+            # "path1 wins" — path1 is the remote — which silently overwrites
+            # local file modifications instead of uploading them.)
             is_first = not svc.get("first_sync_done", False)
             status_in_progress = "Sincronizando…" if is_first else "Actualizando cambios…"
             self._set_status(service_name, status_in_progress)
-            success = self._do_bisync(svc, use_resync=not is_first)
+            success = self._do_bisync(svc, use_resync=False)
             if success:
                 if is_first:
                     # Persist so the next cycle (and future sessions) use the
@@ -1418,10 +1471,10 @@ class RcloneManager:
         the sync is aborted with a clear error message.
 
         When *use_resync* is ``True`` the ``--resync`` flag is added to the
-        initial command.  This is used from the second sync cycle onward, after
-        the first full sync has completed successfully, so that rclone
-        re-establishes the baseline from the current state of both directories
-        rather than comparing against potentially stale listing files.
+        initial command.  Callers should normally pass ``False`` (the default)
+        so that incremental bisync runs properly track changes on both the
+        local and remote sides.  Pass ``True`` only to explicitly force a
+        full baseline re-establishment (e.g. in a one-off recovery call).
 
         On the very first bisync run (or after an abnormal termination that
         deleted the listing files), rclone may fail with "cannot find prior
@@ -1523,6 +1576,15 @@ class RcloneManager:
         # Optional verbose output
         if svc.get("verbose_sync", False):
             perf_args.append("--verbose")
+        # Propagate empty local directories to the remote so newly created
+        # folders appear on the remote side even before any files are placed
+        # inside them.  Enabled by default; can be turned off per-service via
+        # the "create_empty_src_dirs" config key.
+        # Guard with a version check: rclone bisync only accepts this flag
+        # starting from v1.64.  Passing it to older releases raises
+        # "unknown flag: --create-empty-src-dirs".
+        if svc.get("create_empty_src_dirs", True) and _rclone_supports_create_empty_src_dirs(self._config):
+            perf_args.append("--create-empty-src-dirs")
 
         # Conflict resolution mode used during --resync retries
         resync_mode = svc.get("resync_mode", "newer")
@@ -1533,6 +1595,24 @@ class RcloneManager:
         # First attempt: standard bisync, or bisync --resync for subsequent runs
         # --workdir isolates this service's lock files and state snapshots from
         # all other services so concurrent bisync runs don't block each other.
+        #
+        # HOW FOLDER MOVES ARE PROPAGATED
+        # ─────────────────────────────────────────────────────────────────────
+        # rclone bisync does not support --track-renames.  When the user moves a
+        # local folder (e.g. FolderA/ → Parent/FolderA/), bisync handles the
+        # change correctly on the next run via a delete + create sequence:
+        #
+        #   1. Files at the old path (FolderA/…) are missing from the local
+        #      listing but were present in the prior .lst snapshot → bisync
+        #      deletes them from the remote.
+        #   2. Files at the new path (Parent/FolderA/…) are new in the local
+        #      listing → bisync uploads them to the remote.
+        #
+        # The net result is identical to a move: the remote ends up with the
+        # files at the new location and the old location is removed.  The tree
+        # display correctly reflects the pending state between scans by showing
+        # the old path as remote_only (orange = will be deleted) and the new
+        # path as local_only (blue = will be uploaded).
         cmd = base + ["bisync", remote, local, "--workdir", str(workdir)] + perf_args + exclude_args
         if use_resync:
             # Include --resync so rclone re-establishes the baseline instead of
