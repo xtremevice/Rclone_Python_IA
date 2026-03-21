@@ -1677,6 +1677,19 @@ def _merge_local_and_comparison(
             item["status"] = "unknown"
     _propagate_dir_status(result)
 
+    # ── Stage 5: fix empty directories that are still "unknown" ──────────────
+    # _propagate_dir_status leaves a directory as "unknown" when it has no
+    # descendant files with a known status (e.g. the directory is truly empty
+    # or contains only sub-directories that are themselves empty).  We know
+    # whether each such directory is local or remote, so we can colour it
+    # correctly instead of leaving it grey:
+    #
+    #   • In local_all_rels → directory exists on the local disk → "local_only"
+    #   • Not in local_all_rels → came from Stage 3 (remote-only entry) → "remote_only"
+    for item in result:
+        if item["is_dir"] and item["status"] == "unknown":
+            item["status"] = "local_only" if item["rel"] in local_all_rels else "remote_only"
+
     return result
 
 
@@ -1860,6 +1873,12 @@ def _scan_local_tree(
     _walk(base, "")
     # Colour each directory node based on its descendant files
     _propagate_dir_status(result)
+    # Any directory still "unknown" after propagation is empty on the local disk
+    # (no files to inherit a colour from).  It IS present locally, so show it
+    # as "local_only" (blue) rather than the uninformative grey "unknown".
+    for item in result:
+        if item["is_dir"] and item["status"] == "unknown":
+            item["status"] = "local_only"
     return result
 
 

@@ -4024,6 +4024,12 @@ def _merge_local_and_comparison_testable(local_path, comparison_items,
         if item["is_dir"]:
             item["status"] = "unknown"
     _propagate_dir_status_testable(result)
+
+    # Stage 5: fix empty directories still "unknown" after propagation
+    for item in result:
+        if item["is_dir"] and item["status"] == "unknown":
+            item["status"] = "local_only" if item["rel"] in local_all_rels else "remote_only"
+
     return result
 
 
@@ -4184,6 +4190,40 @@ class TestMergeLocalAndComparison(unittest.TestCase):
         self.assertEqual(statuses.get("subdir/file_b.txt"), "local_only")
         # synced should be kept as-is
         self.assertEqual(statuses.get("subdir/file_c.txt"), "synced")
+
+    def test_empty_local_dir_is_local_only(self):
+        """An empty local directory must be coloured local_only (blue), not grey.
+
+        Stage 5 of the merge must fix up directories that _propagate_dir_status
+        left as 'unknown' because they have no descendant files.  If the
+        directory IS in the local filesystem it should be blue, not grey.
+        """
+        # Create an extra empty subdirectory alongside the existing 'subdir'
+        import os as _os
+        empty_dir = _os.path.join(self._root, "empty_folder")
+        _os.makedirs(empty_dir, exist_ok=True)
+        # No comparison items: all files are local_only, empty_folder has no files
+        result = self._merge([])
+        dir_statuses = {item["rel"]: item["status"]
+                        for item in result if item["is_dir"]}
+        self.assertEqual(dir_statuses.get("empty_folder"), "local_only",
+                         "Empty local directory must be blue (local_only), not grey (unknown)")
+
+    def test_empty_remote_only_dir_is_remote_only(self):
+        """An empty remote-only directory must be coloured remote_only (orange).
+
+        Stage 5 of the merge must assign 'remote_only' to empty directories
+        that came from Stage 3 (not in the local filesystem).
+        """
+        comp = [
+            # Simulate a remote-only empty directory that was recorded in the DB
+            {"rel": "remote_empty_dir", "status": "remote_only", "is_dir": True},
+        ]
+        result = self._merge(comp)
+        dir_statuses = {item["rel"]: item["status"]
+                        for item in result if item["is_dir"]}
+        self.assertEqual(dir_statuses.get("remote_empty_dir"), "remote_only",
+                         "Empty remote-only directory must be orange (remote_only), not grey")
 
     # ── edge cases ───────────────────────────────────────────────────────────
 
