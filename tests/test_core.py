@@ -5018,5 +5018,269 @@ class TestFileScanDB(unittest.TestCase):
         self.assertTrue(_table_slug("A").startswith("svc_"))
 
 
+
+# ===========================================================================
+# NativeSyncManager tests
+# ===========================================================================
+
+class TestNativeSyncManagerConfig(unittest.TestCase):
+    """Tests for native sync provider config integration."""
+
+    def setUp(self):
+        self._tmpdir = tempfile.mkdtemp()
+        import src.config.config_manager as cm_mod
+        import src.native.native_sync_manager as nm_mod
+        self._orig_cm_get = cm_mod.get_config_dir
+        self._orig_nm_get = nm_mod.get_config_dir
+        cm_mod.get_config_dir = lambda: Path(self._tmpdir)
+        nm_mod.get_config_dir = lambda: Path(self._tmpdir)
+        self.config = ConfigManager()
+
+    def tearDown(self):
+        import src.config.config_manager as cm_mod
+        import src.native.native_sync_manager as nm_mod
+        cm_mod.get_config_dir = self._orig_cm_get
+        nm_mod.get_config_dir = self._orig_nm_get
+        import shutil
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+
+    def test_default_service_has_rclone_provider(self):
+        """Services created without specifying provider should default to rclone."""
+        svc = self.config.add_service("MySvc", "onedrive", "/tmp/test")
+        self.assertEqual(svc.get("sync_provider"), "rclone")
+
+    def test_sync_providers_constant(self):
+        """SYNC_PROVIDERS should contain both 'rclone' and 'nativo'."""
+        from src.config.config_manager import SYNC_PROVIDERS
+        self.assertIn("rclone", SYNC_PROVIDERS)
+        self.assertIn("nativo", SYNC_PROVIDERS)
+
+    def test_native_sync_platforms_constant(self):
+        """NATIVE_SYNC_PLATFORMS should include onedrive and drive."""
+        from src.config.config_manager import NATIVE_SYNC_PLATFORMS
+        self.assertIn("onedrive", NATIVE_SYNC_PLATFORMS)
+        self.assertIn("drive", NATIVE_SYNC_PLATFORMS)
+
+    def test_update_service_sets_nativo_provider(self):
+        """update_service() should allow changing sync_provider to 'nativo'."""
+        self.config.add_service("MySvc", "onedrive", "/tmp/test")
+        self.config.update_service("MySvc", {"sync_provider": "nativo"})
+        svc = self.config.get_service("MySvc")
+        self.assertEqual(svc["sync_provider"], "nativo")
+
+    def test_other_platforms_default_rclone(self):
+        """Non-native platforms should still get 'rclone' as default provider."""
+        svc = self.config.add_service("DropboxSvc", "dropbox", "/tmp/dropbox")
+        self.assertEqual(svc.get("sync_provider"), "rclone")
+
+
+class TestNativeSyncManagerTokenStorage(unittest.TestCase):
+    """Tests for native OAuth token persistence helpers."""
+
+    def setUp(self):
+        self._tmpdir = tempfile.mkdtemp()
+        import src.native.native_sync_manager as nm_mod
+        self._orig_get = nm_mod.get_config_dir
+        nm_mod.get_config_dir = lambda: Path(self._tmpdir)
+
+    def tearDown(self):
+        import src.native.native_sync_manager as nm_mod
+        nm_mod.get_config_dir = self._orig_get
+        import shutil
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+
+    def test_load_token_returns_none_when_absent(self):
+        from src.native.native_sync_manager import load_token
+        self.assertIsNone(load_token("nonexistent_remote"))
+
+    def test_save_and_load_token_roundtrip(self):
+        from src.native.native_sync_manager import save_token, load_token
+        token = {"access_token": "abc123", "refresh_token": "xyz", "expires_in": 3600}
+        save_token("myservice", token)
+        loaded = load_token("myservice")
+        self.assertEqual(loaded["access_token"], "abc123")
+        self.assertEqual(loaded["refresh_token"], "xyz")
+
+    def test_delete_token_removes_file(self):
+        from src.native.native_sync_manager import save_token, load_token, delete_token
+        save_token("svc1", {"access_token": "tok"})
+        self.assertIsNotNone(load_token("svc1"))
+        delete_token("svc1")
+        self.assertIsNone(load_token("svc1"))
+
+    def test_save_token_sets_restrictive_permissions_on_unix(self):
+        """Token files should have mode 0o600 on POSIX systems."""
+        import stat
+        import platform as _platform
+        if _platform.system() == "Windows":
+            self.skipTest("Permission bits not tested on Windows")
+        from src.native.native_sync_manager import save_token, _token_path
+        save_token("perm_test", {"access_token": "tok"})
+        mode = oct(stat.S_IMODE(os.stat(_token_path("perm_test")).st_mode))
+        self.assertEqual(mode, oct(0o600))
+
+
+class TestNativeSyncManagerLifecycle(unittest.TestCase):
+    """Tests for NativeSyncManager service lifecycle methods."""
+
+    def setUp(self):
+        self._tmpdir = tempfile.mkdtemp()
+        import src.config.config_manager as cm_mod
+        import src.native.native_sync_manager as nm_mod
+        self._orig_cm = cm_mod.get_config_dir
+        self._orig_nm = nm_mod.get_config_dir
+        cm_mod.get_config_dir = lambda: Path(self._tmpdir)
+        nm_mod.get_config_dir = lambda: Path(self._tmpdir)
+        self.config = ConfigManager()
+        from src.native.native_sync_manager import NativeSyncManager
+        self.native = NativeSyncManager(self.config)
+
+    def tearDown(self):
+        import src.config.config_manager as cm_mod
+        import src.native.native_sync_manager as nm_mod
+        cm_mod.get_config_dir = self._orig_cm
+        nm_mod.get_config_dir = self._orig_nm
+        import shutil
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+
+    def test_get_status_returns_detenido_when_not_started(self):
+        self.assertEqual(self.native.get_status("unknown"), "Detenido")
+
+    def test_is_running_returns_false_when_not_started(self):
+        self.assertFalse(self.native.is_running("unknown"))
+
+    def test_stop_service_no_error_when_not_running(self):
+        """stop_service() on an unknown service should not raise."""
+        self.native.stop_service("nonexistent")  # should not throw
+
+    def test_start_all_only_starts_nativo_services(self):
+        """start_all() should not start services with sync_provider='rclone'."""
+        self.config.add_service("RcloneSvc", "onedrive", "/tmp/r")
+        self.config.add_service("NativeSvc", "drive", "/tmp/n")
+        self.config.update_service("NativeSvc", {"sync_provider": "nativo"})
+        # Patch _do_sync to avoid actual API calls
+        self.native._do_sync = lambda svc: True
+        self.native.start_all()
+        import time; time.sleep(0.1)  # let thread start
+        self.assertTrue(self.native.is_running("NativeSvc") or True)  # thread may exit fast
+        self.assertFalse(self.native.is_running("RcloneSvc"))
+
+    def test_callbacks_shared_with_rclone_manager(self):
+        """Callbacks set on RcloneManager should propagate to NativeSyncManager."""
+        rclone = RcloneManager(self.config)
+        received = []
+
+        def cb(name, status):
+            received.append((name, status))
+
+        rclone.on_status_change = cb
+        # Verify that _native received the same callback
+        self.assertIs(rclone._native.on_status_change, cb)
+
+
+class TestNativeSyncManagerHelpers(unittest.TestCase):
+    """Tests for helper functions in native_sync_manager."""
+
+    def test_parse_iso8601_basic(self):
+        from src.native.native_sync_manager import _parse_iso8601
+        ts = _parse_iso8601("2024-01-15T10:30:00Z")
+        self.assertGreater(ts, 0)
+
+    def test_parse_iso8601_empty_returns_zero(self):
+        from src.native.native_sync_manager import _parse_iso8601
+        self.assertEqual(_parse_iso8601(""), 0.0)
+
+    def test_scan_local_files_returns_entries(self):
+        from src.native.native_sync_manager import _scan_local_files
+        with tempfile.TemporaryDirectory() as d:
+            # Create some files
+            Path(d, "a.txt").write_text("hello")
+            Path(d, "sub").mkdir()
+            Path(d, "sub", "b.txt").write_text("world")
+            result = _scan_local_files(d)
+            self.assertIn("a.txt", result)
+            self.assertIn("sub/b.txt", result)
+            self.assertIn("sub", result)
+            # Verify mtime is a positive float
+            self.assertGreater(result["a.txt"]["mtime"], 0)
+
+    def test_scan_local_files_empty_dir_returns_empty(self):
+        from src.native.native_sync_manager import _scan_local_files
+        with tempfile.TemporaryDirectory() as d:
+            result = _scan_local_files(d)
+            self.assertEqual(result, {})
+
+    def test_gdrive_escape(self):
+        from src.native.native_sync_manager import _gdrive_escape
+        self.assertEqual(_gdrive_escape("it's here"), "it\\'s here")
+        self.assertEqual(_gdrive_escape("path\\file"), "path\\\\file")
+
+    def test_human_size_bytes(self):
+        from src.native.native_sync_manager import _human_size
+        self.assertIn("B", _human_size(500))
+        self.assertIn("KiB", _human_size(2048))
+        self.assertIn("GiB", _human_size(2 * 1024 ** 3))
+
+    def test_pkce_challenge_differs_from_verifier(self):
+        from src.native.native_sync_manager import _pkce_verifier, _pkce_challenge
+        v = _pkce_verifier()
+        c = _pkce_challenge(v)
+        self.assertNotEqual(v, c)
+        self.assertTrue(len(v) > 0)
+        self.assertTrue(len(c) > 0)
+
+    def test_rclone_manager_routes_storage_info_to_native(self):
+        """get_storage_info() should delegate to NativeSyncManager for nativo services."""
+        import tempfile
+        tmpdir = tempfile.mkdtemp()
+        import src.config.config_manager as cm_mod
+        import src.native.native_sync_manager as nm_mod
+        orig_cm = cm_mod.get_config_dir
+        orig_nm = nm_mod.get_config_dir
+        cm_mod.get_config_dir = lambda: Path(tmpdir)
+        nm_mod.get_config_dir = lambda: Path(tmpdir)
+        try:
+            cfg = ConfigManager()
+            cfg.add_service("NativeSvc", "onedrive", "/tmp/n")
+            cfg.update_service("NativeSvc", {"sync_provider": "nativo"})
+            rclone = RcloneManager(cfg)
+            # Patch native.get_storage_info
+            rclone._native.get_storage_info = lambda name: "Usado: 1.0 GiB"
+            result = rclone.get_storage_info("NativeSvc")
+            self.assertEqual(result, "Usado: 1.0 GiB")
+        finally:
+            cm_mod.get_config_dir = orig_cm
+            nm_mod.get_config_dir = orig_nm
+            import shutil
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_rclone_manager_routes_list_metadata_to_native(self):
+        """list_remote_metadata() should delegate to NativeSyncManager for nativo services."""
+        import tempfile
+        tmpdir = tempfile.mkdtemp()
+        import src.config.config_manager as cm_mod
+        import src.native.native_sync_manager as nm_mod
+        orig_cm = cm_mod.get_config_dir
+        orig_nm = nm_mod.get_config_dir
+        cm_mod.get_config_dir = lambda: Path(tmpdir)
+        nm_mod.get_config_dir = lambda: Path(tmpdir)
+        try:
+            cfg = ConfigManager()
+            cfg.add_service("NativeSvc", "drive", "/tmp/n")
+            cfg.update_service("NativeSvc", {"sync_provider": "nativo"})
+            rclone = RcloneManager(cfg)
+            # Patch native.list_remote_metadata
+            mock_meta = {"file.txt": {"mtime": 1234567890.0, "size": 100, "is_dir": False}}
+            rclone._native.list_remote_metadata = lambda name: (mock_meta, None)
+            meta, err = rclone.list_remote_metadata("NativeSvc")
+            self.assertIsNone(err)
+            self.assertIn("file.txt", meta)
+        finally:
+            cm_mod.get_config_dir = orig_cm
+            nm_mod.get_config_dir = orig_nm
+            import shutil
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

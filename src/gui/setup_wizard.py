@@ -1,9 +1,10 @@
 """
 Setup wizard for adding a new cloud service.
 
-Presents three sequential windows:
+Presents three (or four) sequential windows:
   Step 1 – Choose the local directory for the new service.
   Step 2 – Choose the cloud platform.
+  Step 2.5 – Choose the sync provider (rclone vs. nativo) for OneDrive / Google Drive.
   Step 3 – Authenticate and confirm.
 
 Window size: 70 % of screen height × 30 % of screen width.
@@ -17,8 +18,15 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
 from typing import Callable, Optional
 
-from src.config.config_manager import PLATFORM_LABELS, SUPPORTED_PLATFORMS, ConfigManager
+from src.config.config_manager import (
+    PLATFORM_LABELS,
+    SUPPORTED_PLATFORMS,
+    NATIVE_SYNC_PLATFORMS,
+    SYNC_PROVIDERS,
+    ConfigManager,
+)
 from src.rclone.rclone_manager import RcloneManager
+from src.native.native_sync_manager import NativeSyncManager
 
 # Maximum seconds to wait for OAuth to complete (browser login + token write).
 _OAUTH_TIMEOUT_SECONDS = 120
@@ -48,6 +56,10 @@ class SetupWizard:
         self._local_path: str = ""
         self._platform: str = ""
         self._service_name: str = ""
+        # Chosen sync provider: "rclone" (default) or "nativo"
+        self._sync_provider: str = "rclone"
+        # NativeSyncManager used when provider is "nativo"
+        self._native: NativeSyncManager = NativeSyncManager(config_manager)
 
         # Create the wizard top-level window
         if parent:
@@ -260,12 +272,78 @@ class SetupWizard:
         tk.Button(nav, text="Siguiente →", command=self._validate_step2).pack(side=tk.RIGHT)
 
     def _validate_step2(self) -> None:
-        """Validate step 2 input and advance to step 3."""
+        """Validate step 2 input and advance to step 2.5 (provider) or step 3."""
         selection = self._platform_listbox.curselection()
         if not selection:
             messagebox.showwarning("Selección requerida", "Por favor selecciona una plataforma.", parent=self._root)
             return
         self._platform = SUPPORTED_PLATFORMS[selection[0]]
+        # Show provider selection for platforms that support the native API
+        if self._platform in NATIVE_SYNC_PLATFORMS:
+            self._show_step2_5()
+        else:
+            self._sync_provider = "rclone"
+            self._show_step3()
+
+    # ------------------------------------------------------------------
+    # Step 2.5 – Choose sync provider (only for OneDrive / Google Drive)
+    # ------------------------------------------------------------------
+
+    def _show_step2_5(self) -> None:
+        """Render step 2.5: ask the user to choose a sync provider."""
+        self._clear_frame()
+
+        platform_label = PLATFORM_LABELS.get(self._platform, self._platform)
+
+        tk.Label(
+            self._frame,
+            text="Paso 2 de 3 – Proveedor de sincronización",
+            font=("Segoe UI", 14, "bold"),
+        ).pack(anchor="w", pady=(0, 10))
+
+        tk.Label(
+            self._frame,
+            text=(
+                f"Elige cómo deseas sincronizar los datos con {platform_label}.\n\n"
+                "• rclone (predeterminado): utiliza rclone bisync para una "
+                "sincronización bidireccional robusta y probada.\n\n"
+                "• Nativo (API directa): utiliza la API REST oficial de "
+                f"{platform_label} sin necesidad de rclone."
+            ),
+            wraplength=530,
+            justify="left",
+        ).pack(anchor="w", pady=(0, 15))
+
+        self._provider_var = tk.StringVar(value="rclone")
+
+        provider_frame = tk.Frame(self._frame)
+        provider_frame.pack(fill=tk.X, pady=5)
+
+        tk.Radiobutton(
+            provider_frame,
+            text="rclone (predeterminado)",
+            variable=self._provider_var,
+            value="rclone",
+            font=("Segoe UI", 11),
+        ).pack(anchor="w", pady=3)
+
+        tk.Radiobutton(
+            provider_frame,
+            text="Nativo (API directa)",
+            variable=self._provider_var,
+            value="nativo",
+            font=("Segoe UI", 11),
+        ).pack(anchor="w", pady=3)
+
+        nav = tk.Frame(self._frame)
+        nav.pack(side=tk.BOTTOM, fill=tk.X, pady=(20, 0))
+
+        tk.Button(nav, text="← Atrás", command=self._show_step2).pack(side=tk.LEFT)
+        tk.Button(nav, text="Siguiente →", command=self._validate_step2_5).pack(side=tk.RIGHT)
+
+    def _validate_step2_5(self) -> None:
+        """Save the provider choice and advance to step 3."""
+        self._sync_provider = self._provider_var.get()
         self._show_step3()
 
     # ------------------------------------------------------------------
@@ -276,10 +354,13 @@ class SetupWizard:
         """Render step 3: authenticate with the cloud provider.
 
         For Mega the authentication is credential-based (email + password).
-        For every other platform it is OAuth via the system browser.
+        For native provider it uses the direct API OAuth flow.
+        For every other platform it is OAuth via rclone / the system browser.
         """
         if self._platform == "mega":
             self._show_step3_mega()
+        elif self._sync_provider == "nativo":
+            self._show_step3_native()
         else:
             self._show_step3_oauth()
 
@@ -337,6 +418,127 @@ class SetupWizard:
             font=("Segoe UI", 10, "bold"),
         )
         self._sync_btn.pack(side=tk.RIGHT)
+
+    def _show_step3_native(self) -> None:
+        """Render step 3 for the native (direct API) provider."""
+        self._clear_frame()
+
+        platform_label = PLATFORM_LABELS.get(self._platform, self._platform)
+
+        tk.Label(
+            self._frame,
+            text="Paso 3 de 3 – Autenticación nativa",
+            font=("Segoe UI", 14, "bold"),
+        ).pack(anchor="w", pady=(0, 10))
+
+        tk.Label(
+            self._frame,
+            text=(
+                f"Haz clic en '🔑 Autenticar con {platform_label}' para abrir "
+                "el navegador e iniciar sesión.\n\n"
+                "La aplicación usará la API directa de "
+                f"{platform_label} (sin rclone).\n"
+                "Espera a que la autenticación se complete antes de continuar."
+            ),
+            wraplength=530,
+            justify="left",
+        ).pack(anchor="w", pady=(0, 15))
+
+        # Summary box
+        summary_frame = tk.LabelFrame(
+            self._frame, text="Resumen de configuración", padx=10, pady=10
+        )
+        summary_frame.pack(fill=tk.X, pady=10)
+
+        tk.Label(summary_frame, text=f"Nombre: {self._service_name}", anchor="w").pack(anchor="w")
+        tk.Label(summary_frame, text=f"Plataforma: {platform_label}", anchor="w").pack(anchor="w")
+        tk.Label(summary_frame, text=f"Proveedor: Nativo (API directa)", anchor="w").pack(anchor="w")
+        tk.Label(
+            summary_frame,
+            text=f"Carpeta local: {self._local_path}",
+            anchor="w",
+            wraplength=500,
+        ).pack(anchor="w")
+
+        self._auth_status_var = tk.StringVar(value="Estado: esperando autenticación…")
+        tk.Label(
+            self._frame,
+            textvariable=self._auth_status_var,
+            fg="gray",
+            font=("Segoe UI", 10, "italic"),
+            wraplength=530,
+            justify="left",
+        ).pack(anchor="w", pady=(10, 0))
+
+        nav = tk.Frame(self._frame)
+        nav.pack(side=tk.BOTTOM, fill=tk.X, pady=(20, 0))
+
+        back_target = self._show_step2_5 if self._platform in NATIVE_SYNC_PLATFORMS else self._show_step2
+        tk.Button(nav, text="← Atrás", command=back_target).pack(side=tk.LEFT)
+
+        self._sync_btn = tk.Button(
+            nav,
+            text=f"🔑 Autenticar con {platform_label}",
+            command=self._start_native_auth,
+            bg="#0078d4",
+            fg="white",
+            font=("Segoe UI", 10, "bold"),
+        )
+        self._sync_btn.pack(side=tk.RIGHT)
+
+    def _start_native_auth(self) -> None:
+        """Launch the native OAuth flow in a background thread."""
+        self._sync_btn.configure(state=tk.DISABLED, text="Autenticando…")
+        self._auth_status_var.set("Estado: abriendo el navegador para autenticación nativa…")
+
+        remote_name = self._service_name.lower().replace(" ", "_")
+
+        def on_done(success: bool, error_msg: str) -> None:
+            if success:
+                self._root.after(0, self._native_auth_success, remote_name)
+            else:
+                self._root.after(0, self._native_auth_failed, error_msg)
+
+        self._native.authenticate(
+            service_name=self._service_name,
+            platform=self._platform,
+            remote_name=remote_name,
+            on_done=on_done,
+            timeout=float(_OAUTH_TIMEOUT_SECONDS),
+        )
+
+    def _native_auth_success(self, remote_name: str) -> None:
+        """Called on the main thread after successful native authentication."""
+        self._auth_status_var.set("✅ Autenticación nativa completada correctamente.")
+        self._root.after(1500, lambda: self._finish_native(remote_name))
+
+    def _native_auth_failed(self, error_msg: str) -> None:
+        """Called on the main thread if native authentication failed."""
+        platform_label = PLATFORM_LABELS.get(self._platform, self._platform)
+        display = f"❌ Error: {error_msg}" if error_msg else "❌ La autenticación falló. Intenta de nuevo."
+        self._auth_status_var.set(display)
+        self._sync_btn.configure(
+            state=tk.NORMAL,
+            text=f"🔑 Autenticar con {platform_label}",
+        )
+
+    def _finish_native(self, remote_name: str) -> None:
+        """Save the native service and close the wizard."""
+        svc = self._config.add_service(
+            name=self._service_name,
+            platform=self._platform,
+            local_path=self._local_path,
+        )
+        self._config.update_service(
+            self._service_name,
+            {
+                "remote_name": remote_name,
+                "sync_provider": "nativo",
+            },
+        )
+        self._root.destroy()
+        if self._on_complete:
+            self._on_complete(self._service_name)
 
     def _show_step3_mega(self) -> None:
         """Render step 3 for Mega: collect email and password credentials."""

@@ -57,6 +57,14 @@ DEFAULT_EXCLUSIONS = [PERSONAL_VAULT_PATTERN]
 # interval is used instead of the "small directory" one.
 TREE_FILE_THRESHOLD = 1000
 
+# Sync providers available when adding a service.
+# "rclone" is the default and uses rclone bisync.
+# "nativo" uses the platform's direct REST API (only OneDrive and Google Drive).
+SYNC_PROVIDERS = ["rclone", "nativo"]
+
+# Platforms that support the "nativo" (direct API) sync provider.
+NATIVE_SYNC_PLATFORMS = ["onedrive", "drive"]
+
 # Platforms supported by rclone that are offered in the wizard.
 # The first section lists the most commonly used cloud drives that were
 # already supported.  The remainder of the list mirrors the full set of
@@ -276,6 +284,9 @@ class ConfigManager:
             "vfs_read_chunk_size": "10M",
             # rclone mount: maximum VFS read chunk size
             "vfs_read_chunk_size_limit": "100M",
+            # Sync provider: "rclone" (default) or "nativo" (direct API for
+            # OneDrive and Google Drive only).
+            "sync_provider": "rclone",
             # Recent file sync history (list of dicts)
             "sync_history": [],
             # Sync-tree auto-refresh intervals (seconds).  When the tree has

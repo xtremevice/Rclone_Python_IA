@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
 from src.config.config_manager import ConfigManager, get_rclone_config_path, PERSONAL_VAULT_PATTERN
+from src.native.native_sync_manager import NativeSyncManager, load_token as _load_native_token
 
 
 def _bisync_cache_dir() -> Path:
@@ -430,6 +431,24 @@ class RcloneManager:
         # configuration error is detected in bisync output.  The UI registers
         # this to surface an in-tab "fix now" action for the user.
         self.on_drive_id_error: Optional[Callable[[str], None]] = None
+        # Native sync manager – handles services with sync_provider="nativo".
+        # Shares the same on_status_change / on_file_synced / on_error callbacks
+        # as this manager; they are wired up when the caller sets those attrs.
+        self._native: NativeSyncManager = NativeSyncManager(config_manager)
+
+    # Callback attributes to forward to the native manager automatically.
+    _FORWARDED_CALLBACKS = frozenset(
+        {"on_status_change", "on_file_synced", "on_error"}
+    )
+
+    def __setattr__(self, name: str, value: object) -> None:
+        """Forward shared callback assignments to the NativeSyncManager."""
+        super().__setattr__(name, value)
+        # _native may not exist yet during __init__ (before it is assigned)
+        if name in RcloneManager._FORWARDED_CALLBACKS:
+            native = self.__dict__.get("_native")
+            if native is not None:
+                setattr(native, name, value)
 
     # ------------------------------------------------------------------
     # Public API
@@ -508,8 +527,16 @@ class RcloneManager:
         """
         Start the background sync loop for the given service.
 
+        Services with ``sync_provider="nativo"`` are delegated to the
+        NativeSyncManager; all others use the rclone bisync loop.
+
         Does nothing if the service is already running.
         """
+        svc = self._config.get_service(service_name)
+        if svc and svc.get("sync_provider", "rclone") == "nativo":
+            self._native.start_service(service_name)
+            return
+
         if service_name in self._sync_threads and self._sync_threads[service_name].is_alive():
             return
 
@@ -531,7 +558,16 @@ class RcloneManager:
         wait), any rclone bisync process that is actively running for this
         service is terminated immediately so the UI reflects the stopped state
         without delay.
+
+        Services with ``sync_provider="nativo"`` are delegated to the
+        NativeSyncManager.
         """
+        # Delegate to native manager if appropriate
+        svc = self._config.get_service(service_name)
+        if svc and svc.get("sync_provider", "rclone") == "nativo":
+            self._native.stop_service(service_name)
+            return
+
         event = self._stop_events.get(service_name)
         if event:
             event.set()
@@ -547,15 +583,25 @@ class RcloneManager:
 
     def is_running(self, service_name: str) -> bool:
         """Return True if the sync thread for this service is alive."""
+        svc = self._config.get_service(service_name)
+        if svc and svc.get("sync_provider", "rclone") == "nativo":
+            return self._native.is_running(service_name)
         thread = self._sync_threads.get(service_name)
         return thread is not None and thread.is_alive()
 
     def get_status(self, service_name: str) -> str:
         """Return the human-readable sync status for this service."""
+        svc = self._config.get_service(service_name)
+        if svc and svc.get("sync_provider", "rclone") == "nativo":
+            return self._native.get_status(service_name)
         return self._status.get(service_name, "Detenido")
 
     def start_all(self) -> None:
-        """Start sync loops for all services that have sync_enabled=True."""
+        """Start sync loops for all services that have sync_enabled=True.
+
+        Services with ``sync_provider="nativo"`` are delegated to the
+        NativeSyncManager; all others use the rclone bisync loop.
+        """
         for svc in self._config.get_services():
             if svc.get("sync_enabled", True):
                 self.start_service(svc["name"])
@@ -564,6 +610,8 @@ class RcloneManager:
         """Stop all running sync loops and mounts."""
         for name in list(self._sync_threads.keys()):
             self.stop_service(name)
+        # Also stop any running native sync loops
+        self._native.stop_all()
         self.stop_all_mounts()
 
     def start_mount(self, service_name: str) -> bool:
@@ -1163,10 +1211,15 @@ class RcloneManager:
 
         Supported platforms: OneDrive, Google Drive, Dropbox, Box, pCloud.
         Unsupported (returns None): Amazon S3, Backblaze B2, SFTP, FTP, etc.
+
+        Services with ``sync_provider="nativo"`` are delegated to the
+        NativeSyncManager.
         """
         svc = self._config.get_service(service_name)
         if svc is None:
             return None
+        if svc.get("sync_provider", "rclone") == "nativo":
+            return self._native.get_storage_info(service_name)
         remote_name = svc.get("remote_name", "")
         if not remote_name:
             return None
@@ -1235,6 +1288,9 @@ class RcloneManager:
         so the sync tree can display remote-only subdirectories (including
         empty ones) and track directory-level sync status in the DB.
 
+        Services with ``sync_provider="nativo"`` are delegated to the
+        NativeSyncManager.
+
         Used by :meth:`~src.gui.main_window.MainWindow._start_tree_check`
         Thread 2 to write all fields to :class:`~src.db.file_scan_db.FileScanDB`.
         """
@@ -1243,6 +1299,10 @@ class RcloneManager:
         svc = self._config.get_service(service_name)
         if svc is None:
             return None, f"Servicio '{service_name}' no encontrado en la configuración"
+
+        if svc.get("sync_provider", "rclone") == "nativo":
+            return self._native.list_remote_metadata(service_name)
+
         remote_name = svc.get("remote_name", "")
         remote_path = svc.get("remote_path", "/")
         local_path = svc.get("local_path", "")
