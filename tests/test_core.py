@@ -5158,11 +5158,16 @@ class TestNativeSyncManagerLifecycle(unittest.TestCase):
         self.config.add_service("RcloneSvc", "onedrive", "/tmp/r")
         self.config.add_service("NativeSvc", "drive", "/tmp/n")
         self.config.update_service("NativeSvc", {"sync_provider": "nativo"})
-        # Patch _do_sync to avoid actual API calls
-        self.native._do_sync = lambda svc: True
+        # Patch _do_sync so the loop exits immediately (returns False → sets error status)
+        # We just verify that a thread was created for the native service but not rclone.
+        started = threading.Event()
+        def _fake_sync(svc):
+            started.set()
+            return True
+        self.native._do_sync = _fake_sync
         self.native.start_all()
-        import time; time.sleep(0.1)  # let thread start
-        self.assertTrue(self.native.is_running("NativeSvc") or True)  # thread may exit fast
+        started.wait(timeout=2.0)
+        # RcloneSvc should NOT be tracked by native manager
         self.assertFalse(self.native.is_running("RcloneSvc"))
 
     def test_callbacks_shared_with_rclone_manager(self):
@@ -5185,6 +5190,15 @@ class TestNativeSyncManagerHelpers(unittest.TestCase):
         from src.native.native_sync_manager import _parse_iso8601
         ts = _parse_iso8601("2024-01-15T10:30:00Z")
         self.assertGreater(ts, 0)
+
+    def test_parse_iso8601_with_fractional_seconds(self):
+        from src.native.native_sync_manager import _parse_iso8601
+        ts1 = _parse_iso8601("2024-01-15T10:30:00Z")
+        ts2 = _parse_iso8601("2024-01-15T10:30:00.000Z")
+        ts3 = _parse_iso8601("2024-01-15T10:30:00.123456Z")
+        # All should be close (within 1 second)
+        self.assertAlmostEqual(ts1, ts2, delta=1.0)
+        self.assertAlmostEqual(ts1, ts3, delta=1.0)
 
     def test_parse_iso8601_empty_returns_zero(self):
         from src.native.native_sync_manager import _parse_iso8601

@@ -60,6 +60,12 @@ _MTIME_TOLERANCE_SECS = 3.0
 # Minimum free local disk space before sync is aborted (10 GiB)
 _MIN_FREE_SPACE_BYTES = 10 * 1024 * 1024 * 1024
 
+# Size (bytes) of each chunk used when uploading large files via a session
+_UPLOAD_CHUNK_SIZE = 10 * 1024 * 1024  # 10 MiB
+
+# One gibibyte in bytes
+_GIB = 1024 * 1024 * 1024
+
 # OAuth callback port range to search for an available port
 _OAUTH_PORT_RANGE = range(53682, 53700)
 
@@ -394,7 +400,7 @@ class OneDriveProvider:
         upload_url = json.loads(body).get("uploadUrl")
         if not upload_url:
             return False
-        chunk_size = 10 * 1024 * 1024  # 10 MiB chunks
+        chunk_size = _UPLOAD_CHUNK_SIZE
         with open(local_path, "rb") as fh:
             offset = 0
             while offset < file_size:
@@ -976,7 +982,7 @@ class NativeSyncManager:
             self._emit_error(
                 name,
                 f"⛔ Sincronización cancelada: espacio libre insuficiente "
-                f"({free / (1024**3):.1f} GiB disponible, mínimo 10 GiB).",
+                f"({free / _GIB:.1f} GiB disponible, mínimo 10 GiB).",
             )
             return False
 
@@ -1143,15 +1149,34 @@ class NativeSyncManager:
 # ── Utility functions ─────────────────────────────────────────────────────────
 
 def _parse_iso8601(s: str) -> float:
-    """Parse an ISO 8601 datetime string and return a Unix timestamp."""
+    """Parse an ISO 8601 datetime string and return a Unix timestamp.
+
+    Handles the common formats returned by OneDrive (``2024-01-15T10:30:00Z``,
+    ``2024-01-15T10:30:00.000Z``) and Google Drive (``2024-01-15T10:30:00.000Z``).
+    """
     if not s:
         return 0.0
-    # Python 3.7+ supports fromisoformat but not the trailing 'Z'
-    s = s.rstrip("Z").replace("T", " ").split(".")[0]
+    import datetime
+    # Normalise: replace trailing 'Z' with '+00:00' so fromisoformat() works
+    normalised = s.rstrip("Z")
+    if "T" in normalised:
+        # Truncate fractional seconds beyond microseconds (Python supports up to 6 digits)
+        date_part, _, time_part = normalised.partition("T")
+        # Split off any timezone offset that may remain
+        for sep in ("+", "-"):
+            if sep in time_part:
+                time_part, _, offset = time_part.partition(sep)
+                break
+        # Trim fractional seconds to 6 digits max
+        if "." in time_part:
+            base, _, frac = time_part.partition(".")
+            time_part = f"{base}.{frac[:6]}"
+        normalised = f"{date_part}T{time_part}+00:00"
+    else:
+        normalised = f"{normalised}+00:00"
     try:
-        import datetime
-        dt = datetime.datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
-        return dt.replace(tzinfo=datetime.timezone.utc).timestamp()
+        dt = datetime.datetime.fromisoformat(normalised)
+        return dt.timestamp()
     except (ValueError, OverflowError):
         return 0.0
 
