@@ -188,20 +188,45 @@ def _http_request(
     headers: Optional[Dict[str, str]] = None,
     data: Optional[bytes] = None,
     timeout: float = 60.0,
+    logger: Optional[Callable[[str], None]] = None,
 ) -> Tuple[int, bytes]:
-    """Perform an HTTP request using urllib. Returns (status_code, body_bytes)."""
+    """Perform an HTTP request using urllib. Returns (status_code, body_bytes).
+
+    If *logger* is provided it is called once with a formatted line:
+    ``"METHOD https://host/path → STATUS"`` so that every API call is
+    visible in the error-log panel.
+    """
     req = urllib.request.Request(url, data=data, method=method)
     if headers:
         for k, v in headers.items():
             req.add_header(k, v)
+    # Truncate URL for logging (avoid leaking huge next-page tokens)
+    _log_url = url if len(url) <= 120 else url[:117] + "…"
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return resp.status, resp.read()
+            status = resp.status
+            body = resp.read()
+            if logger:
+                logger(f"{method} {_log_url} → {status}")
+            return status, body
     except urllib.error.HTTPError as exc:
-        return exc.code, exc.read()
+        status = exc.code
+        body = exc.read()
+        if logger:
+            logger(f"{method} {_log_url} → {status} ⚠️")
+        return status, body
+    except OSError as exc:
+        if logger:
+            logger(f"{method} {_log_url} → ❌ {exc}")
+        raise
 
 
-def _post_form(url: str, fields: Dict[str, str], timeout: float = 30.0) -> Dict:
+def _post_form(
+    url: str,
+    fields: Dict[str, str],
+    timeout: float = 30.0,
+    logger: Optional[Callable[[str], None]] = None,
+) -> Dict:
     """POST application/x-www-form-urlencoded and parse the JSON response."""
     data = urllib.parse.urlencode(fields).encode()
     status, body = _http_request(
@@ -210,6 +235,7 @@ def _post_form(url: str, fields: Dict[str, str], timeout: float = 30.0) -> Dict:
         headers={"Content-Type": "application/x-www-form-urlencoded"},
         data=data,
         timeout=timeout,
+        logger=logger,
     )
     try:
         return json.loads(body)
@@ -222,9 +248,16 @@ def _post_form(url: str, fields: Dict[str, str], timeout: float = 30.0) -> Dict:
 class OneDriveProvider:
     """Direct Microsoft Graph API client for OneDrive personal/business."""
 
-    def __init__(self, remote_name: str) -> None:
+    def __init__(
+        self,
+        remote_name: str,
+        logger: Optional[Callable[[str], None]] = None,
+    ) -> None:
         self._remote_name = remote_name
         self._token: Optional[Dict] = load_token(remote_name)
+        # Optional callable(msg) used to record every API call and error.
+        # Injected by NativeSyncManager so entries appear in the Errors panel.
+        self._logger = logger
 
     # ── Auth ──────────────────────────────────────────────────────────
 
@@ -254,8 +287,11 @@ class OneDriveProvider:
                 "grant_type": "authorization_code",
                 "code_verifier": verifier,
             },
+            logger=self._logger,
         )
         if "access_token" not in resp:
+            if self._logger:
+                self._logger(f"❌ exchange_code falló: {resp.get('error', resp)}")
             return False
         resp["obtained_at"] = time.time()
         self._token = resp
@@ -265,6 +301,8 @@ class OneDriveProvider:
     def _refresh_token(self) -> bool:
         """Use the refresh_token to obtain a new access_token."""
         if not self._token or "refresh_token" not in self._token:
+            if self._logger:
+                self._logger("❌ _refresh_token: no hay refresh_token disponible")
             return False
         resp = _post_form(
             _ONEDRIVE_TOKEN_URL,
@@ -273,8 +311,11 @@ class OneDriveProvider:
                 "refresh_token": self._token["refresh_token"],
                 "grant_type": "refresh_token",
             },
+            logger=self._logger,
         )
         if "access_token" not in resp:
+            if self._logger:
+                self._logger(f"❌ _refresh_token falló: {resp.get('error', resp)}")
             return False
         resp["obtained_at"] = time.time()
         # Preserve the refresh_token if the new response omits it.
@@ -333,9 +374,13 @@ class OneDriveProvider:
         )
         while url:
             status, body = _http_request(
-                url, headers=self._auth_header(), timeout=60.0
+                url, headers=self._auth_header(), timeout=60.0, logger=self._logger
             )
             if status != 200:
+                if self._logger:
+                    self._logger(
+                        f"❌ list_files: respuesta inesperada {status} al listar '{prefix or '/'}'"
+                    )
                 break
             data = json.loads(body)
             for item in data.get("value", []):
@@ -372,15 +417,27 @@ class OneDriveProvider:
         url = f"{_GRAPH_URL}/me/drive/root:/{urllib.parse.quote(drive_path)}:/content"
         try:
             file_size = os.path.getsize(local_path)
-        except OSError:
+        except OSError as exc:
+            if self._logger:
+                self._logger(f"❌ upload_file: no se pudo leer '{rel_path}': {exc}")
             return False
         if file_size <= 4 * 1024 * 1024:
             # Simple PUT for small files (≤ 4 MiB)
             with open(local_path, "rb") as fh:
                 body = fh.read()
             headers = {**self._auth_header(), "Content-Type": "application/octet-stream"}
-            status, _ = _http_request(url, method="PUT", headers=headers, data=body, timeout=120.0)
-            return status in (200, 201)
+            status, resp_body = _http_request(
+                url, method="PUT", headers=headers, data=body,
+                timeout=120.0, logger=self._logger,
+            )
+            if status not in (200, 201):
+                if self._logger:
+                    self._logger(
+                        f"❌ upload_file: PUT '{rel_path}' devolvió {status}: "
+                        f"{resp_body[:200].decode(errors='replace')}"
+                    )
+                return False
+            return True
         else:
             # Upload session for large files
             return self._upload_large_file(url, local_path, file_size)
@@ -394,11 +451,16 @@ class OneDriveProvider:
             headers={**self._auth_header(), "Content-Type": "application/json"},
             data=json.dumps({"item": {"@microsoft.graph.conflictBehavior": "replace"}}).encode(),
             timeout=30.0,
+            logger=self._logger,
         )
         if status not in (200, 201):
+            if self._logger:
+                self._logger(f"❌ _upload_large_file: createUploadSession devolvió {status}")
             return False
         upload_url = json.loads(body).get("uploadUrl")
         if not upload_url:
+            if self._logger:
+                self._logger("❌ _upload_large_file: respuesta sin uploadUrl")
             return False
         chunk_size = _UPLOAD_CHUNK_SIZE
         with open(local_path, "rb") as fh:
@@ -411,9 +473,14 @@ class OneDriveProvider:
                     "Content-Range": f"bytes {offset}-{end}/{file_size}",
                 }
                 status, _ = _http_request(
-                    upload_url, method="PUT", headers=headers, data=chunk, timeout=120.0
+                    upload_url, method="PUT", headers=headers, data=chunk,
+                    timeout=120.0, logger=self._logger,
                 )
                 if status not in (200, 201, 202):
+                    if self._logger:
+                        self._logger(
+                            f"❌ _upload_large_file: chunk {offset}-{end} devolvió {status}"
+                        )
                     return False
                 offset += len(chunk)
         return True
@@ -423,10 +490,14 @@ class OneDriveProvider:
         if not self.ensure_valid_token():
             return False
         url = f"{_GRAPH_URL}/me/drive/items/{item_id}/content"
-        status, body = _http_request(url, headers=self._auth_header(), timeout=120.0)
+        status, body = _http_request(
+            url, headers=self._auth_header(), timeout=120.0, logger=self._logger
+        )
         if status != 200:
+            if self._logger:
+                self._logger(f"❌ download_file: GET item {item_id} devolvió {status}")
             return False
-        os.makedirs(os.path.dirname(local_path), exist_ok=True)
+        os.makedirs(os.path.dirname(local_path) or ".", exist_ok=True)
         with open(local_path, "wb") as fh:
             fh.write(body)
         return True
@@ -444,14 +515,22 @@ class OneDriveProvider:
         else:
             url = f"{_GRAPH_URL}/me/drive/root/children"
         body = json.dumps({"name": folder_name, "folder": {}, "@microsoft.graph.conflictBehavior": "replace"}).encode()
-        status, _ = _http_request(
+        status, resp_body = _http_request(
             url,
             method="POST",
             headers={**self._auth_header(), "Content-Type": "application/json"},
             data=body,
             timeout=30.0,
+            logger=self._logger,
         )
-        return status in (200, 201)
+        if status not in (200, 201):
+            if self._logger:
+                self._logger(
+                    f"❌ create_remote_folder: POST '{rel_path}' devolvió {status}: "
+                    f"{resp_body[:200].decode(errors='replace')}"
+                )
+            return False
+        return True
 
     # ── Storage info ──────────────────────────────────────────────────
 
@@ -460,9 +539,12 @@ class OneDriveProvider:
         if not self.ensure_valid_token():
             return None
         status, body = _http_request(
-            f"{_GRAPH_URL}/me/drive", headers=self._auth_header(), timeout=15.0
+            f"{_GRAPH_URL}/me/drive", headers=self._auth_header(),
+            timeout=15.0, logger=self._logger,
         )
         if status != 200:
+            if self._logger:
+                self._logger(f"❌ get_storage_info: GET /me/drive devolvió {status}")
             return None
         data = json.loads(body)
         quota = data.get("quota", {})
@@ -478,9 +560,15 @@ class OneDriveProvider:
 class GoogleDriveProvider:
     """Direct Google Drive API v3 client."""
 
-    def __init__(self, remote_name: str) -> None:
+    def __init__(
+        self,
+        remote_name: str,
+        logger: Optional[Callable[[str], None]] = None,
+    ) -> None:
         self._remote_name = remote_name
         self._token: Optional[Dict] = load_token(remote_name)
+        # Optional callable(msg) used to record every API call and error.
+        self._logger = logger
 
     # ── Auth ──────────────────────────────────────────────────────────
 
@@ -512,8 +600,11 @@ class GoogleDriveProvider:
                 "grant_type": "authorization_code",
                 "code_verifier": verifier,
             },
+            logger=self._logger,
         )
         if "access_token" not in resp:
+            if self._logger:
+                self._logger(f"❌ exchange_code falló: {resp.get('error', resp)}")
             return False
         resp["obtained_at"] = time.time()
         self._token = resp
@@ -522,6 +613,8 @@ class GoogleDriveProvider:
 
     def _refresh_token(self) -> bool:
         if not self._token or "refresh_token" not in self._token:
+            if self._logger:
+                self._logger("❌ _refresh_token: no hay refresh_token disponible")
             return False
         resp = _post_form(
             _GDRIVE_TOKEN_URL,
@@ -531,8 +624,11 @@ class GoogleDriveProvider:
                 "refresh_token": self._token["refresh_token"],
                 "grant_type": "refresh_token",
             },
+            logger=self._logger,
         )
         if "access_token" not in resp:
+            if self._logger:
+                self._logger(f"❌ _refresh_token falló: {resp.get('error', resp)}")
             return False
         resp["obtained_at"] = time.time()
         if "refresh_token" not in resp:
@@ -573,8 +669,14 @@ class GoogleDriveProvider:
                 f"?q={urllib.parse.quote(query)}"
                 f"&fields=files(id,name)&pageSize=10"
             )
-            status, body = _http_request(url, headers=self._auth_header(), timeout=30.0)
+            status, body = _http_request(
+                url, headers=self._auth_header(), timeout=30.0, logger=self._logger
+            )
             if status != 200:
+                if self._logger:
+                    self._logger(
+                        f"❌ _get_folder_id: no se pudo resolver '{part}' (status {status})"
+                    )
                 return None
             items = json.loads(body).get("files", [])
             if not items:
@@ -606,8 +708,14 @@ class GoogleDriveProvider:
             if page_token:
                 params["pageToken"] = page_token
             url = f"{_GDRIVE_API_URL}/files?{urllib.parse.urlencode(params)}"
-            status, body = _http_request(url, headers=self._auth_header(), timeout=60.0)
+            status, body = _http_request(
+                url, headers=self._auth_header(), timeout=60.0, logger=self._logger
+            )
             if status != 200:
+                if self._logger:
+                    self._logger(
+                        f"❌ list_files: respuesta inesperada {status} al listar '{prefix or '/'}'"
+                    )
                 break
             data = json.loads(body)
             for item in data.get("files", []):
@@ -645,7 +753,9 @@ class GoogleDriveProvider:
                 f"?q={urllib.parse.quote(query)}"
                 f"&fields=files(id)&pageSize=1"
             )
-            status, body = _http_request(url, headers=self._auth_header(), timeout=20.0)
+            status, body = _http_request(
+                url, headers=self._auth_header(), timeout=20.0, logger=self._logger
+            )
             if status == 200 and json.loads(body).get("files"):
                 current_id = json.loads(body)["files"][0]["id"]
             else:
@@ -661,8 +771,13 @@ class GoogleDriveProvider:
                     headers={**self._auth_header(), "Content-Type": "application/json"},
                     data=meta,
                     timeout=20.0,
+                    logger=self._logger,
                 )
                 if status not in (200, 201):
+                    if self._logger:
+                        self._logger(
+                            f"❌ _get_or_create_folder: POST '{part}' devolvió {status}"
+                        )
                     return None
                 current_id = json.loads(body).get("id")
                 if not current_id:
@@ -684,7 +799,9 @@ class GoogleDriveProvider:
         try:
             with open(local_path, "rb") as fh:
                 file_body = fh.read()
-        except OSError:
+        except OSError as exc:
+            if self._logger:
+                self._logger(f"❌ upload_file: no se pudo leer '{rel_path}': {exc}")
             return False
         if existing_id:
             # Update existing file content
@@ -692,14 +809,22 @@ class GoogleDriveProvider:
                 f"https://www.googleapis.com/upload/drive/v3/files/{existing_id}"
                 f"?uploadType=media"
             )
-            status, _ = _http_request(
+            status, resp_body = _http_request(
                 url,
                 method="PATCH",
                 headers={**self._auth_header(), "Content-Type": "application/octet-stream"},
                 data=file_body,
                 timeout=120.0,
+                logger=self._logger,
             )
-            return status == 200
+            if status != 200:
+                if self._logger:
+                    self._logger(
+                        f"❌ upload_file: PATCH '{rel_path}' devolvió {status}: "
+                        f"{resp_body[:200].decode(errors='replace')}"
+                    )
+                return False
+            return True
         else:
             # Multipart upload (metadata + content)
             meta = json.dumps({"name": file_name, "parents": [parent_id]}).encode()
@@ -714,7 +839,7 @@ class GoogleDriveProvider:
                 b"--" + boundary + b"--"
             )
             url = "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart"
-            status, _ = _http_request(
+            status, resp_body = _http_request(
                 url,
                 method="POST",
                 headers={
@@ -723,8 +848,16 @@ class GoogleDriveProvider:
                 },
                 data=parts,
                 timeout=120.0,
+                logger=self._logger,
             )
-            return status in (200, 201)
+            if status not in (200, 201):
+                if self._logger:
+                    self._logger(
+                        f"❌ upload_file: POST (multipart) '{rel_path}' devolvió {status}: "
+                        f"{resp_body[:200].decode(errors='replace')}"
+                    )
+                return False
+            return True
 
     def _find_file_id(self, parent_id: str, name: str) -> Optional[str]:
         """Return the Drive ID of a file by name in *parent_id*, or None."""
@@ -738,7 +871,9 @@ class GoogleDriveProvider:
             f"?q={urllib.parse.quote(query)}"
             f"&fields=files(id)&pageSize=1"
         )
-        status, body = _http_request(url, headers=self._auth_header(), timeout=20.0)
+        status, body = _http_request(
+            url, headers=self._auth_header(), timeout=20.0, logger=self._logger
+        )
         if status == 200:
             files = json.loads(body).get("files", [])
             if files:
@@ -750,8 +885,12 @@ class GoogleDriveProvider:
         if not self.ensure_valid_token():
             return False
         url = f"{_GDRIVE_API_URL}/files/{item_id}?alt=media"
-        status, body = _http_request(url, headers=self._auth_header(), timeout=120.0)
+        status, body = _http_request(
+            url, headers=self._auth_header(), timeout=120.0, logger=self._logger
+        )
         if status != 200:
+            if self._logger:
+                self._logger(f"❌ download_file: GET item {item_id} devolvió {status}")
             return False
         os.makedirs(os.path.dirname(local_path) or ".", exist_ok=True)
         with open(local_path, "wb") as fh:
@@ -769,8 +908,12 @@ class GoogleDriveProvider:
         if not self.ensure_valid_token():
             return None
         url = f"{_GDRIVE_API_URL}/about?fields=storageQuota"
-        status, body = _http_request(url, headers=self._auth_header(), timeout=15.0)
+        status, body = _http_request(
+            url, headers=self._auth_header(), timeout=15.0, logger=self._logger
+        )
         if status != 200:
+            if self._logger:
+                self._logger(f"❌ get_storage_info: GET /about devolvió {status}")
             return None
         quota = json.loads(body).get("storageQuota", {})
         used = int(quota.get("usage", 0))
@@ -805,17 +948,35 @@ class NativeSyncManager:
         self.on_status_change: Optional[Callable[[str, str], None]] = None
         self.on_file_synced: Optional[Callable[[str, str, bool], None]] = None
         self.on_error: Optional[Callable[[str, str], None]] = None
+        # Callback fired for every API call (and internal errors).
+        # Signature: on_api_call(service_name: str, message: str)
+        # Forwarded from RcloneManager so entries reach the Errors panel.
+        self.on_api_call: Optional[Callable[[str, str], None]] = None
 
     # ── Provider factory ──────────────────────────────────────────────
+
+    def _make_logger(self, service_name: str) -> Callable[[str], None]:
+        """Return a single-argument callable that routes log messages to both
+        ``on_api_call`` (always) and ``on_error`` (when the message starts with
+        the error prefix ``❌``), tagged with *service_name*.
+        """
+        def _log(msg: str) -> None:
+            if self.on_api_call:
+                self.on_api_call(service_name, msg)
+            if msg.startswith("❌") and self.on_error:
+                self.on_error(service_name, msg)
+        return _log
 
     def _get_provider(self, svc: Dict):
         """Return an OneDriveProvider or GoogleDriveProvider for *svc*."""
         remote_name = svc.get("remote_name", svc.get("name", ""))
         platform = svc.get("platform", "")
+        service_name = svc.get("name", remote_name)
+        logger = self._make_logger(service_name)
         if platform == "onedrive":
-            return OneDriveProvider(remote_name)
+            return OneDriveProvider(remote_name, logger=logger)
         if platform == "drive":
-            return GoogleDriveProvider(remote_name)
+            return GoogleDriveProvider(remote_name, logger=logger)
         return None
 
     # ── OAuth authentication ──────────────────────────────────────────
