@@ -273,28 +273,27 @@ class OneDriveProvider:
 
     @staticmethod
     def build_auth_url(redirect_uri: str, verifier: str) -> str:
-        """Return the Microsoft identity platform authorisation URL.
+        """Return the Microsoft identity platform authorisation URL (PKCE).
 
-        PKCE is intentionally omitted: the rclone public client
-        (b15665d9-…) was registered before PKCE was mandatory and
-        Microsoft's token endpoint rejects an unexpected ``code_verifier``.
-        The ``verifier`` parameter is accepted for API symmetry but unused.
+        The rclone public client (b15665d9-…) is registered as a public
+        client that supports PKCE.  Microsoft identity platform requires
+        PKCE (code_challenge / code_verifier) for public clients on the
+        ``/common`` tenant; omitting it causes ``invalid_client`` (401).
         """
+        challenge = _pkce_challenge(verifier)
         params = {
             "client_id": _ONEDRIVE_CLIENT_ID,
             "response_type": "code",
             "redirect_uri": redirect_uri,
             "scope": _ONEDRIVE_SCOPES,
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
             "prompt": "select_account",
         }
         return f"{_ONEDRIVE_AUTH_URL}?{urllib.parse.urlencode(params)}"
 
     def exchange_code(self, code: str, redirect_uri: str, verifier: str) -> bool:
-        """Exchange an authorisation code for access+refresh tokens.
-
-        ``verifier`` is accepted for API symmetry with GoogleDriveProvider
-        but is not forwarded: no PKCE challenge was included in the auth URL.
-        """
+        """Exchange an authorisation code for access+refresh tokens (PKCE)."""
         resp = _post_form(
             _ONEDRIVE_TOKEN_URL,
             {
@@ -302,6 +301,7 @@ class OneDriveProvider:
                 "code": code,
                 "redirect_uri": redirect_uri,
                 "grant_type": "authorization_code",
+                "code_verifier": verifier,
             },
             logger=self._logger,
         )

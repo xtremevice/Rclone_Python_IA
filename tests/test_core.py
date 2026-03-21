@@ -5605,26 +5605,28 @@ class TestNativeLogging(unittest.TestCase):
         self.assertNotIn("%2Fcallback", url, "redirect_uri must not include /callback path")
         self.assertNotIn("/callback", url, "redirect_uri must not include /callback path")
 
-    def test_onedrive_build_auth_url_has_no_pkce_params(self):
-        """OneDriveProvider.build_auth_url must NOT include PKCE parameters.
+    def test_onedrive_build_auth_url_has_pkce_params(self):
+        """OneDriveProvider.build_auth_url MUST include PKCE parameters.
 
-        The rclone public client (b15665d9-…) was registered before PKCE was
-        mandatory; Microsoft's token endpoint returns AADSTS9002331 / invalid_request
-        when code_verifier is sent for a non-PKCE client.
+        The rclone public client (b15665d9-…) is registered for PKCE on the
+        Microsoft identity platform.  Omitting code_challenge causes Microsoft
+        to return ``invalid_client`` (401) for public-client flows.
         """
         from src.native.native_sync_manager import OneDriveProvider, _OAUTH_PORT_RANGE
         verifier = "dummyverifier1234567890abcdef"
         redirect_uri = f"http://localhost:{_OAUTH_PORT_RANGE.start}/"
         url = OneDriveProvider.build_auth_url(redirect_uri, verifier)
-        self.assertNotIn("code_challenge", url, "OneDrive auth URL must not contain code_challenge")
-        self.assertNotIn("code_challenge_method", url,
-                         "OneDrive auth URL must not contain code_challenge_method")
+        self.assertIn("code_challenge", url,
+                      "OneDrive auth URL must contain code_challenge")
+        self.assertIn("code_challenge_method", url,
+                      "OneDrive auth URL must contain code_challenge_method")
+        self.assertIn("S256", url, "OneDrive auth URL must use S256 challenge method")
 
-    def test_onedrive_exchange_code_has_no_code_verifier(self):
-        """OneDriveProvider.exchange_code must NOT send code_verifier.
+    def test_onedrive_exchange_code_has_code_verifier(self):
+        """OneDriveProvider.exchange_code MUST send code_verifier.
 
-        Since build_auth_url omits code_challenge, Microsoft rejects any
-        code_verifier in the token exchange as an unexpected parameter.
+        Microsoft identity platform requires the PKCE verifier in the token
+        exchange for public clients; omitting it causes ``invalid_client`` (401).
         """
         from unittest.mock import patch
         from src.native.native_sync_manager import OneDriveProvider
@@ -5640,8 +5642,9 @@ class TestNativeLogging(unittest.TestCase):
             ok = provider.exchange_code("authcode123", "http://localhost:53682/", "verifier_xyz")
 
         self.assertTrue(ok)
-        self.assertNotIn("code_verifier", posted_fields,
-                         "code_verifier must not be sent in OneDrive token exchange")
+        self.assertIn("code_verifier", posted_fields,
+                      "code_verifier must be sent in OneDrive token exchange")
+        self.assertEqual(posted_fields["code_verifier"], "verifier_xyz")
         self.assertIn("code", posted_fields)
         self.assertIn("redirect_uri", posted_fields)
 
