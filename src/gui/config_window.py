@@ -42,6 +42,10 @@ _NATIVE_API_LABELS: Dict[str, str] = {
     "drive": "Google Drive API v3",
 }
 
+# Auto-refresh interval (ms) for the Errors panel so new sync errors become
+# visible without requiring a manual "🔄 Actualizar" click.
+_ERRORS_REFRESH_INTERVAL_MS = 3000
+
 
 # Mapping from human-readable interval label → seconds
 INTERVAL_OPTIONS: Dict[str, int] = {
@@ -199,6 +203,14 @@ class ConfigWindow:
 
     def _show_panel(self, index: int) -> None:
         """Clear the content area and render the selected panel."""
+        # Cancel the errors-panel auto-refresh timer before destroying widgets
+        if hasattr(self, "_errors_refresh_id"):
+            try:
+                self._win.after_cancel(self._errors_refresh_id)
+            except Exception:
+                pass
+            del self._errors_refresh_id
+
         # Highlight the active menu button
         for i, btn in enumerate(self._menu_buttons):
             btn.configure(bg="#0078d4" if i == index else "#2c2c2c")
@@ -1308,8 +1320,9 @@ class ConfigWindow:
         self._errors_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         sb.config(command=self._errors_text.yview)
 
-        # Populate the text box
+        # Populate the text box immediately and then start auto-refresh
         self._refresh_errors_text()
+        self._schedule_errors_refresh()
 
         # ── Action buttons ───────────────────────────────────────────
         btn_frame = tk.Frame(p, bg="white")
@@ -1370,6 +1383,25 @@ class ConfigWindow:
         self._errors_text.delete("1.0", tk.END)
         self._errors_text.insert(tk.END, content if content else "(Sin errores registrados)")
         self._errors_text.configure(state=tk.DISABLED)
+
+    def _schedule_errors_refresh(self) -> None:
+        """Schedule a periodic auto-refresh of the Errors panel (every 3 s).
+
+        Keeps the panel live while it is visible — the user does not need to
+        click the manual "🔄 Actualizar" button to see new sync errors that
+        arrive after the panel was opened.  The timer is cancelled automatically
+        when the panel is switched via :meth:`_show_panel` or on window close.
+        """
+        self._refresh_errors_text()
+        # Re-schedule only while the text widget still exists
+        if not hasattr(self, "_errors_text"):
+            return
+        try:
+            if not self._errors_text.winfo_exists():
+                return
+        except tk.TclError:
+            return
+        self._errors_refresh_id = self._win.after(_ERRORS_REFRESH_INTERVAL_MS, self._schedule_errors_refresh)
 
     def _copy_selected_errors(self) -> None:
         """Copy any selected text from the errors text box to the clipboard."""
@@ -1648,6 +1680,13 @@ class ConfigWindow:
         # Cancel the disk refresh timer if it exists
         if hasattr(self, "_disk_refresh_id"):
             self._win.after_cancel(self._disk_refresh_id)
+
+        # Cancel the errors-panel auto-refresh timer if it exists
+        if hasattr(self, "_errors_refresh_id"):
+            try:
+                self._win.after_cancel(self._errors_refresh_id)
+            except Exception:
+                pass
 
         # Panel 9 – mount
         if hasattr(self, "_mount_enabled_var"):

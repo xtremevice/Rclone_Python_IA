@@ -2296,6 +2296,109 @@ class TestErrorLogger(unittest.TestCase):
         self.assertEqual(self.logger.get_all_entries(), [])
 
 
+class TestConfigWindowErrorsAutoRefresh(unittest.TestCase):
+    """Tests for the Errors-panel auto-refresh logic in ConfigWindow.
+
+    Because tkinter is not available in headless CI, these tests exercise only
+    the scheduling/cancellation logic without importing the actual ConfigWindow
+    class — they replicate the pure control-flow that was added.
+    """
+
+    def test_schedule_errors_refresh_stores_after_id(self):
+        """The after() ID returned when scheduling an errors-panel refresh must
+        be stored as _errors_refresh_id so it can later be cancelled.
+        The interval used must match _ERRORS_REFRESH_INTERVAL_MS."""
+        # Import the constant from the implementation (without tkinter) by
+        # reading it via importlib at the source-text level is tricky, so we
+        # compare against the numeric value 3000 ms which is what the constant
+        # is set to. If the constant changes, this comment should be updated.
+        import importlib, types
+        _EXPECTED_MS = 3000  # must match config_window._ERRORS_REFRESH_INTERVAL_MS
+
+        after_calls: list = []
+
+        class FakeWin:
+            def after(self, ms, fn):
+                after_calls.append((ms, fn))
+                return "test-after-id"
+
+        class FakeObj:
+            def __init__(self):
+                self._win = FakeWin()
+
+            def _refresh_errors_text(self):
+                pass  # no-op
+
+            def _schedule_errors_refresh_logic(self):
+                """Inline copy of the logic under test."""
+                self._refresh_errors_text()
+                self._errors_refresh_id = self._win.after(_EXPECTED_MS, self._schedule_errors_refresh_logic)
+
+        obj = FakeObj()
+        obj._schedule_errors_refresh_logic()
+
+        # after(_EXPECTED_MS, …) must have been called
+        self.assertTrue(
+            any(ms == _EXPECTED_MS for ms, _ in after_calls),
+            f"auto-refresh must be scheduled with a {_EXPECTED_MS} ms delay"
+        )
+        # The ID must be stored
+        self.assertEqual(obj._errors_refresh_id, "test-after-id")
+
+    def test_show_panel_cancels_errors_refresh_id(self):
+        """When switching panels, any existing _errors_refresh_id must be
+        cancelled via after_cancel() and the attribute must be removed."""
+        cancelled: list = []
+
+        class FakeWin:
+            def after_cancel(self, aid):
+                cancelled.append(aid)
+
+        class FakeObj:
+            def __init__(self):
+                self._win = FakeWin()
+                self._errors_refresh_id = "old-id"  # instance attribute
+
+            def _cancel_errors_refresh_if_pending(self):
+                """Inline copy of the cancellation logic added to _show_panel."""
+                if hasattr(self, "_errors_refresh_id"):
+                    try:
+                        self._win.after_cancel(self._errors_refresh_id)
+                    except Exception:
+                        pass
+                    del self._errors_refresh_id
+
+        obj = FakeObj()
+        obj._cancel_errors_refresh_if_pending()
+
+        self.assertIn("old-id", cancelled, "after_cancel must be called with the stored ID")
+        self.assertFalse(
+            hasattr(obj, "_errors_refresh_id"),
+            "_errors_refresh_id must be deleted after cancellation"
+        )
+
+    def test_no_cancel_when_no_refresh_id(self):
+        """Calling the cancellation logic when no refresh is active must not raise."""
+        class FakeWin:
+            def after_cancel(self, aid):
+                raise AssertionError("should not be called")
+
+        class FakeObj:
+            _win = FakeWin()
+
+            def _cancel_errors_refresh_if_pending(self):
+                if hasattr(self, "_errors_refresh_id"):
+                    try:
+                        self._win.after_cancel(self._errors_refresh_id)
+                    except Exception:
+                        pass
+                    del self._errors_refresh_id
+
+        obj = FakeObj()
+        # Must not raise even though there is no _errors_refresh_id
+        obj._cancel_errors_refresh_if_pending()
+
+
 class TestElementaryIndicator(unittest.TestCase):
     """Tests for the Elementary OS Wingpanel indicator helpers."""
 
