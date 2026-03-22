@@ -547,7 +547,7 @@ class OneDriveProvider:
             url = f"{_GRAPH_URL}/me/drive/root:/{urllib.parse.quote(parent)}:/children"
         else:
             url = f"{_GRAPH_URL}/me/drive/root/children"
-        body = json.dumps({"name": folder_name, "folder": {}, "@microsoft.graph.conflictBehavior": "replace"}).encode()
+        body = json.dumps({"name": folder_name, "folder": {}, "@microsoft.graph.conflictBehavior": "fail"}).encode()
         status, resp_body = _http_request(
             url,
             method="POST",
@@ -556,14 +556,15 @@ class OneDriveProvider:
             timeout=30.0,
             logger=self._logger,
         )
-        if status not in (200, 201):
-            if self._logger:
-                self._logger(
-                    f"❌ create_remote_folder: POST '{rel_path}' devolvió {status}: "
-                    f"{resp_body[:200].decode(errors='replace')}"
-                )
-            return False
-        return True
+        if status in (200, 201, 409):
+            # 200/201 = created, 409 = folder already exists (conflict) — both are success
+            return True
+        if self._logger:
+            self._logger(
+                f"❌ create_remote_folder: POST '{rel_path}' devolvió {status}: "
+                f"{resp_body[:200].decode(errors='replace')}"
+            )
+        return False
 
     # ── Storage info ──────────────────────────────────────────────────
 
@@ -803,10 +804,19 @@ class GoogleDriveProvider:
             status, body = _http_request(
                 url, headers=self._auth_header(), timeout=20.0, logger=self._logger
             )
-            if status == 200 and json.loads(body).get("files"):
-                current_id = json.loads(body)["files"][0]["id"]
+            if status != 200:
+                # API error: we cannot tell if the folder exists. Do NOT create it,
+                # as that would duplicate an existing folder.
+                if self._logger:
+                    self._logger(
+                        f"❌ _get_or_create_folder: búsqueda de '{part}' devolvió {status}"
+                    )
+                return None
+            found = json.loads(body).get("files", [])
+            if found:
+                current_id = found[0]["id"]
             else:
-                # Create the folder
+                # 200 with empty list → folder genuinely does not exist. Create it.
                 meta = json.dumps({
                     "name": part,
                     "mimeType": "application/vnd.google-apps.folder",
@@ -834,13 +844,19 @@ class GoogleDriveProvider:
     def upload_file(self, local_path: str, remote_path: str, rel_path: str) -> bool:
         """Upload a local file to Google Drive. Returns True on success."""
         if not self.ensure_valid_token():
+            if self._logger:
+                self._logger("❌ upload_file: token inválido o expirado — necesita re-autenticación")
             return False
         rel_parts = rel_path.replace("\\", "/").split("/")
         file_name = rel_parts[-1]
         folder_rel = "/".join(rel_parts[:-1])
         parent_id = self._get_or_create_folder(remote_path, folder_rel)
         if not parent_id:
-            parent_id = self._get_folder_id(remote_path) or "root"
+            if self._logger:
+                self._logger(
+                    f"❌ upload_file: no se pudo obtener/crear carpeta para '{rel_path}'"
+                )
+            return False
         # Check if file already exists (to update vs. create)
         existing_id = self._find_file_id(parent_id, file_name)
         try:
@@ -907,7 +923,12 @@ class GoogleDriveProvider:
             return True
 
     def _find_file_id(self, parent_id: str, name: str) -> Optional[str]:
-        """Return the Drive ID of a file by name in *parent_id*, or None."""
+        """Return the Drive ID of a file by name in *parent_id*, or None if not found.
+
+        Raises ``OSError`` when the Drive API returns a non-200 status so that
+        the caller (``upload_file``) never creates a duplicate by mistaking an
+        API error for a "file not found" response.
+        """
         query = (
             f"name='{_gdrive_escape(name)}' and "
             f"'{parent_id}' in parents and trashed=false and "
@@ -921,15 +942,19 @@ class GoogleDriveProvider:
         status, body = _http_request(
             url, headers=self._auth_header(), timeout=20.0, logger=self._logger
         )
-        if status == 200:
-            files = json.loads(body).get("files", [])
-            if files:
-                return files[0]["id"]
-        return None
+        if status != 200:
+            raise OSError(
+                f"Drive API devolvió {status} al buscar '{name}' "
+                f"(no se puede verificar si el archivo ya existe)"
+            )
+        files = json.loads(body).get("files", [])
+        return files[0]["id"] if files else None
 
     def download_file(self, item_id: str, local_path: str) -> bool:
         """Download a Drive file to *local_path*. Returns True on success."""
         if not self.ensure_valid_token():
+            if self._logger:
+                self._logger("❌ download_file: token inválido o expirado — necesita re-autenticación")
             return False
         url = f"{_GDRIVE_API_URL}/files/{item_id}?alt=media"
         status, body = _http_request(

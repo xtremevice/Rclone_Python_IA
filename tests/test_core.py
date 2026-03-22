@@ -6057,5 +6057,204 @@ class TestNativeLogging(unittest.TestCase):
         self.assertIn("❌", combined, "Log message must contain ❌ indicator")
 
 
+    def test_gdrive_get_or_create_folder_no_create_on_api_error(self):
+        """_get_or_create_folder must NOT attempt to create a folder when the
+        existence-check API call returns a non-200 status.  Creating a folder
+        when the check fails would cause duplicate folders if the folder already
+        exists but the API was temporarily unavailable."""
+        import json
+        from unittest.mock import patch, MagicMock
+        from src.native.native_sync_manager import GoogleDriveProvider
+
+        logged: list = []
+        provider = GoogleDriveProvider("remote1", logger=lambda msg: logged.append(msg))
+
+        call_count = [0]
+
+        def fake_http(url, *, method="GET", headers=None, data=None, timeout=60.0, logger=None):
+            call_count[0] += 1
+            if method == "GET" and "files" in url:
+                # Simulate a 500 server error on the existence check
+                if logger:
+                    logger(f"GET {url} → 500 ⚠️")
+                return 500, b'{"error": "internal server error"}'
+            # POST should NOT be reached
+            return 201, json.dumps({"id": "new_folder_id"}).encode()
+
+        with patch("src.native.native_sync_manager._http_request", side_effect=fake_http), \
+             patch.object(provider, "_get_folder_id", return_value="root_id"), \
+             patch.object(provider, "_auth_header", return_value={"Authorization": "Bearer test"}), \
+             patch.object(provider, "ensure_valid_token", return_value=True):
+            result = provider._get_or_create_folder("/", "testfolder")
+
+        self.assertIsNone(result, "_get_or_create_folder must return None on API error")
+        # Crucially, only ONE HTTP call was made (the query). No POST to create.
+        post_calls = [c for c in range(call_count[0])]  # just count
+        # The fake always returns 500 for GET; no POST should have been triggered
+        self.assertEqual(call_count[0], 1,
+                         "Only the existence-check GET should have been called, not a POST")
+        self.assertTrue(any("❌" in m for m in logged),
+                        "An error must be logged when the API returns non-200")
+
+    def test_gdrive_upload_file_no_fallback_on_missing_parent(self):
+        """When _get_or_create_folder returns None (API error), upload_file must
+        return False immediately without falling back to an incorrect parent_id
+        and creating a duplicate file at the wrong location."""
+        from unittest.mock import patch
+        from src.native.native_sync_manager import GoogleDriveProvider
+
+        logged: list = []
+        provider = GoogleDriveProvider("remote1", logger=lambda msg: logged.append(msg))
+
+        with patch.object(provider, "ensure_valid_token", return_value=True), \
+             patch.object(provider, "_get_or_create_folder", return_value=None), \
+             patch.object(provider, "_find_file_id") as mock_find, \
+             patch("src.native.native_sync_manager._http_request") as mock_http:
+            import tempfile, os
+            with tempfile.NamedTemporaryFile(delete=False) as tf:
+                tf.write(b"data")
+                tf_path = tf.name
+            try:
+                result = provider.upload_file(tf_path, "remote/", "subdir/file.txt")
+            finally:
+                os.unlink(tf_path)
+
+        self.assertFalse(result, "upload_file must return False when folder can't be obtained")
+        mock_find.assert_not_called()
+        mock_http.assert_not_called()
+        self.assertTrue(any("❌" in m for m in logged),
+                        "An error must be logged when the parent folder is unavailable")
+
+    def test_gdrive_find_file_id_raises_on_api_error(self):
+        """_find_file_id must raise OSError (not return None) when the Drive API
+        returns a non-200 status.  Returning None would cause upload_file to
+        create a new file even though the existing file just failed to be found,
+        resulting in a duplicate."""
+        from unittest.mock import patch
+        from src.native.native_sync_manager import GoogleDriveProvider
+
+        provider = GoogleDriveProvider("remote1")
+
+        def fake_http(url, *, method="GET", headers=None, data=None, timeout=60.0, logger=None):
+            return 503, b'{"error": "service unavailable"}'
+
+        with patch("src.native.native_sync_manager._http_request", side_effect=fake_http), \
+             patch.object(provider, "_auth_header", return_value={"Authorization": "Bearer test"}):
+            with self.assertRaises(OSError) as ctx:
+                provider._find_file_id("parent_id", "file.jpg")
+
+        self.assertIn("503", str(ctx.exception),
+                      "OSError message must include the HTTP status code")
+
+    def test_gdrive_find_file_id_returns_none_when_not_found(self):
+        """_find_file_id must return None (not raise) when the file genuinely
+        does not exist (200 response with empty files list)."""
+        import json
+        from unittest.mock import patch
+        from src.native.native_sync_manager import GoogleDriveProvider
+
+        provider = GoogleDriveProvider("remote1")
+
+        def fake_http(url, *, method="GET", headers=None, data=None, timeout=60.0, logger=None):
+            return 200, json.dumps({"files": []}).encode()
+
+        with patch("src.native.native_sync_manager._http_request", side_effect=fake_http), \
+             patch.object(provider, "_auth_header", return_value={"Authorization": "Bearer test"}):
+            result = provider._find_file_id("parent_id", "nonexistent.jpg")
+
+        self.assertIsNone(result)
+
+    def test_onedrive_create_folder_treats_409_as_success(self):
+        """create_remote_folder must treat a 409 Conflict response as success
+        (folder already exists) and return True, so that re-running sync does
+        not try to create duplicate folders."""
+        import json
+        from unittest.mock import patch
+        from src.native.native_sync_manager import OneDriveProvider
+
+        provider = OneDriveProvider("remote1")
+
+        def fake_http(url, *, method="GET", headers=None, data=None, timeout=60.0, logger=None):
+            # Simulate 409 Conflict — folder already exists
+            return 409, json.dumps({"error": {"code": "nameAlreadyExists"}}).encode()
+
+        with patch("src.native.native_sync_manager._http_request", side_effect=fake_http), \
+             patch.object(provider, "ensure_valid_token", return_value=True), \
+             patch.object(provider, "_auth_header", return_value={"Authorization": "Bearer test"}):
+            result = provider.create_remote_folder("/", "existing_folder")
+
+        self.assertTrue(result,
+                        "create_remote_folder must return True when folder already exists (409)")
+
+    def test_onedrive_create_folder_uses_fail_conflict_behavior(self):
+        """create_remote_folder must use conflictBehavior='fail' (not 'replace').
+        'replace' is undocumented/destructive for folders in the Graph API."""
+        import json
+        from unittest.mock import patch
+        from src.native.native_sync_manager import OneDriveProvider
+
+        provider = OneDriveProvider("remote1")
+        captured_body: list = []
+
+        def fake_http(url, *, method="GET", headers=None, data=None, timeout=60.0, logger=None):
+            if data:
+                captured_body.append(json.loads(data.decode()))
+            return 201, json.dumps({"id": "new_folder"}).encode()
+
+        with patch("src.native.native_sync_manager._http_request", side_effect=fake_http), \
+             patch.object(provider, "ensure_valid_token", return_value=True), \
+             patch.object(provider, "_auth_header", return_value={"Authorization": "Bearer test"}):
+            provider.create_remote_folder("/", "my_folder")
+
+        self.assertTrue(len(captured_body) >= 1, "At least one POST body must have been sent")
+        behavior = captured_body[0].get("@microsoft.graph.conflictBehavior")
+        self.assertEqual(behavior, "fail",
+                         "conflictBehavior must be 'fail', not 'replace', to prevent folder duplication")
+
+    def test_gdrive_upload_file_no_create_when_find_fails(self):
+        """When _find_file_id raises OSError (API error), upload_file must propagate
+        the exception (and NativeSyncManager._upload must catch it), ensuring no
+        new duplicate file is created via a POST."""
+        import json, tempfile, os
+        from unittest.mock import patch, MagicMock
+        from src.native.native_sync_manager import GoogleDriveProvider, NativeSyncManager
+
+        native = NativeSyncManager(self.config)
+        errors: list = []
+        native.on_error = lambda svc, msg: errors.append(msg)
+        native.on_api_call = lambda svc, msg: None
+
+        # Create a real temp file
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tf:
+            tf.write(b"fake image data")
+            tf_path = tf.name
+
+        http_calls: list = []
+
+        def fake_http(url, *, method="GET", headers=None, data=None, timeout=60.0, logger=None):
+            http_calls.append((method, url))
+            if method == "GET" and "files" in url:
+                # _get_or_create_folder search succeeds (folder found)
+                if "pageSize=1" in url and "parents" in url and "folder" in url.lower():
+                    # For _get_or_create_folder loop
+                    return 200, json.dumps({"files": [{"id": "parent_id"}]}).encode()
+                # For _find_file_id: return 503 to simulate API error
+                return 503, b'{"error": "service unavailable"}'
+            return 200, json.dumps({"files": [{"id": "root_id"}]}).encode()
+
+        try:
+            mock_provider = MagicMock()
+            mock_provider.upload_file.side_effect = OSError("Drive API devolvió 503")
+            result = native._upload(mock_provider, tf_path, "remote/", "folder/img.jpg", "svc1")
+        finally:
+            os.unlink(tf_path)
+
+        self.assertFalse(result, "_upload must return False when upload_file raises")
+        self.assertTrue(len(errors) >= 1, "on_error must fire when upload raises")
+        # No POST (create) calls should have been made
+        post_calls = [c for c in http_calls if c[0] == "POST"]
+        self.assertEqual(len(post_calls), 0, "No POST (create) calls should be made on API error")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
