@@ -18,6 +18,7 @@ Tokens are stored as JSON files in the application config directory:
 """
 
 import base64
+import datetime
 import hashlib
 import http.server
 import json
@@ -516,8 +517,12 @@ class OneDriveProvider:
                 offset += len(chunk)
         return True
 
-    def download_file(self, item_id: str, local_path: str) -> bool:
-        """Download a Drive item to *local_path*. Returns True on success."""
+    def download_file(self, item_id: str, local_path: str, remote_mtime: Optional[float] = None) -> bool:
+        """Download a Drive item to *local_path*. Returns True on success.
+
+        If *remote_mtime* is provided the local file's modification time is set
+        to match it so that the next sync cycle sees the file as already synced.
+        """
         if not self.ensure_valid_token():
             if self._logger:
                 self._logger("❌ download_file: token inválido o expirado — necesita re-autenticación")
@@ -533,6 +538,11 @@ class OneDriveProvider:
         os.makedirs(os.path.dirname(local_path) or ".", exist_ok=True)
         with open(local_path, "wb") as fh:
             fh.write(body)
+        if remote_mtime:
+            try:
+                os.utime(local_path, (remote_mtime, remote_mtime))
+            except OSError:
+                pass
         return True
 
     def create_remote_folder(self, remote_path: str, rel_path: str) -> bool:
@@ -871,17 +881,41 @@ class GoogleDriveProvider:
             if self._logger:
                 self._logger(f"❌ upload_file: no se pudo leer '{rel_path}': {exc}")
             return False
+        # Preserve local modification time so Drive stores the original mtime
+        # instead of the upload time.  Without this, the next sync would see
+        # remote_mtime > local_mtime and download the file back unnecessarily.
+        try:
+            local_mtime_str: Optional[str] = _to_rfc3339(os.path.getmtime(local_path))
+        except OSError:
+            local_mtime_str = None
+        boundary = b"----NativeSyncBoundary"
         if existing_id:
-            # Update existing file content
+            # Update existing file: use multipart so we can set modifiedTime
+            meta_dict: Dict = {}
+            if local_mtime_str:
+                meta_dict["modifiedTime"] = local_mtime_str
+            meta = json.dumps(meta_dict).encode()
+            parts = (
+                b"--" + boundary + b"\r\n"
+                b"Content-Type: application/json; charset=UTF-8\r\n\r\n"
+                + meta + b"\r\n"
+                b"--" + boundary + b"\r\n"
+                b"Content-Type: application/octet-stream\r\n\r\n"
+                + file_body + b"\r\n"
+                b"--" + boundary + b"--"
+            )
             url = (
                 f"https://www.googleapis.com/upload/drive/v3/files/{existing_id}"
-                f"?uploadType=media"
+                f"?uploadType=multipart"
             )
             status, resp_body = _http_request(
                 url,
                 method="PATCH",
-                headers={**self._auth_header(), "Content-Type": "application/octet-stream"},
-                data=file_body,
+                headers={
+                    **self._auth_header(),
+                    "Content-Type": f"multipart/related; boundary={boundary.decode()}",
+                },
+                data=parts,
                 timeout=120.0,
                 logger=self._logger,
             )
@@ -894,9 +928,11 @@ class GoogleDriveProvider:
                 return False
             return True
         else:
-            # Multipart upload (metadata + content)
-            meta = json.dumps({"name": file_name, "parents": [parent_id]}).encode()
-            boundary = b"----NativeSyncBoundary"
+            # New file: multipart upload (metadata + content)
+            meta_new: Dict = {"name": file_name, "parents": [parent_id]}
+            if local_mtime_str:
+                meta_new["modifiedTime"] = local_mtime_str
+            meta = json.dumps(meta_new).encode()
             parts = (
                 b"--" + boundary + b"\r\n"
                 b"Content-Type: application/json; charset=UTF-8\r\n\r\n"
@@ -955,8 +991,13 @@ class GoogleDriveProvider:
         files = json.loads(body).get("files", [])
         return files[0]["id"] if files else None
 
-    def download_file(self, item_id: str, local_path: str) -> bool:
-        """Download a Drive file to *local_path*. Returns True on success."""
+    def download_file(self, item_id: str, local_path: str, remote_mtime: Optional[float] = None) -> bool:
+        """Download a Drive file to *local_path*. Returns True on success.
+
+        If *remote_mtime* is provided the local file's modification time is set
+        to match it so that the next sync cycle sees the file as already synced
+        (avoiding an immediate re-download triggered by a mtime mismatch).
+        """
         if not self.ensure_valid_token():
             if self._logger:
                 self._logger("❌ download_file: token inválido o expirado — necesita re-autenticación")
@@ -972,6 +1013,11 @@ class GoogleDriveProvider:
         os.makedirs(os.path.dirname(local_path) or ".", exist_ok=True)
         with open(local_path, "wb") as fh:
             fh.write(body)
+        if remote_mtime:
+            try:
+                os.utime(local_path, (remote_mtime, remote_mtime))
+            except OSError:
+                pass
         return True
 
     def create_remote_folder(self, remote_path: str, rel_path: str) -> bool:
@@ -1355,7 +1401,10 @@ class NativeSyncManager:
                     errors += 1
             elif remote_info and not local_info:
                 # Remote only → download
-                ok = self._download(provider, remote_info["id"], abs_local, rel, name)
+                ok = self._download(
+                    provider, remote_info["id"], abs_local, rel, name,
+                    remote_mtime=remote_info.get("mtime"),
+                )
                 if not ok:
                     errors += 1
             elif local_info and remote_info:
@@ -1368,7 +1417,8 @@ class NativeSyncManager:
                         ok = self._upload(provider, abs_local, remote_path, rel, name)
                     else:
                         ok = self._download(
-                            provider, remote_info["id"], abs_local, rel, name
+                            provider, remote_info["id"], abs_local, rel, name,
+                            remote_mtime=remote_mtime,
                         )
                     if not ok:
                         errors += 1
@@ -1402,10 +1452,11 @@ class NativeSyncManager:
         abs_local: str,
         rel: str,
         service_name: str,
+        remote_mtime: Optional[float] = None,
     ) -> bool:
         self._log_progress(service_name, f"⬇️ Descargando: '{rel}'")
         try:
-            ok = provider.download_file(item_id, abs_local)
+            ok = provider.download_file(item_id, abs_local, remote_mtime=remote_mtime)
         except Exception as exc:
             self._emit_error(service_name, f"Error al descargar '{rel}' ({type(exc).__name__}): {exc}")
             return False
@@ -1476,6 +1527,12 @@ class NativeSyncManager:
 
 # ── Utility functions ─────────────────────────────────────────────────────────
 
+def _to_rfc3339(unix_ts: float) -> str:
+    """Convert a UTC Unix timestamp to an RFC 3339 string for API metadata fields."""
+    dt = datetime.datetime.fromtimestamp(unix_ts, tz=datetime.timezone.utc)
+    return dt.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+
 def _parse_iso8601(s: str) -> float:
     """Parse an ISO 8601 datetime string and return a Unix timestamp.
 
@@ -1484,7 +1541,6 @@ def _parse_iso8601(s: str) -> float:
     """
     if not s:
         return 0.0
-    import datetime
     # Normalise: replace trailing 'Z' with '+00:00' so fromisoformat() works
     normalised = s.rstrip("Z")
     if "T" in normalised:

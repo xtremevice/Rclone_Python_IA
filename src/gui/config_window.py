@@ -1376,6 +1376,17 @@ class ConfigWindow:
 
         if self._error_logger is not None:
             content = self._error_logger.get_text_for_service(self._service_name)
+            if not content:
+                # No entries for this service specifically.  Fall back to
+                # showing all entries so the user can see what went wrong
+                # even when the service-name filter matches nothing (e.g.
+                # after a rename or due to a logging-name mismatch).
+                all_content = self._error_logger.get_all_text()
+                if all_content:
+                    content = (
+                        f"(Sin errores específicos de '{self._service_name}'."
+                        f"  Mostrando registro completo:)\n\n{all_content}"
+                    )
         else:
             content = "(Registro de errores no disponible)"
 

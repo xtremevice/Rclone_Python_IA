@@ -11,6 +11,7 @@ import os
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -6521,6 +6522,324 @@ class TestNativeSyncLoopExceptionHandling(unittest.TestCase):
             any("docs" in msg for msg in errors),
             f"Error message must mention the failing path; got: {errors}"
         )
+
+
+
+
+class TestMtimePreservation(unittest.TestCase):
+    """Tests for mtime preservation fixes in native sync upload/download.
+
+    Covers:
+    1. _to_rfc3339 converts a Unix timestamp to the RFC 3339 format expected
+       by the Google Drive API.
+    2. GoogleDriveProvider.upload_file includes 'modifiedTime' in upload metadata
+       for both new files (POST multipart) and existing files (PATCH multipart).
+    3. GoogleDriveProvider.download_file calls os.utime when remote_mtime is given.
+    4. OneDriveProvider.download_file calls os.utime when remote_mtime is given.
+    5. NativeSyncManager._download passes remote_mtime to download_file.
+    6. NativeSyncManager._do_sync passes remote_info["mtime"] as remote_mtime.
+    """
+
+    def setUp(self):
+        self._tmpdir = tempfile.mkdtemp()
+        import src.config.config_manager as cm_mod
+        import src.native.native_sync_manager as nm_mod
+        self._orig_cm = cm_mod.get_config_dir
+        self._orig_nm = nm_mod.get_config_dir
+        cm_mod.get_config_dir = lambda: Path(self._tmpdir)
+        nm_mod.get_config_dir = lambda: Path(self._tmpdir)
+        self.config = ConfigManager()
+
+    def tearDown(self):
+        import src.config.config_manager as cm_mod
+        import src.native.native_sync_manager as nm_mod
+        cm_mod.get_config_dir = self._orig_cm
+        nm_mod.get_config_dir = self._orig_nm
+        import shutil
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+
+    def test_to_rfc3339_converts_unix_timestamp(self):
+        """_to_rfc3339 must produce a valid RFC 3339 UTC string."""
+        from src.native.native_sync_manager import _to_rfc3339
+        # 2024-01-15T10:30:00Z
+        import datetime
+        ts = datetime.datetime(2024, 1, 15, 10, 30, 0, tzinfo=datetime.timezone.utc).timestamp()
+        result = _to_rfc3339(ts)
+        self.assertEqual(result, "2024-01-15T10:30:00.000Z")
+
+    def test_gdrive_upload_file_new_includes_modified_time(self):
+        """upload_file for a NEW Drive file (POST multipart) must embed
+        'modifiedTime' in the JSON metadata part of the multipart body."""
+        from src.native.native_sync_manager import GoogleDriveProvider
+
+        provider = GoogleDriveProvider("remote1", logger=None)
+        provider._token = {"access_token": "tok", "obtained_at": time.time(), "expires_in": 3600}
+
+        # Create a temporary file with a known mtime
+        local_file = os.path.join(self._tmpdir, "test.txt")
+        with open(local_file, "wb") as fh:
+            fh.write(b"hello world")
+        known_mtime = 1705316400.0  # 2024-01-15T10:00:00Z approx
+        os.utime(local_file, (known_mtime, known_mtime))
+
+        captured_requests = []
+
+        def fake_http(url, method="GET", headers=None, data=None, **kw):
+            captured_requests.append({"url": url, "method": method, "data": data})
+            # _find_file_id → returns empty files list (new file)
+            if "/files?" in url and "q=" in url:
+                return 200, json.dumps({"files": []}).encode()
+            # _get_folder_id for remote root
+            if "/files?" in url:
+                return 200, json.dumps({"files": [{"id": "root_id"}]}).encode()
+            # multipart POST
+            if "uploadType=multipart" in url and method == "POST":
+                return 201, json.dumps({"id": "new_file_id"}).encode()
+            return 200, b"{}"
+
+        with patch("src.native.native_sync_manager._http_request", side_effect=fake_http):
+            with patch.object(provider, "_get_folder_id", return_value="parent_id"):
+                with patch.object(provider, "_find_file_id", return_value=None):
+                    result = provider.upload_file(local_file, "/", "test.txt")
+
+        self.assertTrue(result)
+        # Find the multipart POST call
+        post_call = next(
+            (r for r in captured_requests
+             if "uploadType=multipart" in r["url"] and r["method"] == "POST"),
+            None
+        )
+        self.assertIsNotNone(post_call, "A multipart POST must have been made")
+        # The multipart body must contain a JSON part with modifiedTime
+        body_str = post_call["data"].decode(errors="replace")
+        self.assertIn("modifiedTime", body_str)
+        self.assertIn("2024-01-15", body_str)
+
+    def test_gdrive_upload_file_existing_uses_multipart_patch(self):
+        """upload_file for an EXISTING Drive file must use multipart PATCH
+        (not simple media) so that modifiedTime can be set."""
+        from src.native.native_sync_manager import GoogleDriveProvider
+
+        provider = GoogleDriveProvider("remote1", logger=None)
+        provider._token = {"access_token": "tok", "obtained_at": time.time(), "expires_in": 3600}
+
+        local_file = os.path.join(self._tmpdir, "test.txt")
+        with open(local_file, "wb") as fh:
+            fh.write(b"updated content")
+        known_mtime = 1705316400.0
+        os.utime(local_file, (known_mtime, known_mtime))
+
+        patch_calls = []
+
+        def fake_http(url, method="GET", headers=None, data=None, **kw):
+            if method == "PATCH" and "uploadType=multipart" in url:
+                patch_calls.append({"url": url, "data": data})
+                return 200, json.dumps({"id": "existing_id"}).encode()
+            return 200, b"{}"
+
+        with patch("src.native.native_sync_manager._http_request", side_effect=fake_http):
+            with patch.object(provider, "_get_folder_id", return_value="parent_id"):
+                with patch.object(provider, "_find_file_id", return_value="existing_file_id"):
+                    result = provider.upload_file(local_file, "/", "test.txt")
+
+        self.assertTrue(result)
+        self.assertEqual(len(patch_calls), 1, "Exactly one multipart PATCH must be made")
+        body_str = patch_calls[0]["data"].decode(errors="replace")
+        self.assertIn("modifiedTime", body_str)
+
+    def test_gdrive_download_file_sets_utime(self):
+        """download_file must call os.utime on the local file when remote_mtime
+        is provided, so that the local mtime matches the remote mtime."""
+        from src.native.native_sync_manager import GoogleDriveProvider
+
+        provider = GoogleDriveProvider("remote1", logger=None)
+        provider._token = {"access_token": "tok", "obtained_at": time.time(), "expires_in": 3600}
+
+        local_file = os.path.join(self._tmpdir, "downloaded.txt")
+        remote_mtime = 1705316400.0  # known timestamp
+
+        with patch("src.native.native_sync_manager._http_request",
+                   return_value=(200, b"file content")):
+            result = provider.download_file("item_id_123", local_file, remote_mtime=remote_mtime)
+
+        self.assertTrue(result)
+        self.assertTrue(os.path.exists(local_file))
+        actual_mtime = os.path.getmtime(local_file)
+        self.assertAlmostEqual(actual_mtime, remote_mtime, places=0,
+                               msg="Local mtime must match remote_mtime after download")
+
+    def test_gdrive_download_file_no_utime_without_remote_mtime(self):
+        """download_file must NOT crash when remote_mtime is not provided
+        (backwards-compatible default)."""
+        from src.native.native_sync_manager import GoogleDriveProvider
+
+        provider = GoogleDriveProvider("remote1", logger=None)
+        provider._token = {"access_token": "tok", "obtained_at": time.time(), "expires_in": 3600}
+
+        local_file = os.path.join(self._tmpdir, "downloaded2.txt")
+
+        with patch("src.native.native_sync_manager._http_request",
+                   return_value=(200, b"data")):
+            result = provider.download_file("item_id_456", local_file)
+
+        self.assertTrue(result)
+        self.assertTrue(os.path.exists(local_file))
+
+    def test_onedrive_download_file_sets_utime(self):
+        """OneDriveProvider.download_file must also call os.utime when
+        remote_mtime is provided."""
+        from src.native.native_sync_manager import OneDriveProvider
+
+        provider = OneDriveProvider("remote1", logger=None)
+        provider._token = {"access_token": "tok", "obtained_at": time.time(), "expires_in": 3600}
+
+        local_file = os.path.join(self._tmpdir, "onedrive_dl.txt")
+        remote_mtime = 1705316400.0
+
+        with patch("src.native.native_sync_manager._http_request",
+                   return_value=(200, b"onedrive content")):
+            result = provider.download_file("od_item_id", local_file, remote_mtime=remote_mtime)
+
+        self.assertTrue(result)
+        actual_mtime = os.path.getmtime(local_file)
+        self.assertAlmostEqual(actual_mtime, remote_mtime, places=0)
+
+    def test_native_download_passes_remote_mtime_to_provider(self):
+        """NativeSyncManager._download must forward remote_mtime to
+        provider.download_file so the local mtime is preserved."""
+        from src.native.native_sync_manager import NativeSyncManager
+
+        native = NativeSyncManager(self.config)
+        native.on_error = lambda svc, msg: None
+        native.on_file_synced = lambda svc, fp, synced: None
+
+        mock_provider = MagicMock()
+        mock_provider.download_file.return_value = True
+
+        local_file = os.path.join(self._tmpdir, "file.txt")
+        remote_mtime = 1705316400.0
+        native._download(mock_provider, "item_id", local_file, "file.txt", "MySvc",
+                         remote_mtime=remote_mtime)
+
+        mock_provider.download_file.assert_called_once_with(
+            "item_id", local_file, remote_mtime=remote_mtime
+        )
+
+    def test_do_sync_passes_remote_mtime_on_download(self):
+        """_do_sync must pass remote_info['mtime'] as remote_mtime to _download
+        for remote-only files and for files where remote is newer."""
+        from src.native.native_sync_manager import NativeSyncManager
+
+        native = NativeSyncManager(self.config)
+        native.on_error = lambda svc, msg: None
+        native.on_api_call = lambda svc, msg: None
+        native.on_file_synced = lambda svc, fp, synced: None
+
+        download_calls = []
+
+        def track_download(provider, item_id, abs_local, rel, service_name, remote_mtime=None):
+            download_calls.append(remote_mtime)
+            return True
+
+        remote_mtime_val = 1705316400.0
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            svc = {
+                "name": "GDriveTest",
+                "platform": "drive",
+                "remote_name": "gdrive",
+                "local_path": tmpdir,
+                "remote_path": "/",
+            }
+            mock_provider = MagicMock()
+            mock_provider.is_authenticated.return_value = True
+            # Remote-only file
+            mock_provider.list_files.return_value = {
+                "remote_only.txt": {
+                    "id": "r1",
+                    "is_dir": False,
+                    "mtime": remote_mtime_val,
+                    "size": 10,
+                },
+            }
+
+            with patch.object(native, "_get_provider", return_value=mock_provider), \
+                 patch.object(native, "_download", side_effect=track_download), \
+                 patch("shutil.disk_usage") as mock_du:
+                mock_du.return_value = MagicMock(free=20 * 1024 * 1024 * 1024)
+                native._do_sync(svc)
+
+        self.assertEqual(len(download_calls), 1, "_download must be called once")
+        self.assertAlmostEqual(download_calls[0], remote_mtime_val, places=1,
+                               msg="remote_mtime must be forwarded from remote_info['mtime']")
+
+
+class TestErrorsPanelFallback(unittest.TestCase):
+    """Tests for the errors-panel fallback to all-service entries.
+
+    When no entries match the service-specific filter, _refresh_errors_text
+    must fall back to showing all entries (with a header) so the user can
+    always see what went wrong even if the filter name doesn't match.
+
+    Because tkinter is not available in headless CI these tests exercise only
+    the display-string logic (the part that builds the content variable inside
+    _refresh_errors_text) without importing ConfigWindow.
+    """
+
+    def _build_content(self, error_logger, service_name: str) -> str:
+        """Inline the content-building logic of _refresh_errors_text."""
+        content = error_logger.get_text_for_service(service_name)
+        if not content:
+            all_content = error_logger.get_all_text()
+            if all_content:
+                content = (
+                    f"(Sin errores específicos de '{service_name}'."
+                    f"  Mostrando registro completo:)\n\n{all_content}"
+                )
+        return content if content else "(Sin errores registrados)"
+
+    def test_fallback_shows_all_when_service_filter_empty(self):
+        """When no entries match service_name but there ARE other entries,
+        the content must include the fallback header and all entries."""
+        from src.gui.error_logger import ErrorLogger
+        logger = ErrorLogger()
+        logger.log("OtherService", "Something went wrong in other service")
+        logger.log("OtherService", "Another error")
+
+        content = self._build_content(logger, "MyGDrive")
+
+        self.assertIn("OtherService", content,
+                      "Fallback must show entries from other services")
+        self.assertNotIn("Sin errores registrados", content,
+                         "Must not show 'Sin errores registrados' when there are log entries")
+        self.assertIn("MyGDrive", content,
+                      "Fallback header must mention the service name")
+
+    def test_no_fallback_when_service_has_own_entries(self):
+        """When there ARE entries matching service_name, only those must be shown
+        (no fallback header)."""
+        from src.gui.error_logger import ErrorLogger
+        logger = ErrorLogger()
+        logger.log("OtherService", "Noise from other service")
+        logger.log("MyGDrive", "Real error for MyGDrive")
+
+        content = self._build_content(logger, "MyGDrive")
+
+        self.assertIn("Real error for MyGDrive", content)
+        self.assertNotIn("Noise from other service", content,
+                         "Other-service noise must be filtered out when own entries exist")
+        self.assertNotIn("Mostrando registro completo", content,
+                         "Fallback header must NOT appear when service has own entries")
+
+    def test_sin_errores_when_no_entries_at_all(self):
+        """When the error logger is completely empty, must yield
+        '(Sin errores registrados)'."""
+        from src.gui.error_logger import ErrorLogger
+        logger = ErrorLogger()
+
+        content = self._build_content(logger, "MyGDrive")
+
+        self.assertIn("Sin errores registrados", content)
 
 
 if __name__ == "__main__":
