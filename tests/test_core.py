@@ -2307,12 +2307,7 @@ class TestConfigWindowErrorsAutoRefresh(unittest.TestCase):
     def test_schedule_errors_refresh_stores_after_id(self):
         """The after() ID returned when scheduling an errors-panel refresh must
         be stored as _errors_refresh_id so it can later be cancelled.
-        The interval used must match _ERRORS_REFRESH_INTERVAL_MS."""
-        # Import the constant from the implementation (without tkinter) by
-        # reading it via importlib at the source-text level is tricky, so we
-        # compare against the numeric value 3000 ms which is what the constant
-        # is set to. If the constant changes, this comment should be updated.
-        import importlib, types
+        The interval must be 3000 ms (matching config_window._ERRORS_REFRESH_INTERVAL_MS)."""
         _EXPECTED_MS = 3000  # must match config_window._ERRORS_REFRESH_INTERVAL_MS
 
         after_calls: list = []
@@ -6357,6 +6352,175 @@ class TestNativeLogging(unittest.TestCase):
         # No POST (create) calls should have been made
         post_calls = [c for c in http_calls if c[0] == "POST"]
         self.assertEqual(len(post_calls), 0, "No POST (create) calls should be made on API error")
+
+
+class TestNativeSyncLoopExceptionHandling(unittest.TestCase):
+    """Tests for silent-failure fixes in the native sync loop and Google Drive provider.
+
+    Covers three bugs where sync errors would not appear in the Errores panel:
+    1. _sync_loop had no exception handler — uncaught _do_sync exceptions killed
+       the thread without calling _emit_error.
+    2. GoogleDriveProvider.list_files returned {} silently when ensure_valid_token
+       returned False (no _logger call).
+    3. os.makedirs in _do_sync was not wrapped — FileExistsError killed the thread.
+    """
+
+    def setUp(self):
+        self._tmpdir = tempfile.mkdtemp()
+        import src.config.config_manager as cm_mod
+        import src.native.native_sync_manager as nm_mod
+        self._orig_cm = cm_mod.get_config_dir
+        self._orig_nm = nm_mod.get_config_dir
+        cm_mod.get_config_dir = lambda: Path(self._tmpdir)
+        nm_mod.get_config_dir = lambda: Path(self._tmpdir)
+        self.config = ConfigManager()
+
+    def tearDown(self):
+        import src.config.config_manager as cm_mod
+        import src.native.native_sync_manager as nm_mod
+        cm_mod.get_config_dir = self._orig_cm
+        nm_mod.get_config_dir = self._orig_nm
+        import shutil
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+
+    def test_sync_loop_catches_do_sync_exception(self):
+        """If _do_sync raises an unexpected exception, _sync_loop must catch it,
+        emit an error via on_error, and set status to 'Error en sincronización'
+        instead of crashing the thread silently."""
+        from src.native.native_sync_manager import NativeSyncManager
+
+        native = NativeSyncManager(self.config)
+        errors: list = []
+        statuses: list = []
+        native.on_error = lambda svc, msg: errors.append((svc, msg))
+        native.on_status_change = lambda svc, st: statuses.append((svc, st))
+
+        self.config.add_service("GDriveTest", "drive", self._tmpdir)
+        self.config.update_service("GDriveTest", {"sync_provider": "nativo", "sync_interval": 0})
+
+        stop_event = threading.Event()
+
+        call_count = [0]
+        def raising_do_sync(_svc):
+            call_count[0] += 1
+            stop_event.set()  # stop after this one iteration
+            raise RuntimeError("Simulated unexpected crash in _do_sync")
+
+        # Patch stop_event.wait to avoid sleeping
+        with patch.object(native, "_do_sync", side_effect=raising_do_sync), \
+             patch.object(stop_event, "wait", side_effect=lambda **_: None):
+            native._sync_loop("GDriveTest", stop_event)
+
+        self.assertEqual(call_count[0], 1, "_do_sync should be called exactly once")
+        self.assertTrue(
+            any(svc == "GDriveTest" and "Error en sincronización" in st
+                for svc, st in statuses),
+            f"Status 'Error en sincronización' must be set; got: {statuses}"
+        )
+        self.assertTrue(
+            any(svc == "GDriveTest" and "RuntimeError" in msg
+                for svc, msg in errors),
+            f"on_error must contain RuntimeError; got: {errors}"
+        )
+
+    def test_sync_loop_exception_emits_before_generic_message(self):
+        """When _do_sync raises, the specific exception message must be emitted
+        via on_error so the user can see the root cause in the Errores panel."""
+        from src.native.native_sync_manager import NativeSyncManager
+
+        native = NativeSyncManager(self.config)
+        errors: list = []
+        native.on_error = lambda svc, msg: errors.append(msg)
+        native.on_status_change = lambda *_: None
+
+        self.config.add_service("Svc1", "drive", self._tmpdir)
+        self.config.update_service("Svc1", {"sync_provider": "nativo", "sync_interval": 0})
+
+        stop_event = threading.Event()
+
+        def raising_do_sync(_svc):
+            stop_event.set()
+            raise ValueError("disk quota exceeded")
+
+        with patch.object(native, "_do_sync", side_effect=raising_do_sync), \
+             patch.object(stop_event, "wait", side_effect=lambda **_: None):
+            native._sync_loop("Svc1", stop_event)
+
+        # Both the specific error and the generic summary must be emitted
+        self.assertTrue(
+            any("disk quota exceeded" in msg for msg in errors),
+            f"Specific exception detail must appear; got: {errors}"
+        )
+        self.assertTrue(
+            any("Fallo en el ciclo" in msg for msg in errors),
+            f"Generic summary must also appear; got: {errors}"
+        )
+
+    def test_gdrive_list_files_logs_when_token_invalid(self):
+        """GoogleDriveProvider.list_files must log via _logger when
+        ensure_valid_token() returns False (previously a silent failure that
+        caused 'Error en sincronización' with nothing in the Errores panel)."""
+        from src.native.native_sync_manager import GoogleDriveProvider
+
+        logged: list = []
+        provider = GoogleDriveProvider("remote1", logger=lambda msg: logged.append(msg))
+
+        with patch.object(provider, "ensure_valid_token", return_value=False):
+            result = provider.list_files("/MyFolder")
+
+        self.assertEqual(result, {}, "list_files must return empty dict on invalid token")
+        self.assertTrue(
+            any("❌" in msg and "token" in msg.lower() for msg in logged),
+            f"list_files must log a ❌ token error; got: {logged}"
+        )
+
+    def test_do_sync_wraps_makedirs_error(self):
+        """When os.makedirs raises (e.g. FileExistsError when a file already
+        occupies the path that Drive has as a folder), _do_sync must catch the
+        error, emit it via on_error, and count it as a sync error — NOT crash
+        the thread silently."""
+        from src.native.native_sync_manager import NativeSyncManager
+
+        native = NativeSyncManager(self.config)
+        errors: list = []
+        native.on_error = lambda svc, msg: errors.append(msg)
+        native.on_api_call = lambda svc, msg: None
+        native.on_file_synced = lambda svc, fp, synced: None
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            svc = {
+                "name": "GDriveTest",
+                "platform": "drive",
+                "remote_name": "gdrive",
+                "local_path": tmpdir,
+                "remote_path": "/",
+            }
+
+            # Remote has a directory "docs/"; local has a FILE named "docs"
+            # so os.makedirs would raise FileExistsError
+            mock_provider = MagicMock()
+            mock_provider.is_authenticated.return_value = True
+            mock_provider.list_files.return_value = {
+                "docs": {"id": "dir_id", "is_dir": True, "mtime": 0.0, "size": 0},
+            }
+
+            # Create a file at the path where makedirs would try to create a dir
+            conflict_path = os.path.join(tmpdir, "docs")
+            with open(conflict_path, "w") as f:
+                f.write("I am a file, not a directory")
+
+            with patch.object(native, "_get_provider", return_value=mock_provider), \
+                 patch("shutil.disk_usage") as mock_du:
+                mock_du.return_value = MagicMock(free=20 * 1024 * 1024 * 1024)
+                result = native._do_sync(svc)
+
+        # Must report failure (makedirs error → errors > 0)
+        self.assertFalse(result, "_do_sync must return False when makedirs fails")
+        # Must emit an actionable error message
+        self.assertTrue(
+            any("docs" in msg for msg in errors),
+            f"Error message must mention the failing path; got: {errors}"
+        )
 
 
 if __name__ == "__main__":

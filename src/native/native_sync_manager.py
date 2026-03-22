@@ -726,6 +726,11 @@ class GoogleDriveProvider:
         and listing all descendants recursively.
         """
         if not self.ensure_valid_token():
+            if self._logger:
+                self._logger(
+                    "❌ list_files: token inválido o expirado — "
+                    "necesita re-autenticación"
+                )
             return {}
         root_id = self._get_folder_id(remote_path) or "root"
         return self._list_folder_recursive(root_id, "")
@@ -1238,7 +1243,15 @@ class NativeSyncManager:
                 service_name, "Sincronizando…" if is_first else "Actualizando cambios…"
             )
 
-            success = self._do_sync(svc)
+            try:
+                success = self._do_sync(svc)
+            except Exception as exc:
+                self._emit_error(
+                    service_name,
+                    f"❌ Error inesperado en sincronización ({type(exc).__name__}): {exc}",
+                )
+                success = False
+
             if success:
                 if is_first:
                     self._config.update_service(service_name, {"first_sync_done": True})
@@ -1318,7 +1331,11 @@ class NativeSyncManager:
             if remote_info and remote_info.get("is_dir"):
                 # Ensure local directory exists
                 local_dir = os.path.join(local_path, rel.replace("/", os.sep))
-                os.makedirs(local_dir, exist_ok=True)
+                try:
+                    os.makedirs(local_dir, exist_ok=True)
+                except OSError as exc:
+                    self._emit_error(name, f"Error al crear directorio local '{rel}': {exc}")
+                    errors += 1
                 continue
 
             if local_info and local_info.get("is_dir"):
