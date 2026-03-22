@@ -440,6 +440,8 @@ class OneDriveProvider:
     def upload_file(self, local_path: str, remote_path: str, rel_path: str) -> bool:
         """Upload a local file to OneDrive. Returns True on success."""
         if not self.ensure_valid_token():
+            if self._logger:
+                self._logger("❌ upload_file: token inválido o expirado — necesita re-autenticación")
             return False
         rp = remote_path.strip("/")
         drive_path = f"{rp}/{rel_path}".lstrip("/")
@@ -517,6 +519,8 @@ class OneDriveProvider:
     def download_file(self, item_id: str, local_path: str) -> bool:
         """Download a Drive item to *local_path*. Returns True on success."""
         if not self.ensure_valid_token():
+            if self._logger:
+                self._logger("❌ download_file: token inválido o expirado — necesita re-autenticación")
             return False
         url = f"{_GRAPH_URL}/me/drive/items/{item_id}/content"
         status, body = _http_request(
@@ -1343,6 +1347,8 @@ class NativeSyncManager:
         except Exception as exc:
             self._emit_error(service_name, f"Error al subir '{rel}' ({type(exc).__name__}): {exc}")
             return False
+        if not ok:
+            self._emit_error(service_name, f"❌ No se pudo subir '{rel}'")
         if ok and self.on_file_synced:
             self.on_file_synced(service_name, rel, True)
         return ok
@@ -1361,6 +1367,8 @@ class NativeSyncManager:
         except Exception as exc:
             self._emit_error(service_name, f"Error al descargar '{rel}' ({type(exc).__name__}): {exc}")
             return False
+        if not ok:
+            self._emit_error(service_name, f"❌ No se pudo descargar '{rel}'")
         if ok and self.on_file_synced:
             self.on_file_synced(service_name, rel, True)
         return ok

@@ -5966,5 +5966,96 @@ class TestNativeLogging(unittest.TestCase):
         )
 
 
+    def test_download_emits_error_with_filename_on_false_return(self):
+        """When download_file returns False (non-exception), _download must call
+        _emit_error (on_error) with the human-readable filename so the user can
+        see which file failed in the Errores panel."""
+        from unittest.mock import MagicMock
+        from src.native.native_sync_manager import NativeSyncManager
+
+        native = NativeSyncManager(self.config)
+
+        errors: list = []
+        native.on_error = lambda svc, msg: errors.append((svc, msg))
+        native.on_api_call = lambda svc, msg: None  # ignore API log
+        native.on_file_synced = lambda svc, fp, synced: None
+
+        mock_provider = MagicMock()
+        mock_provider.download_file.return_value = False  # e.g., 401, token expired
+
+        result = native._download(
+            mock_provider, "ITEM_ID", "/tmp/f.txt", "deep/folder/file.jpg", "svc1"
+        )
+
+        self.assertFalse(result, "_download must propagate the False return")
+        self.assertTrue(len(errors) >= 1, "on_error must be called when download returns False")
+        # The error message must contain the filename so the user can identify it
+        combined = " ".join(msg for _, msg in errors)
+        self.assertIn("deep/folder/file.jpg", combined,
+                      "Error message must contain the filename for user visibility")
+
+    def test_upload_emits_error_with_filename_on_false_return(self):
+        """When upload_file returns False (non-exception), _upload must call
+        _emit_error (on_error) with the human-readable filename."""
+        from unittest.mock import MagicMock
+        from src.native.native_sync_manager import NativeSyncManager
+
+        native = NativeSyncManager(self.config)
+
+        errors: list = []
+        native.on_error = lambda svc, msg: errors.append((svc, msg))
+        native.on_api_call = lambda svc, msg: None
+        native.on_file_synced = lambda svc, fp, synced: None
+
+        mock_provider = MagicMock()
+        mock_provider.upload_file.return_value = False  # e.g., 403, conflict
+
+        result = native._upload(
+            mock_provider, "/tmp/f.txt", "remote/", "docs/report.pdf", "svc1"
+        )
+
+        self.assertFalse(result, "_upload must propagate the False return")
+        self.assertTrue(len(errors) >= 1, "on_error must be called when upload returns False")
+        combined = " ".join(msg for _, msg in errors)
+        self.assertIn("docs/report.pdf", combined,
+                      "Error message must contain the filename for user visibility")
+
+    def test_onedrive_download_logs_when_token_invalid(self):
+        """OneDriveProvider.download_file must log via _logger when
+        ensure_valid_token() returns False (previously a silent failure)."""
+        from unittest.mock import patch
+        from src.native.native_sync_manager import OneDriveProvider
+
+        logged: list = []
+        provider = OneDriveProvider("remote1", logger=lambda msg: logged.append(msg))
+
+        with patch.object(provider, "ensure_valid_token", return_value=False):
+            result = provider.download_file("ITEM123", "/tmp/out.bin")
+
+        self.assertFalse(result)
+        self.assertTrue(len(logged) >= 1,
+                        "download_file must log when ensure_valid_token() returns False")
+        combined = " ".join(logged)
+        self.assertIn("❌", combined, "Log message must contain ❌ indicator")
+
+    def test_onedrive_upload_logs_when_token_invalid(self):
+        """OneDriveProvider.upload_file must log via _logger when
+        ensure_valid_token() returns False (previously a silent failure)."""
+        from unittest.mock import patch
+        from src.native.native_sync_manager import OneDriveProvider
+
+        logged: list = []
+        provider = OneDriveProvider("remote1", logger=lambda msg: logged.append(msg))
+
+        with patch.object(provider, "ensure_valid_token", return_value=False):
+            result = provider.upload_file("/tmp/f.txt", "remote/", "file.txt")
+
+        self.assertFalse(result)
+        self.assertTrue(len(logged) >= 1,
+                        "upload_file must log when ensure_valid_token() returns False")
+        combined = " ".join(logged)
+        self.assertIn("❌", combined, "Log message must contain ❌ indicator")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
