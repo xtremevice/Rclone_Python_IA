@@ -1066,14 +1066,21 @@ class ConfigWindow:
             self._reconnect_btn.pack(side=tk.LEFT)
 
     def _start_native_reauth(self) -> None:
-        """Re-run the native OAuth PKCE flow for this service."""
+        """Re-run the native OAuth flow for this service."""
         from src.native.native_sync_manager import NativeSyncManager
         if not hasattr(self, "_reconnect_status_var"):
             return
-        self._reconnect_status_var.set("Abriendo el navegador para re-autenticación…")
+        self._reconnect_status_var.set("Iniciando autenticación…")
         platform = self._svc.get("platform", "")
         remote_name = self._svc.get("remote_name", self._service_name)
         native = NativeSyncManager(self._config)
+
+        def on_user_code(user_code: str, verification_uri: str) -> None:
+            def _update() -> None:
+                self._reconnect_status_var.set(
+                    f"Ingresa el código {user_code!r} en el navegador abierto."
+                )
+            self._win.after(0, _update)
 
         def on_done(success: bool, error_msg: str) -> None:
             def _update() -> None:
@@ -1088,6 +1095,7 @@ class ConfigWindow:
             platform=platform,
             remote_name=remote_name,
             on_done=on_done,
+            on_user_code=on_user_code,
         )
 
     def _start_find_drive_id(self) -> None:

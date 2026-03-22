@@ -6,11 +6,12 @@ Supports the same key callback interface as RcloneManager so that the rest
 of the application can delegate to this class transparently for services
 whose ``sync_provider`` config field is set to ``"nativo"``.
 
-OAuth 2.0 PKCE flow:
-  * OneDrive – Microsoft Graph API (no client_secret needed for PKCE).
-  * Google Drive – Google Drive API v3 (client_secret required for installed
-    apps; uses rclone's publicly registered client credentials which are
-    available under the Apache 2.0 licence in the rclone source tree).
+OAuth 2.0 authentication:
+  * OneDrive – Device Code Flow (RFC 8628).  Microsoft returns a short
+    ``user_code``; the user enters it at ``https://microsoft.com/devicelogin``.
+    No ``client_secret`` or PKCE needed for this public-client flow.
+  * Google Drive – Authorization Code + PKCE flow with a local callback server.
+    Uses rclone's publicly registered client credentials (Apache 2.0 licence).
 
 Tokens are stored as JSON files in the application config directory:
   ``~/.config/RclonePythonIA/native_token_<remote_name>.json``
@@ -40,6 +41,9 @@ _ONEDRIVE_CLIENT_ID = "b15665d9-eda6-4092-8539-0eec376afd59"
 _ONEDRIVE_SCOPES = "Files.ReadWrite offline_access"
 _ONEDRIVE_AUTH_URL = "https://login.microsoftonline.com/common/oauth2/v2.0/authorize"
 _ONEDRIVE_TOKEN_URL = "https://login.microsoftonline.com/common/oauth2/v2.0/token"
+# Device Code endpoint (RFC 8628) – used instead of Auth Code + PKCE for OneDrive.
+# Works for public clients without requiring a client_secret or PKCE.
+_ONEDRIVE_DEVICE_CODE_URL = "https://login.microsoftonline.com/common/oauth2/v2.0/devicecode"
 _GRAPH_URL = "https://graph.microsoft.com/v1.0"
 
 # ── Google Drive / Google API ─────────────────────────────────────────────────
@@ -270,49 +274,6 @@ class OneDriveProvider:
         self._logger = logger
 
     # ── Auth ──────────────────────────────────────────────────────────
-
-    @staticmethod
-    def build_auth_url(redirect_uri: str, verifier: str) -> str:
-        """Return the Microsoft identity platform authorisation URL (PKCE).
-
-        The rclone public client (b15665d9-…) is registered as a public
-        client that supports PKCE.  Microsoft identity platform requires
-        PKCE (code_challenge / code_verifier) for public clients on the
-        ``/common`` tenant; omitting it causes ``invalid_client`` (401).
-        """
-        challenge = _pkce_challenge(verifier)
-        params = {
-            "client_id": _ONEDRIVE_CLIENT_ID,
-            "response_type": "code",
-            "redirect_uri": redirect_uri,
-            "scope": _ONEDRIVE_SCOPES,
-            "code_challenge": challenge,
-            "code_challenge_method": "S256",
-            "prompt": "select_account",
-        }
-        return f"{_ONEDRIVE_AUTH_URL}?{urllib.parse.urlencode(params)}"
-
-    def exchange_code(self, code: str, redirect_uri: str, verifier: str) -> bool:
-        """Exchange an authorisation code for access+refresh tokens (PKCE)."""
-        resp = _post_form(
-            _ONEDRIVE_TOKEN_URL,
-            {
-                "client_id": _ONEDRIVE_CLIENT_ID,
-                "code": code,
-                "redirect_uri": redirect_uri,
-                "grant_type": "authorization_code",
-                "code_verifier": verifier,
-            },
-            logger=self._logger,
-        )
-        if "access_token" not in resp:
-            if self._logger:
-                self._logger(f"❌ exchange_code falló: {resp.get('error', resp)}")
-            return False
-        resp["obtained_at"] = time.time()
-        self._token = resp
-        save_token(self._remote_name, resp)
-        return True
 
     def _refresh_token(self) -> bool:
         """Use the refresh_token to obtain a new access_token."""
@@ -1022,22 +983,140 @@ class NativeSyncManager:
         remote_name: str,
         on_done: Optional[Callable[[bool, str], None]] = None,
         timeout: float = 120.0,
+        on_user_code: Optional[Callable[[str, str], None]] = None,
     ) -> None:
         """
-        Start the native OAuth PKCE flow for *service_name* in a background
-        thread.  Calls ``on_done(success: bool, error_msg: str)`` when done.
+        Start the native OAuth flow for *service_name* in a background thread.
+
+        For OneDrive the Device Code flow (RFC 8628) is used; the optional
+        *on_user_code* callback is invoked with ``(user_code, verification_uri)``
+        so the UI can display the short code before the browser opens.
+
+        Calls ``on_done(success: bool, error_msg: str)`` when complete.
         """
         def _run() -> None:
-            ok, msg = self._do_authenticate(platform, remote_name, timeout)
+            ok, msg = self._do_authenticate(platform, remote_name, timeout, on_user_code)
             if on_done:
                 on_done(ok, msg)
 
         threading.Thread(target=_run, daemon=True, name=f"native-auth-{service_name}").start()
 
     def _do_authenticate(
-        self, platform: str, remote_name: str, timeout: float
+        self,
+        platform: str,
+        remote_name: str,
+        timeout: float,
+        on_user_code: Optional[Callable[[str, str], None]] = None,
     ) -> Tuple[bool, str]:
-        """Perform the OAuth PKCE flow synchronously. Returns (success, error_msg)."""
+        """Dispatch the native OAuth flow based on *platform*.
+
+        OneDrive uses the Device Code flow (RFC 8628), which works for public
+        clients without requiring a ``client_secret`` or PKCE challenge.
+        Google Drive keeps the Authorization Code + PKCE flow.
+
+        Returns ``(success, error_msg)``.
+        """
+        if platform == "onedrive":
+            return self._do_onedrive_device_code_auth(remote_name, timeout, on_user_code)
+        elif platform == "drive":
+            return self._do_pkce_auth(remote_name, timeout)
+        else:
+            return False, f"Plataforma no compatible para autenticación nativa: {platform}"
+
+    def _do_onedrive_device_code_auth(
+        self,
+        remote_name: str,
+        timeout: float,
+        on_user_code: Optional[Callable[[str, str], None]] = None,
+    ) -> Tuple[bool, str]:
+        """Authenticate OneDrive via the Device Code flow (RFC 8628).
+
+        This flow is explicitly designed for public clients and does not require
+        a ``client_secret`` or a PKCE ``code_verifier``.  Microsoft returns a
+        short ``user_code`` that the user enters at ``verification_uri``; this
+        app opens the browser to that URI and polls the token endpoint until the
+        user completes authentication or the code expires.
+        """
+        # Step 1: Request device authorisation
+        try:
+            resp = _post_form(
+                _ONEDRIVE_DEVICE_CODE_URL,
+                {
+                    "client_id": _ONEDRIVE_CLIENT_ID,
+                    "scope": _ONEDRIVE_SCOPES,
+                },
+            )
+        except OSError as exc:
+            return False, f"Error de red al iniciar la autenticación: {exc}"
+
+        if "device_code" not in resp:
+            error = resp.get("error", "unknown")
+            desc = resp.get("error_description", "")
+            return False, f"Error al iniciar la autenticación: {error}" + (
+                f": {desc}" if desc else ""
+            )
+
+        device_code: str = resp["device_code"]
+        user_code: str = resp["user_code"]
+        verification_uri: str = resp.get("verification_uri", "https://microsoft.com/devicelogin")
+        # verification_uri_complete (if present) pre-fills the user_code in the browser.
+        verification_uri_complete: str = resp.get("verification_uri_complete", "")
+        interval: int = max(int(resp.get("interval", 5)), 5)
+        expires_in: int = int(resp.get("expires_in", 900))
+
+        # Step 2: Notify the caller so the UI can display the user_code.
+        if on_user_code:
+            on_user_code(user_code, verification_uri)
+
+        # Open the browser – prefer the complete URI so the code is pre-filled.
+        webbrowser.open(verification_uri_complete or verification_uri)
+
+        # Step 3: Poll the token endpoint until success, failure, or timeout.
+        deadline = time.monotonic() + min(timeout, float(expires_in))
+        while time.monotonic() < deadline:
+            time.sleep(interval)
+            try:
+                poll_resp = _post_form(
+                    _ONEDRIVE_TOKEN_URL,
+                    {
+                        "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+                        "client_id": _ONEDRIVE_CLIENT_ID,
+                        "device_code": device_code,
+                    },
+                )
+            except OSError as exc:
+                return False, f"Error de red al obtener el token: {exc}"
+
+            if "access_token" in poll_resp:
+                poll_resp["obtained_at"] = time.time()
+                save_token(remote_name, poll_resp)
+                return True, ""
+
+            error = poll_resp.get("error", "")
+            if error == "authorization_pending":
+                continue
+            elif error == "slow_down":
+                interval = min(interval + 5, 30)
+                continue
+            elif error in ("authorization_declined", "expired_token", "bad_verification_code"):
+                return False, f"Autenticación rechazada o caducada: {error}"
+            else:
+                desc = poll_resp.get("error_description", "")
+                return False, f"Error al obtener token: {error}" + (f": {desc}" if desc else "")
+
+        return False, "Tiempo de espera agotado. Por favor, inténtalo de nuevo."
+
+    def _do_pkce_auth(
+        self, remote_name: str, timeout: float
+    ) -> Tuple[bool, str]:
+        """Perform the OAuth Authorization Code + PKCE flow for Google Drive.
+
+        Starts a local HTTP server on a loopback port, opens the browser with
+        the PKCE-enhanced authorisation URL, waits for the redirect callback,
+        then exchanges the code for access + refresh tokens.
+
+        Returns ``(success, error_msg)``.
+        """
         # Find a free port for the local callback server
         port: Optional[int] = None
         server: Optional[_OAuthCallbackServer] = None
@@ -1056,26 +1135,17 @@ class NativeSyncManager:
         redirect_uri = f"http://localhost:{port}/"
         verifier = _pkce_verifier()
 
-        if platform == "onedrive":
-            auth_url = OneDriveProvider.build_auth_url(redirect_uri, verifier)
-        elif platform == "drive":
-            auth_url = GoogleDriveProvider.build_auth_url(redirect_uri, verifier)
-        else:
-            return False, f"Plataforma no compatible para autenticación nativa: {platform}"
-
+        auth_url = GoogleDriveProvider.build_auth_url(redirect_uri, verifier)
         webbrowser.open(auth_url)
 
         code = server.wait_for_code(timeout)
         if not code:
             return False, "Tiempo de espera agotado o autenticación cancelada."
 
-        # Exchange code for tokens – pass a logger so Microsoft error details
-        # are captured and returned to the caller instead of being silently dropped.
+        # Exchange code for tokens – pass a logger so error details are
+        # captured and returned to the caller instead of being silently dropped.
         auth_errors: List[str] = []
-        if platform == "onedrive":
-            provider: Any = OneDriveProvider(remote_name, logger=auth_errors.append)
-        else:
-            provider = GoogleDriveProvider(remote_name, logger=auth_errors.append)
+        provider: Any = GoogleDriveProvider(remote_name, logger=auth_errors.append)
 
         try:
             ok = provider.exchange_code(code, redirect_uri, verifier)
