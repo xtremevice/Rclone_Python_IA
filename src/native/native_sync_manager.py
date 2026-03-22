@@ -1014,6 +1014,25 @@ class NativeSyncManager:
                 self.on_api_call(service_name, msg)
         return _log
 
+    def _log_progress(self, service_name: str, msg: str) -> None:
+        """Emit a progress message to both output channels so the user can
+        follow sync stages and individual file operations in real time.
+
+        * **Errores panel** (``on_api_call``): every message appears here.
+          The ``🔗 API |`` prefix is added by the ``_on_native_api_call``
+          handler in ``main_window.py``, not here.
+        * **Left console** (``on_file_synced``): message appears as an ⏳ entry
+          in the service's file-history Listbox (the panel left of the tree).
+
+        The method is intentionally lightweight — it does not call
+        ``on_error`` so stage messages never duplicate in the Errores panel.
+        Both callbacks are guarded against ``None`` (no-op when not set).
+        """
+        if self.on_api_call:
+            self.on_api_call(service_name, msg)
+        if self.on_file_synced:
+            self.on_file_synced(service_name, msg, False)
+
     def _get_provider(self, svc: Dict):
         """Return an OneDriveProvider or GoogleDriveProvider for *svc*."""
         remote_name = svc.get("remote_name", svc.get("name", ""))
@@ -1242,15 +1261,25 @@ class NativeSyncManager:
             self._emit_error(name, "❌ Sin token de autenticación. Reconecta el servicio.")
             return False
 
+        # ── Stage 1: List remote files ────────────────────────────────────
+        self._log_progress(name, "📋 Obteniendo lista de archivos remotos…")
         try:
             remote_files = provider.list_files(remote_path)
         except Exception as exc:
             self._emit_error(name, f"Error al listar archivos remotos ({type(exc).__name__}): {exc}")
             return False
+        self._log_progress(name, f"📋 Lista remota: {len(remote_files)} elemento(s)")
 
+        # ── Stage 2: Scan local files ─────────────────────────────────────
+        self._log_progress(name, "🔍 Escaneando archivos locales…")
         local_files = _scan_local_files(local_path)
+        self._log_progress(name, f"🔍 Archivos locales: {len(local_files)} elemento(s)")
 
         all_paths = set(remote_files.keys()) | set(local_files.keys())
+
+        # ── Stage 3: Compare and sync ─────────────────────────────────────
+        if all_paths:
+            self._log_progress(name, f"⚙️ Comparando {len(all_paths)} ruta(s)…")
         errors = 0
 
         for rel in sorted(all_paths):
@@ -1308,6 +1337,7 @@ class NativeSyncManager:
         rel: str,
         service_name: str,
     ) -> bool:
+        self._log_progress(service_name, f"⬆️ Subiendo: '{rel}'")
         try:
             ok = provider.upload_file(abs_local, remote_path, rel)
         except Exception as exc:
@@ -1325,6 +1355,7 @@ class NativeSyncManager:
         rel: str,
         service_name: str,
     ) -> bool:
+        self._log_progress(service_name, f"⬇️ Descargando: '{rel}'")
         try:
             ok = provider.download_file(item_id, abs_local)
         except Exception as exc:

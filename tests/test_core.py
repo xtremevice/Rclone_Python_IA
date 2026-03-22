@@ -5820,6 +5820,151 @@ class TestNativeLogging(unittest.TestCase):
         self.assertIn("myremote", saved)
         self.assertEqual(saved["myremote"]["access_token"], "at_ok")
 
+    def test_log_progress_fires_both_callbacks(self):
+        """_log_progress must fire both on_api_call and on_file_synced."""
+        from src.native.native_sync_manager import NativeSyncManager
+
+        native = NativeSyncManager(self.config)
+
+        api_calls: list = []
+        file_events: list = []
+
+        native.on_api_call = lambda svc, msg: api_calls.append((svc, msg))
+        native.on_file_synced = lambda svc, fp, synced: file_events.append((svc, fp, synced))
+
+        native._log_progress("my_svc", "📋 test stage message")
+
+        self.assertEqual(len(api_calls), 1, "on_api_call must be fired once")
+        self.assertEqual(api_calls[0], ("my_svc", "📋 test stage message"))
+
+        self.assertEqual(len(file_events), 1, "on_file_synced must be fired once")
+        svc, fp, synced = file_events[0]
+        self.assertEqual(svc, "my_svc")
+        self.assertEqual(fp, "📋 test stage message")
+        self.assertFalse(synced, "stage messages must be emitted with synced=False")
+
+    def test_log_progress_safe_when_callbacks_none(self):
+        """_log_progress must not raise when callbacks are not set (None)."""
+        from src.native.native_sync_manager import NativeSyncManager
+
+        native = NativeSyncManager(self.config)
+        # Both callbacks remain None (the default)
+        try:
+            native._log_progress("svc", "some message")
+        except Exception as exc:
+            self.fail(f"_log_progress raised unexpectedly when callbacks are None: {exc}")
+
+    def test_download_logs_progress_before_transfer(self):
+        """_download must call _log_progress with the file path before starting
+        the actual HTTP transfer, so the filename appears in the console even
+        when the download fails (e.g., 401 errors)."""
+        from unittest.mock import MagicMock
+        from src.native.native_sync_manager import NativeSyncManager
+
+        native = NativeSyncManager(self.config)
+
+        logged: list = []
+        native.on_api_call = lambda svc, msg: logged.append(msg)
+        native.on_file_synced = lambda svc, fp, synced: logged.append((fp, synced))
+
+        mock_provider = MagicMock()
+        mock_provider.download_file.return_value = False  # simulate failure (e.g. 401)
+
+        native._download(mock_provider, "item_abc", "/tmp/test.txt", "folder/test.txt", "svc1")
+
+        # The progress message with the filename must appear before the download call
+        progress_msgs = [m for m in logged if isinstance(m, str) and "folder/test.txt" in m]
+        self.assertTrue(len(progress_msgs) >= 1,
+                        "A progress message with the filename must be logged before download")
+        self.assertTrue(any("⬇️" in m for m in progress_msgs),
+                        "Progress message must contain the ⬇️ indicator")
+        # The first logged entry must be the progress string (ordering check)
+        self.assertIsInstance(logged[0], str,
+                              "Progress log string must appear first in the log")
+        self.assertIn("folder/test.txt", logged[0])
+
+    def test_upload_logs_progress_before_transfer(self):
+        """_upload must call _log_progress with the file path before starting
+        the actual HTTP transfer, and the progress message must come before
+        the success notification."""
+        from unittest.mock import MagicMock
+        from src.native.native_sync_manager import NativeSyncManager
+
+        native = NativeSyncManager(self.config)
+
+        logged: list = []
+        native.on_api_call = lambda svc, msg: logged.append(msg)
+        native.on_file_synced = lambda svc, fp, synced: logged.append((fp, synced))
+
+        mock_provider = MagicMock()
+        mock_provider.upload_file.return_value = True
+
+        native._upload(mock_provider, "/tmp/test.txt", "remote/", "folder/test.txt", "svc1")
+
+        progress_msgs = [m for m in logged if isinstance(m, str) and "folder/test.txt" in m]
+        self.assertTrue(len(progress_msgs) >= 1,
+                        "A progress message with the filename must be logged before upload")
+        self.assertTrue(any("⬆️" in m for m in progress_msgs),
+                        "Progress message must contain the ⬆️ indicator")
+        # Progress string must precede success (synced=True) event
+        first_str_idx = next(i for i, m in enumerate(logged) if isinstance(m, str))
+        success_events = [(i, m) for i, m in enumerate(logged)
+                         if isinstance(m, tuple) and m[1] is True]
+        if success_events:
+            self.assertLess(first_str_idx, success_events[0][0],
+                            "Progress log must appear before the success file_synced event")
+
+    def test_do_sync_emits_stage_messages(self):
+        """_do_sync must emit stage-progress messages via _log_progress:
+        obtaining remote list, scanning local files, and comparing paths."""
+        import tempfile
+        import os
+        from unittest.mock import patch, MagicMock
+        from src.native.native_sync_manager import NativeSyncManager
+
+        native = NativeSyncManager(self.config)
+
+        stage_messages: list = []
+        native.on_api_call = lambda svc, msg: stage_messages.append(msg)
+        native.on_file_synced = lambda svc, fp, synced: None  # ignore file events
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            svc = {
+                "name": "test_onedrive",
+                "platform": "onedrive",
+                "remote_name": "testremote",
+                "local_path": tmpdir,
+                "remote_path": "/",
+            }
+
+            mock_provider = MagicMock()
+            mock_provider.is_authenticated.return_value = True
+            mock_provider.list_files.return_value = {}  # empty remote
+
+            with patch.object(native, "_get_provider", return_value=mock_provider), \
+                 patch("shutil.disk_usage") as mock_du:
+                mock_du.return_value = MagicMock(free=20 * 1024 * 1024 * 1024)  # 20 GiB
+                native._do_sync(svc)
+
+        # Verify the three key stage messages were emitted
+        self.assertTrue(
+            any("Obteniendo lista de archivos remotos" in m for m in stage_messages),
+            f"Expected 'Obteniendo lista' stage message, got: {stage_messages}",
+        )
+        self.assertTrue(
+            any("Escaneando archivos locales" in m for m in stage_messages),
+            f"Expected 'Escaneando archivos locales' stage message, got: {stage_messages}",
+        )
+        # The summary count messages must also be present
+        self.assertTrue(
+            any("Lista remota:" in m for m in stage_messages),
+            f"Expected 'Lista remota:' count message, got: {stage_messages}",
+        )
+        self.assertTrue(
+            any("Archivos locales:" in m for m in stage_messages),
+            f"Expected 'Archivos locales:' count message, got: {stage_messages}",
+        )
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
