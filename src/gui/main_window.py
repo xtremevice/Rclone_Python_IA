@@ -758,7 +758,8 @@ class MainWindow:
             )
 
         # ── Thread 2: remote metadata scan ─────────────────────────────────
-        def _remote_worker() -> None:
+        def _remote_worker_inner() -> None:
+            """Core remote-scan logic (always runs inside the semaphore context)."""
             scan_ts = datetime.now(timezone.utc).timestamp()
             remote_files, remote_error = rclone.list_remote_metadata(service_name)
             if remote_files is not None:
@@ -793,6 +794,26 @@ class MainWindow:
                     service_name, g, "remote", d
                 ),
             )
+
+        # Whether this is the first tree scan for the service.  First-time
+        # scans run at full concurrency (no semaphore); steady-state rescans
+        # share _tree_rescan_semaphore so at most _MAX_PARALLEL_RESCANS cloud
+        # connections are open simultaneously, reducing peak memory.
+        is_first_scan = not svc.get("first_tree_scan_done", False)
+
+        def _remote_worker() -> None:
+            if is_first_scan:
+                # Initial scan: run without waiting for the semaphore so the
+                # user sees their data as quickly as possible on first launch.
+                _remote_worker_inner()
+            else:
+                # Rescan: wait for a semaphore slot so at most
+                # _MAX_PARALLEL_RESCANS remote scans run concurrently.
+                _tree_rescan_semaphore.acquire()
+                try:
+                    _remote_worker_inner()
+                finally:
+                    _tree_rescan_semaphore.release()
 
         # ── Thread 3: merger — reads DB, computes statuses, updates tree ────
         def _merger_worker() -> None:
@@ -961,8 +982,9 @@ class MainWindow:
         """Called on the main thread after a tree check completes.
 
         Fills the tree widget, persists the snapshot to disk (so future
-        startups / refreshes can show it immediately), and schedules the next
-        automatic refresh.
+        startups / refreshes can show it immediately), schedules the next
+        automatic refresh, and records that the first tree scan has been
+        completed so subsequent rescans participate in the concurrency limit.
         """
         tree = self._file_trees.get(service_name)
         if tree is None:
@@ -973,6 +995,11 @@ class MainWindow:
         # never overwrites a good snapshot.
         _save_tree_cache(service_name, items)
         self._schedule_tree_refresh(service_name, len(items))
+        # Mark that the first tree scan has been completed so that the next
+        # rescan is subject to the parallel-scan semaphore limit.
+        svc = self._config.get_service(service_name)
+        if svc is not None and not svc.get("first_tree_scan_done", False):
+            self._config.update_service(service_name, {"first_tree_scan_done": True})
 
     def _update_thread_status(
         self, service_name: str, gen: int, thread_name: str, detail: str = ""
@@ -1479,6 +1506,14 @@ _MAX_TREE_DIRS = _MAX_TREE_FILES * 10
 # Minimum auto-refresh interval in seconds (hard floor to avoid hammering
 # the cloud API when a user sets an unreasonably low value).
 _MIN_REFRESH_INTERVAL_SECS = 30
+
+# Maximum number of background tree-scan sets (3 threads each) that may run
+# concurrently once a service has already completed its first tree scan.
+# First-time scans are always allowed to run at full capacity (no semaphore).
+# This prevents the application from opening too many simultaneous cloud-API
+# connections and consuming excessive memory when many services are active.
+_MAX_PARALLEL_RESCANS = 6
+_tree_rescan_semaphore = threading.Semaphore(_MAX_PARALLEL_RESCANS)
 
 # strftime format used for "last scan started" and "next scan" labels.
 _SCAN_TIME_FMT = "%H:%M:%S"

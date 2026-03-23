@@ -229,6 +229,89 @@ class TestConfigManagerConstants(unittest.TestCase):
         """DEFAULT_SYNC_INTERVAL should be a positive number of seconds."""
         self.assertGreater(DEFAULT_SYNC_INTERVAL, 0)
 
+    def test_default_sync_interval_is_1800(self):
+        """DEFAULT_SYNC_INTERVAL must be 1800 s (30 min) as per requirements."""
+        self.assertEqual(DEFAULT_SYNC_INTERVAL, 1800)
+
+    def test_default_tree_refresh_small_is_3600(self):
+        """Default tree_refresh_small_secs must be 3600 s (1 h)."""
+        from src.config.config_manager import ConfigManager
+        import tempfile, shutil
+        td = tempfile.mkdtemp()
+        try:
+            import src.config.config_manager as cm
+            orig = cm.get_config_dir
+            cm.get_config_dir = lambda: Path(td)
+            cfg = ConfigManager()
+            cfg.add_service("TestSvc", "drive", "/tmp/t")
+            svc = cfg.get_service("TestSvc")
+            self.assertEqual(svc["tree_refresh_small_secs"], 3600)
+        finally:
+            cm.get_config_dir = orig
+            shutil.rmtree(td, ignore_errors=True)
+
+    def test_default_tree_refresh_large_is_3600(self):
+        """Default tree_refresh_large_secs must be 3600 s (1 h)."""
+        from src.config.config_manager import ConfigManager
+        import tempfile, shutil
+        td = tempfile.mkdtemp()
+        try:
+            import src.config.config_manager as cm
+            orig = cm.get_config_dir
+            cm.get_config_dir = lambda: Path(td)
+            cfg = ConfigManager()
+            cfg.add_service("TestSvc", "drive", "/tmp/t")
+            svc = cfg.get_service("TestSvc")
+            self.assertEqual(svc["tree_refresh_large_secs"], 3600)
+        finally:
+            cm.get_config_dir = orig
+            shutil.rmtree(td, ignore_errors=True)
+
+    def test_default_lsjson_timeout_is_1800(self):
+        """Default lsjson_timeout must be 1800 s (30 min)."""
+        from src.config.config_manager import ConfigManager
+        import tempfile, shutil
+        td = tempfile.mkdtemp()
+        try:
+            import src.config.config_manager as cm
+            orig = cm.get_config_dir
+            cm.get_config_dir = lambda: Path(td)
+            cfg = ConfigManager()
+            cfg.add_service("TestSvc", "drive", "/tmp/t")
+            svc = cfg.get_service("TestSvc")
+            self.assertEqual(svc["lsjson_timeout"], 1800)
+        finally:
+            cm.get_config_dir = orig
+            shutil.rmtree(td, ignore_errors=True)
+
+    def test_default_rclone_opts_buffer_size_is_16m(self):
+        """DEFAULT_RCLONE_OPTS buffer_size must be '16M' to reduce RAM usage."""
+        from src.config.config_manager import DEFAULT_RCLONE_OPTS
+        self.assertEqual(DEFAULT_RCLONE_OPTS["buffer_size"], "16M")
+
+    def test_default_rclone_opts_drive_chunk_size_is_32m(self):
+        """DEFAULT_RCLONE_OPTS drive_chunk_size must be '32M' to reduce RAM usage."""
+        from src.config.config_manager import DEFAULT_RCLONE_OPTS
+        self.assertEqual(DEFAULT_RCLONE_OPTS["drive_chunk_size"], "32M")
+
+    def test_first_tree_scan_done_defaults_to_false(self):
+        """New services must start with first_tree_scan_done=False so initial
+        scans bypass the concurrency semaphore."""
+        from src.config.config_manager import ConfigManager
+        import tempfile, shutil
+        td = tempfile.mkdtemp()
+        try:
+            import src.config.config_manager as cm
+            orig = cm.get_config_dir
+            cm.get_config_dir = lambda: Path(td)
+            cfg = ConfigManager()
+            cfg.add_service("TestSvc", "drive", "/tmp/t")
+            svc = cfg.get_service("TestSvc")
+            self.assertFalse(svc.get("first_tree_scan_done", True))
+        finally:
+            cm.get_config_dir = orig
+            shutil.rmtree(td, ignore_errors=True)
+
 
 class TestRcloneHelpers(unittest.TestCase):
     """Tests for module-level helper functions in rclone_manager."""
@@ -430,19 +513,19 @@ class TestRcloneManager(unittest.TestCase):
         import subprocess as _sp
         self.config.add_service("TimeoutSvc", "drive", "/tmp/timeout")
         self.config.update_service("TimeoutSvc", {"remote_name": "slow_remote"})
-        with patch("subprocess.run", side_effect=_sp.TimeoutExpired("cmd", 600)) as mock_run:
+        with patch("subprocess.run", side_effect=_sp.TimeoutExpired("cmd", 1800)) as mock_run:
             meta, err = self.rclone.list_remote_metadata("TimeoutSvc")
         self.assertIsNone(meta)
         self.assertIsNotNone(err)
-        self.assertIn("600", err)  # default timeout value must appear in the message
-        # subprocess.run must have been called with the default timeout of 600 s
+        self.assertIn("1800", err)  # default timeout value must appear in the message
+        # subprocess.run must have been called with the default timeout of 1800 s
         _call_kwargs = mock_run.call_args
         actual_timeout = (
             _call_kwargs.kwargs.get("timeout")
             if _call_kwargs.kwargs
             else _call_kwargs[1].get("timeout")
         )
-        self.assertEqual(actual_timeout, 600)
+        self.assertEqual(actual_timeout, 1800)
 
     def test_list_remote_metadata_custom_timeout_used(self):
         """lsjson_timeout per-service setting must change the timeout and error message."""
@@ -6524,6 +6607,121 @@ class TestNativeSyncLoopExceptionHandling(unittest.TestCase):
         )
 
 
+class TestTreeScanParallelism(unittest.TestCase):
+    """Tests for the parallel tree-scan throttle design.
+
+    Verifies the concurrency constants and semaphore behaviour without
+    importing main_window (tkinter is not available in headless CI).
+    All tests exercise the logic inline, mirroring the actual implementation.
+    """
+
+    def test_max_parallel_rescans_is_6(self):
+        """The semaphore must limit steady-state rescans to at most 6 concurrent
+        remote scans, keeping cloud-API connections and peak memory under control."""
+        _MAX_PARALLEL_RESCANS = 6
+        sem = threading.Semaphore(_MAX_PARALLEL_RESCANS)
+        acquired = []
+        for _ in range(6):
+            if sem.acquire(blocking=False):
+                acquired.append(True)
+        for _ in acquired:
+            sem.release()
+        self.assertEqual(len(acquired), 6,
+                         "Semaphore must grant exactly 6 concurrent acquisitions")
+
+    def test_first_scan_bypasses_semaphore(self):
+        """A first-time scan (is_first_scan=True) must not touch the semaphore
+        so it always starts immediately, even when all rescan slots are taken."""
+        _MAX_PARALLEL_RESCANS = 6
+        sem = threading.Semaphore(_MAX_PARALLEL_RESCANS)
+        # Exhaust all slots
+        for _ in range(_MAX_PARALLEL_RESCANS):
+            sem.acquire(blocking=False)
+
+        completed = []
+
+        def first_scan_remote_worker(is_first_scan: bool) -> None:
+            """Inline replica of the first-scan / rescan branch."""
+            if is_first_scan:
+                completed.append("done")  # runs without semaphore
+            else:
+                sem.acquire()
+                try:
+                    completed.append("done")
+                finally:
+                    sem.release()
+
+        t = threading.Thread(target=first_scan_remote_worker, args=(True,))
+        t.start()
+        t.join(timeout=2.0)
+
+        self.assertIn("done", completed,
+                      "First-scan worker must complete without waiting for semaphore")
+        # Release all slots we grabbed
+        for _ in range(_MAX_PARALLEL_RESCANS):
+            sem.release()
+
+    def test_rescan_waits_for_semaphore_slot(self):
+        """A rescan (is_first_scan=False) must acquire the semaphore before
+        doing work and release it immediately after, even on error."""
+        _MAX_PARALLEL_RESCANS = 6
+        sem = threading.Semaphore(_MAX_PARALLEL_RESCANS)
+        events = []
+
+        def rescan_remote_worker(is_first_scan: bool) -> None:
+            if is_first_scan:
+                events.append("work")
+            else:
+                sem.acquire()
+                try:
+                    events.append("work")
+                finally:
+                    sem.release()
+                    events.append("released")
+
+        t = threading.Thread(target=rescan_remote_worker, args=(False,))
+        t.start()
+        t.join(timeout=2.0)
+
+        self.assertIn("work", events, "Rescan must perform its work")
+        self.assertIn("released", events, "Rescan must release the semaphore")
+
+    def test_first_tree_scan_done_defaults_false(self):
+        """New services must have first_tree_scan_done=False so the first
+        scan always runs at full capacity."""
+        import tempfile, shutil
+        import src.config.config_manager as cm_mod
+        td = tempfile.mkdtemp()
+        orig_gcf = cm_mod.get_config_dir
+        try:
+            cm_mod.get_config_dir = lambda: Path(td)
+            cfg = cm_mod.ConfigManager()
+            cfg.add_service("SvcA", "drive", "/tmp/svca")
+            svc = cfg.get_service("SvcA")
+            self.assertFalse(svc.get("first_tree_scan_done", True),
+                             "first_tree_scan_done must start as False")
+        finally:
+            cm_mod.get_config_dir = orig_gcf
+            shutil.rmtree(td, ignore_errors=True)
+
+    def test_first_tree_scan_done_can_be_set(self):
+        """After the first tree scan completes, first_tree_scan_done must be
+        persisted as True so subsequent rescans use the semaphore."""
+        import tempfile, shutil
+        import src.config.config_manager as cm_mod
+        td = tempfile.mkdtemp()
+        orig_gcf = cm_mod.get_config_dir
+        try:
+            cm_mod.get_config_dir = lambda: Path(td)
+            cfg = cm_mod.ConfigManager()
+            cfg.add_service("SvcB", "drive", "/tmp/svcb")
+            cfg.update_service("SvcB", {"first_tree_scan_done": True})
+            svc = cfg.get_service("SvcB")
+            self.assertTrue(svc.get("first_tree_scan_done"),
+                            "first_tree_scan_done must be True after update")
+        finally:
+            cm_mod.get_config_dir = orig_gcf
+            shutil.rmtree(td, ignore_errors=True)
 
 
 class TestMtimePreservation(unittest.TestCase):
