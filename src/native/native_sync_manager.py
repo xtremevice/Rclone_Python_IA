@@ -202,6 +202,78 @@ def delete_token(remote_name: str) -> None:
         pass
 
 
+# ── Sync work-queue cache (resume support) ────────────────────────────────────
+# When a sync cycle is interrupted mid-way (e.g. network drop, app restart),
+# the next cycle normally re-lists all remote files from scratch – a slow
+# operation that can involve hundreds of API round-trips for large drives.
+#
+# The work-queue cache avoids this by persisting the remote file listing and
+# the set of files already transferred to disk.  On the next cycle the cache
+# is reused if it is still fresh (within _SYNC_CACHE_TTL_SECS), allowing the
+# sync to resume exactly where it left off without any extra API calls.
+#
+# The cache is deleted once the full sync cycle completes successfully, so
+# subsequent cycles always start with a fresh listing.
+
+# How many seconds a sync work-queue cache remains valid for resume purposes.
+_SYNC_CACHE_TTL_SECS = 4 * 3600  # 4 hours
+
+
+def _sync_cache_path(remote_name: str) -> Path:
+    """Return the path of the persistent sync work-queue cache file."""
+    safe = remote_name.replace("/", "_").replace("\\", "_")
+    return get_config_dir() / f"native_sync_cache_{safe}.json"
+
+
+def _load_sync_cache(remote_name: str, remote_path: str) -> Optional[Dict]:
+    """Load a previously saved sync work-queue cache if it is still valid.
+
+    Returns the cache dict when:
+    * the file exists and is valid JSON,
+    * ``created_at`` is within ``_SYNC_CACHE_TTL_SECS``, and
+    * ``remote_path`` matches the current remote path.
+
+    Returns ``None`` in all other cases (no cache, expired, wrong path,
+    corrupt file).
+    """
+    path = _sync_cache_path(remote_name)
+    if not path.exists():
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (json.JSONDecodeError, OSError):
+        return None
+    if data.get("remote_path") != remote_path:
+        return None
+    age = time.time() - data.get("created_at", 0.0)
+    if age > _SYNC_CACHE_TTL_SECS:
+        return None
+    return data
+
+
+def _save_sync_cache(remote_name: str, data: Dict) -> None:
+    """Persist the sync work-queue cache to disk.
+
+    Failures are silently ignored — the worst outcome is that the next sync
+    cycle re-lists the remote files rather than resuming.
+    """
+    path = _sync_cache_path(remote_name)
+    try:
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, separators=(",", ":"))
+    except OSError:
+        pass
+
+
+def _delete_sync_cache(remote_name: str) -> None:
+    """Remove the sync work-queue cache after a successful full sync cycle."""
+    try:
+        _sync_cache_path(remote_name).unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 # ── HTTP helpers ──────────────────────────────────────────────────────────────
 
 def _http_request(
@@ -1330,15 +1402,23 @@ class NativeSyncManager:
 
         Algorithm (mirrors rclone bisync behaviour):
           1. Check local free space.
-          2. List remote files with mtimes.
+          2. List remote files with mtimes (or resume from a work-queue cache).
           3. Scan local files with mtimes.
           4. Upload local-only files and local-modified files.
           5. Download remote-only files and remote-modified files.
           6. Create missing local directories.
+
+        Resume support:
+          If a previous sync cycle was interrupted the remote file listing is
+          saved in a work-queue cache (``_save_sync_cache``).  The next cycle
+          loads the cache instead of re-listing the remote, then skips any
+          files that were already transferred successfully.  The cache is
+          deleted once the full cycle completes without errors.
         """
         name = svc.get("name", "?")
         local_path = svc.get("local_path", "")
         remote_path = svc.get("remote_path", "/")
+        remote_name = svc.get("remote_name", svc.get("name", name))
 
         # Free-space guard
         try:
@@ -1362,14 +1442,32 @@ class NativeSyncManager:
             self._emit_error(name, "❌ Sin token de autenticación. Reconecta el servicio.")
             return False
 
-        # ── Stage 1: List remote files ────────────────────────────────────
-        self._log_progress(name, "📋 Obteniendo lista de archivos remotos…")
-        try:
-            remote_files = provider.list_files(remote_path)
-        except Exception as exc:
-            self._emit_error(name, f"Error al listar archivos remotos ({type(exc).__name__}): {exc}")
-            return False
-        self._log_progress(name, f"📋 Lista remota: {len(remote_files)} elemento(s)")
+        # ── Stage 1: List remote files (or resume from work-queue cache) ──
+        queue_cache = _load_sync_cache(remote_name, remote_path)
+        if queue_cache is not None:
+            remote_files = queue_cache["remote_files"]
+            completed = set(queue_cache.get("completed", []))
+            self._log_progress(
+                name,
+                f"♻️ Reanudando sincronización desde caché: "
+                f"{len(remote_files)} elemento(s), {len(completed)} ya completado(s).",
+            )
+        else:
+            self._log_progress(name, "📋 Obteniendo lista de archivos remotos…")
+            try:
+                remote_files = provider.list_files(remote_path)
+            except Exception as exc:
+                self._emit_error(name, f"Error al listar archivos remotos ({type(exc).__name__}): {exc}")
+                return False
+            self._log_progress(name, f"📋 Lista remota: {len(remote_files)} elemento(s)")
+            completed = set()
+            queue_cache = {
+                "created_at": time.time(),
+                "remote_path": remote_path,
+                "remote_files": remote_files,
+                "completed": [],
+            }
+            _save_sync_cache(remote_name, queue_cache)
 
         # ── Stage 2: Scan local files ─────────────────────────────────────
         self._log_progress(name, "🔍 Escaneando archivos locales…")
@@ -1384,6 +1482,11 @@ class NativeSyncManager:
         errors = 0
 
         for rel in sorted(all_paths):
+            # Skip files that were already successfully transferred in a
+            # previous (interrupted) run of this same sync cycle.
+            if rel in completed:
+                continue
+
             remote_info = remote_files.get(rel)
             local_info = local_files.get(rel)
 
@@ -1410,7 +1513,11 @@ class NativeSyncManager:
             if local_info and not remote_info:
                 # Local only → upload
                 ok = self._upload(provider, abs_local, remote_path, rel, name)
-                if not ok:
+                if ok:
+                    completed.add(rel)
+                    queue_cache["completed"] = list(completed)
+                    _save_sync_cache(remote_name, queue_cache)
+                else:
                     errors += 1
             elif remote_info and not local_info:
                 # Remote only → download
@@ -1418,7 +1525,11 @@ class NativeSyncManager:
                     provider, remote_info["id"], abs_local, rel, name,
                     remote_mtime=remote_info.get("mtime"),
                 )
-                if not ok:
+                if ok:
+                    completed.add(rel)
+                    queue_cache["completed"] = list(completed)
+                    _save_sync_cache(remote_name, queue_cache)
+                else:
                     errors += 1
             elif local_info and remote_info:
                 # Both exist → compare mtimes
@@ -1433,8 +1544,15 @@ class NativeSyncManager:
                             provider, remote_info["id"], abs_local, rel, name,
                             remote_mtime=remote_mtime,
                         )
-                    if not ok:
+                    if ok:
+                        completed.add(rel)
+                        queue_cache["completed"] = list(completed)
+                        _save_sync_cache(remote_name, queue_cache)
+                    else:
                         errors += 1
+
+        if errors == 0:
+            _delete_sync_cache(remote_name)
 
         return errors == 0
 
