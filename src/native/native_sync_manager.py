@@ -594,9 +594,16 @@ class OneDriveProvider:
         quota = data.get("quota", {})
         used = quota.get("used", 0)
         total = quota.get("total", 0)
+        remaining = quota.get("remaining", None)
+        parts: list = []
         if total:
-            return f"Usado: {_human_size(used)} / {_human_size(total)}"
-        return f"Usado: {_human_size(used)}"
+            free = remaining if remaining is not None else max(0, total - used)
+            parts.append(f"Total: {_human_size(total)}")
+            parts.append(f"Usado: {_human_size(used)}")
+            parts.append(f"Libre: {_human_size(free)}")
+        else:
+            parts.append(f"Usado: {_human_size(used)}")
+        return "  |  ".join(parts)
 
 
 # ── Google Drive provider ─────────────────────────────────────────────────────
@@ -1041,9 +1048,15 @@ class GoogleDriveProvider:
         quota = json.loads(body).get("storageQuota", {})
         used = int(quota.get("usage", 0))
         limit = int(quota.get("limit", 0))
+        parts: list = []
         if limit:
-            return f"Usado: {_human_size(used)} / {_human_size(limit)}"
-        return f"Usado: {_human_size(used)}"
+            free = max(0, limit - used)
+            parts.append(f"Total: {_human_size(limit)}")
+            parts.append(f"Usado: {_human_size(used)}")
+            parts.append(f"Libre: {_human_size(free)}")
+        else:
+            parts.append(f"Usado: {_human_size(used)}")
+        return "  |  ".join(parts)
 
 
 # ── NativeSyncManager ─────────────────────────────────────────────────────────

@@ -5478,6 +5478,150 @@ class TestNativeSyncManagerHelpers(unittest.TestCase):
             shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+class TestNativeStorageInfoFormat(unittest.TestCase):
+    """Tests that get_storage_info() on native providers returns the
+    'Total: X  |  Usado: Y  |  Libre: Z' format expected by the UI label."""
+
+    def _make_gdrive_provider(self):
+        from src.native.native_sync_manager import GoogleDriveProvider
+        prov = GoogleDriveProvider.__new__(GoogleDriveProvider)
+        prov._remote_name = "test_gdrive"
+        prov._token = {"access_token": "tok", "obtained_at": time.time(), "expires_in": 3600}
+        prov._logger = None
+        # Bypass token refresh in unit tests
+        prov.ensure_valid_token = lambda: True
+        return prov
+
+    def _make_onedrive_provider(self):
+        from src.native.native_sync_manager import OneDriveProvider
+        prov = OneDriveProvider.__new__(OneDriveProvider)
+        prov._remote_name = "test_onedrive"
+        prov._token = {"access_token": "tok", "obtained_at": time.time(), "expires_in": 3600}
+        prov._logger = None
+        # Bypass token refresh in unit tests
+        prov.ensure_valid_token = lambda: True
+        return prov
+
+    def test_gdrive_storage_info_full_format(self):
+        """GoogleDriveProvider.get_storage_info must return
+        'Total: X  |  Usado: Y  |  Libre: Z' when limit is set."""
+        import json
+        from unittest.mock import patch
+        from src.native import native_sync_manager as nm_mod
+
+        prov = self._make_gdrive_provider()
+        response_body = json.dumps({
+            "storageQuota": {
+                "limit": str(100 * 1024 ** 3),   # 100 GiB
+                "usage": str(30 * 1024 ** 3),     # 30 GiB used
+            }
+        })
+
+        with patch.object(nm_mod, "_http_request", return_value=(200, response_body)):
+            result = prov.get_storage_info()
+
+        self.assertIsNotNone(result)
+        self.assertIn("Total:", result)
+        self.assertIn("Usado:", result)
+        self.assertIn("Libre:", result)
+        self.assertIn("  |  ", result)
+        # Free = 100 GiB - 30 GiB = 70 GiB
+        parts = [p.strip() for p in result.split("  |  ")]
+        self.assertEqual(len(parts), 3)
+
+    def test_gdrive_storage_info_no_limit(self):
+        """GoogleDriveProvider.get_storage_info must return at least 'Usado: X'
+        when the API doesn't return a limit (unlimited storage)."""
+        import json
+        from unittest.mock import patch
+        from src.native import native_sync_manager as nm_mod
+
+        prov = self._make_gdrive_provider()
+        response_body = json.dumps({
+            "storageQuota": {
+                "usage": str(5 * 1024 ** 3),  # 5 GiB used, no limit
+            }
+        })
+
+        with patch.object(nm_mod, "_http_request", return_value=(200, response_body)):
+            result = prov.get_storage_info()
+
+        self.assertIsNotNone(result)
+        self.assertIn("Usado:", result)
+
+    def test_gdrive_storage_info_free_is_correct(self):
+        """Libre = Total - Usado (computed by get_storage_info)."""
+        import json
+        from unittest.mock import patch
+        from src.native import native_sync_manager as nm_mod
+        from src.native.native_sync_manager import _human_size
+
+        total = 16 * 1024 ** 3    # 16 GiB
+        used  = 4 * 1024 ** 3     # 4 GiB
+        free  = total - used       # 12 GiB expected
+
+        prov = self._make_gdrive_provider()
+        response_body = json.dumps({
+            "storageQuota": {"limit": str(total), "usage": str(used)}
+        })
+
+        with patch.object(nm_mod, "_http_request", return_value=(200, response_body)):
+            result = prov.get_storage_info()
+
+        self.assertIsNotNone(result)
+        self.assertIn(_human_size(free), result,
+                      f"Expected free-space string '{_human_size(free)}' in '{result}'")
+        self.assertIn(_human_size(total), result)
+        self.assertIn(_human_size(used), result)
+
+    def test_onedrive_storage_info_full_format(self):
+        """OneDriveProvider.get_storage_info must return
+        'Total: X  |  Usado: Y  |  Libre: Z' when total is set."""
+        import json
+        from unittest.mock import patch
+        from src.native import native_sync_manager as nm_mod
+
+        prov = self._make_onedrive_provider()
+        total = 50 * 1024 ** 3
+        used  = 20 * 1024 ** 3
+        remaining = total - used
+        response_body = json.dumps({
+            "quota": {"total": total, "used": used, "remaining": remaining}
+        })
+
+        with patch.object(nm_mod, "_http_request", return_value=(200, response_body)):
+            result = prov.get_storage_info()
+
+        self.assertIsNotNone(result)
+        self.assertIn("Total:", result)
+        self.assertIn("Usado:", result)
+        self.assertIn("Libre:", result)
+        self.assertIn("  |  ", result)
+
+    def test_onedrive_storage_info_remaining_used_when_provided(self):
+        """OneDriveProvider should prefer 'remaining' from the API response
+        over computing total - used."""
+        import json
+        from unittest.mock import patch
+        from src.native import native_sync_manager as nm_mod
+        from src.native.native_sync_manager import _human_size
+
+        total = 100 * 1024 ** 3
+        used  = 35 * 1024 ** 3
+        # API reports a slightly different remaining (e.g. reserved space)
+        api_remaining = 60 * 1024 ** 3
+        response_body = json.dumps({
+            "quota": {"total": total, "used": used, "remaining": api_remaining}
+        })
+
+        prov = self._make_onedrive_provider()
+        with patch.object(nm_mod, "_http_request", return_value=(200, response_body)):
+            result = prov.get_storage_info()
+
+        self.assertIsNotNone(result)
+        self.assertIn(_human_size(api_remaining), result,
+                      "Libre should show the API-provided remaining value")
+
 
 # ===========================================================================
 # NativeSyncManager API-call logging tests
