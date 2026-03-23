@@ -30,15 +30,18 @@ def get_rclone_config_path() -> Path:
     return get_config_dir() / "rclone.conf"
 
 
-# Default sync interval in seconds (15 minutes)
-DEFAULT_SYNC_INTERVAL = 900
+# Default sync interval in seconds (30 minutes)
+DEFAULT_SYNC_INTERVAL = 1800
 
-# Default rclone options for transfers
+# Default rclone options for transfers.
+# Buffer and chunk sizes are kept deliberately modest (16 MiB / 32 MiB) to
+# reduce peak RAM usage: large values only help for sustained sequential I/O
+# but consume memory even when idle.
 DEFAULT_RCLONE_OPTS = {
     "transfers": 16,
     "checkers": 32,
-    "drive_chunk_size": "128M",
-    "buffer_size": "64M",
+    "drive_chunk_size": "32M",
+    "buffer_size": "16M",
     "vfs_cache_mode": "writes",
     "vfs_cache_max_size": "10G",
     # Maximum API transactions per second (0 = unlimited).  Set to a low value
@@ -56,6 +59,14 @@ DEFAULT_EXCLUSIONS = [PERSONAL_VAULT_PATTERN]
 # Number of files in the sync tree above which the "large directory" refresh
 # interval is used instead of the "small directory" one.
 TREE_FILE_THRESHOLD = 1000
+
+# Sync providers available when adding a service.
+# "rclone" is the default and uses rclone bisync.
+# "nativo" uses the platform's direct REST API (only OneDrive and Google Drive).
+SYNC_PROVIDERS = ["rclone", "nativo"]
+
+# Platforms that support the "nativo" (direct API) sync provider.
+NATIVE_SYNC_PLATFORMS = ["onedrive", "drive"]
 
 # Platforms supported by rclone that are offered in the wizard.
 # The first section lists the most commonly used cloud drives that were
@@ -267,7 +278,7 @@ class ConfigManager:
             # to list all remote files when refreshing the sync tree.  Remotes
             # with many files (hundreds of thousands) can take several minutes
             # to list; increase this value if scans are timing out.
-            "lsjson_timeout": 600,
+            "lsjson_timeout": 1800,
             # rclone mount: whether to run a persistent mount process
             "mount_enabled": False,
             # rclone mount: local directory used as the mount point
@@ -276,13 +287,21 @@ class ConfigManager:
             "vfs_read_chunk_size": "10M",
             # rclone mount: maximum VFS read chunk size
             "vfs_read_chunk_size_limit": "100M",
+            # Sync provider: "rclone" (default) or "nativo" (direct API for
+            # OneDrive and Google Drive only).
+            "sync_provider": "rclone",
             # Recent file sync history (list of dicts)
             "sync_history": [],
             # Sync-tree auto-refresh intervals (seconds).  When the tree has
             # fewer than TREE_FILE_THRESHOLD items, the small interval is used;
-            # otherwise the large one is used.
-            "tree_refresh_small_secs": 60,
-            "tree_refresh_large_secs": 600,
+            # otherwise the large one is used.  Both default to 1 hour (3600 s)
+            # so routine background scans do not constantly hit the cloud API.
+            "tree_refresh_small_secs": 3600,
+            "tree_refresh_large_secs": 3600,
+            # Set to True after the first successful tree scan completes.  Used
+            # by the parallel-scan throttle so that initial scans run at full
+            # concurrency while steady-state rescans share a global semaphore.
+            "first_tree_scan_done": False,
         }
 
     # ------------------------------------------------------------------

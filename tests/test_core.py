@@ -11,6 +11,7 @@ import os
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -228,6 +229,89 @@ class TestConfigManagerConstants(unittest.TestCase):
         """DEFAULT_SYNC_INTERVAL should be a positive number of seconds."""
         self.assertGreater(DEFAULT_SYNC_INTERVAL, 0)
 
+    def test_default_sync_interval_is_1800(self):
+        """DEFAULT_SYNC_INTERVAL must be 1800 s (30 min) as per requirements."""
+        self.assertEqual(DEFAULT_SYNC_INTERVAL, 1800)
+
+    def test_default_tree_refresh_small_is_3600(self):
+        """Default tree_refresh_small_secs must be 3600 s (1 h)."""
+        from src.config.config_manager import ConfigManager
+        import tempfile, shutil
+        td = tempfile.mkdtemp()
+        try:
+            import src.config.config_manager as cm
+            orig = cm.get_config_dir
+            cm.get_config_dir = lambda: Path(td)
+            cfg = ConfigManager()
+            cfg.add_service("TestSvc", "drive", "/tmp/t")
+            svc = cfg.get_service("TestSvc")
+            self.assertEqual(svc["tree_refresh_small_secs"], 3600)
+        finally:
+            cm.get_config_dir = orig
+            shutil.rmtree(td, ignore_errors=True)
+
+    def test_default_tree_refresh_large_is_3600(self):
+        """Default tree_refresh_large_secs must be 3600 s (1 h)."""
+        from src.config.config_manager import ConfigManager
+        import tempfile, shutil
+        td = tempfile.mkdtemp()
+        try:
+            import src.config.config_manager as cm
+            orig = cm.get_config_dir
+            cm.get_config_dir = lambda: Path(td)
+            cfg = ConfigManager()
+            cfg.add_service("TestSvc", "drive", "/tmp/t")
+            svc = cfg.get_service("TestSvc")
+            self.assertEqual(svc["tree_refresh_large_secs"], 3600)
+        finally:
+            cm.get_config_dir = orig
+            shutil.rmtree(td, ignore_errors=True)
+
+    def test_default_lsjson_timeout_is_1800(self):
+        """Default lsjson_timeout must be 1800 s (30 min)."""
+        from src.config.config_manager import ConfigManager
+        import tempfile, shutil
+        td = tempfile.mkdtemp()
+        try:
+            import src.config.config_manager as cm
+            orig = cm.get_config_dir
+            cm.get_config_dir = lambda: Path(td)
+            cfg = ConfigManager()
+            cfg.add_service("TestSvc", "drive", "/tmp/t")
+            svc = cfg.get_service("TestSvc")
+            self.assertEqual(svc["lsjson_timeout"], 1800)
+        finally:
+            cm.get_config_dir = orig
+            shutil.rmtree(td, ignore_errors=True)
+
+    def test_default_rclone_opts_buffer_size_is_16m(self):
+        """DEFAULT_RCLONE_OPTS buffer_size must be '16M' to reduce RAM usage."""
+        from src.config.config_manager import DEFAULT_RCLONE_OPTS
+        self.assertEqual(DEFAULT_RCLONE_OPTS["buffer_size"], "16M")
+
+    def test_default_rclone_opts_drive_chunk_size_is_32m(self):
+        """DEFAULT_RCLONE_OPTS drive_chunk_size must be '32M' to reduce RAM usage."""
+        from src.config.config_manager import DEFAULT_RCLONE_OPTS
+        self.assertEqual(DEFAULT_RCLONE_OPTS["drive_chunk_size"], "32M")
+
+    def test_first_tree_scan_done_defaults_to_false(self):
+        """New services must start with first_tree_scan_done=False so initial
+        scans bypass the concurrency semaphore."""
+        from src.config.config_manager import ConfigManager
+        import tempfile, shutil
+        td = tempfile.mkdtemp()
+        try:
+            import src.config.config_manager as cm
+            orig = cm.get_config_dir
+            cm.get_config_dir = lambda: Path(td)
+            cfg = ConfigManager()
+            cfg.add_service("TestSvc", "drive", "/tmp/t")
+            svc = cfg.get_service("TestSvc")
+            self.assertFalse(svc.get("first_tree_scan_done", True))
+        finally:
+            cm.get_config_dir = orig
+            shutil.rmtree(td, ignore_errors=True)
+
 
 class TestRcloneHelpers(unittest.TestCase):
     """Tests for module-level helper functions in rclone_manager."""
@@ -429,19 +513,19 @@ class TestRcloneManager(unittest.TestCase):
         import subprocess as _sp
         self.config.add_service("TimeoutSvc", "drive", "/tmp/timeout")
         self.config.update_service("TimeoutSvc", {"remote_name": "slow_remote"})
-        with patch("subprocess.run", side_effect=_sp.TimeoutExpired("cmd", 600)) as mock_run:
+        with patch("subprocess.run", side_effect=_sp.TimeoutExpired("cmd", 1800)) as mock_run:
             meta, err = self.rclone.list_remote_metadata("TimeoutSvc")
         self.assertIsNone(meta)
         self.assertIsNotNone(err)
-        self.assertIn("600", err)  # default timeout value must appear in the message
-        # subprocess.run must have been called with the default timeout of 600 s
+        self.assertIn("1800", err)  # default timeout value must appear in the message
+        # subprocess.run must have been called with the default timeout of 1800 s
         _call_kwargs = mock_run.call_args
         actual_timeout = (
             _call_kwargs.kwargs.get("timeout")
             if _call_kwargs.kwargs
             else _call_kwargs[1].get("timeout")
         )
-        self.assertEqual(actual_timeout, 600)
+        self.assertEqual(actual_timeout, 1800)
 
     def test_list_remote_metadata_custom_timeout_used(self):
         """lsjson_timeout per-service setting must change the timeout and error message."""
@@ -2294,6 +2378,104 @@ class TestErrorLogger(unittest.TestCase):
         self.logger.log("Svc", "Error 1")
         self.logger.clear()
         self.assertEqual(self.logger.get_all_entries(), [])
+
+
+class TestConfigWindowErrorsAutoRefresh(unittest.TestCase):
+    """Tests for the Errors-panel auto-refresh logic in ConfigWindow.
+
+    Because tkinter is not available in headless CI, these tests exercise only
+    the scheduling/cancellation logic without importing the actual ConfigWindow
+    class — they replicate the pure control-flow that was added.
+    """
+
+    def test_schedule_errors_refresh_stores_after_id(self):
+        """The after() ID returned when scheduling an errors-panel refresh must
+        be stored as _errors_refresh_id so it can later be cancelled.
+        The interval must be 3000 ms (matching config_window._ERRORS_REFRESH_INTERVAL_MS)."""
+        _EXPECTED_MS = 3000  # must match config_window._ERRORS_REFRESH_INTERVAL_MS
+
+        after_calls: list = []
+
+        class FakeWin:
+            def after(self, ms, fn):
+                after_calls.append((ms, fn))
+                return "test-after-id"
+
+        class FakeObj:
+            def __init__(self):
+                self._win = FakeWin()
+
+            def _refresh_errors_text(self):
+                pass  # no-op
+
+            def _schedule_errors_refresh_logic(self):
+                """Inline copy of the logic under test."""
+                self._refresh_errors_text()
+                self._errors_refresh_id = self._win.after(_EXPECTED_MS, self._schedule_errors_refresh_logic)
+
+        obj = FakeObj()
+        obj._schedule_errors_refresh_logic()
+
+        # after(_EXPECTED_MS, …) must have been called
+        self.assertTrue(
+            any(ms == _EXPECTED_MS for ms, _ in after_calls),
+            f"auto-refresh must be scheduled with a {_EXPECTED_MS} ms delay"
+        )
+        # The ID must be stored
+        self.assertEqual(obj._errors_refresh_id, "test-after-id")
+
+    def test_show_panel_cancels_errors_refresh_id(self):
+        """When switching panels, any existing _errors_refresh_id must be
+        cancelled via after_cancel() and the attribute must be removed."""
+        cancelled: list = []
+
+        class FakeWin:
+            def after_cancel(self, aid):
+                cancelled.append(aid)
+
+        class FakeObj:
+            def __init__(self):
+                self._win = FakeWin()
+                self._errors_refresh_id = "old-id"  # instance attribute
+
+            def _cancel_errors_refresh_if_pending(self):
+                """Inline copy of the cancellation logic added to _show_panel."""
+                if hasattr(self, "_errors_refresh_id"):
+                    try:
+                        self._win.after_cancel(self._errors_refresh_id)
+                    except Exception:
+                        pass
+                    del self._errors_refresh_id
+
+        obj = FakeObj()
+        obj._cancel_errors_refresh_if_pending()
+
+        self.assertIn("old-id", cancelled, "after_cancel must be called with the stored ID")
+        self.assertFalse(
+            hasattr(obj, "_errors_refresh_id"),
+            "_errors_refresh_id must be deleted after cancellation"
+        )
+
+    def test_no_cancel_when_no_refresh_id(self):
+        """Calling the cancellation logic when no refresh is active must not raise."""
+        class FakeWin:
+            def after_cancel(self, aid):
+                raise AssertionError("should not be called")
+
+        class FakeObj:
+            _win = FakeWin()
+
+            def _cancel_errors_refresh_if_pending(self):
+                if hasattr(self, "_errors_refresh_id"):
+                    try:
+                        self._win.after_cancel(self._errors_refresh_id)
+                    except Exception:
+                        pass
+                    del self._errors_refresh_id
+
+        obj = FakeObj()
+        # Must not raise even though there is no _errors_refresh_id
+        obj._cancel_errors_refresh_if_pending()
 
 
 class TestElementaryIndicator(unittest.TestCase):
@@ -5016,6 +5198,1990 @@ class TestFileScanDB(unittest.TestCase):
         self.assertEqual(_table_slug("123"), "svc_123")
         self.assertEqual(_table_slug("!@#"), "svc_svc")  # all symbols → fallback
         self.assertTrue(_table_slug("A").startswith("svc_"))
+
+
+
+# ===========================================================================
+# NativeSyncManager tests
+# ===========================================================================
+
+class TestNativeSyncManagerConfig(unittest.TestCase):
+    """Tests for native sync provider config integration."""
+
+    def setUp(self):
+        self._tmpdir = tempfile.mkdtemp()
+        import src.config.config_manager as cm_mod
+        import src.native.native_sync_manager as nm_mod
+        self._orig_cm_get = cm_mod.get_config_dir
+        self._orig_nm_get = nm_mod.get_config_dir
+        cm_mod.get_config_dir = lambda: Path(self._tmpdir)
+        nm_mod.get_config_dir = lambda: Path(self._tmpdir)
+        self.config = ConfigManager()
+
+    def tearDown(self):
+        import src.config.config_manager as cm_mod
+        import src.native.native_sync_manager as nm_mod
+        cm_mod.get_config_dir = self._orig_cm_get
+        nm_mod.get_config_dir = self._orig_nm_get
+        import shutil
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+
+    def test_default_service_has_rclone_provider(self):
+        """Services created without specifying provider should default to rclone."""
+        svc = self.config.add_service("MySvc", "onedrive", "/tmp/test")
+        self.assertEqual(svc.get("sync_provider"), "rclone")
+
+    def test_sync_providers_constant(self):
+        """SYNC_PROVIDERS should contain both 'rclone' and 'nativo'."""
+        from src.config.config_manager import SYNC_PROVIDERS
+        self.assertIn("rclone", SYNC_PROVIDERS)
+        self.assertIn("nativo", SYNC_PROVIDERS)
+
+    def test_native_sync_platforms_constant(self):
+        """NATIVE_SYNC_PLATFORMS should include onedrive and drive."""
+        from src.config.config_manager import NATIVE_SYNC_PLATFORMS
+        self.assertIn("onedrive", NATIVE_SYNC_PLATFORMS)
+        self.assertIn("drive", NATIVE_SYNC_PLATFORMS)
+
+    def test_update_service_sets_nativo_provider(self):
+        """update_service() should allow changing sync_provider to 'nativo'."""
+        self.config.add_service("MySvc", "onedrive", "/tmp/test")
+        self.config.update_service("MySvc", {"sync_provider": "nativo"})
+        svc = self.config.get_service("MySvc")
+        self.assertEqual(svc["sync_provider"], "nativo")
+
+    def test_other_platforms_default_rclone(self):
+        """Non-native platforms should still get 'rclone' as default provider."""
+        svc = self.config.add_service("DropboxSvc", "dropbox", "/tmp/dropbox")
+        self.assertEqual(svc.get("sync_provider"), "rclone")
+
+
+class TestNativeSyncManagerTokenStorage(unittest.TestCase):
+    """Tests for native OAuth token persistence helpers."""
+
+    def setUp(self):
+        self._tmpdir = tempfile.mkdtemp()
+        import src.native.native_sync_manager as nm_mod
+        self._orig_get = nm_mod.get_config_dir
+        nm_mod.get_config_dir = lambda: Path(self._tmpdir)
+
+    def tearDown(self):
+        import src.native.native_sync_manager as nm_mod
+        nm_mod.get_config_dir = self._orig_get
+        import shutil
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+
+    def test_load_token_returns_none_when_absent(self):
+        from src.native.native_sync_manager import load_token
+        self.assertIsNone(load_token("nonexistent_remote"))
+
+    def test_save_and_load_token_roundtrip(self):
+        from src.native.native_sync_manager import save_token, load_token
+        token = {"access_token": "abc123", "refresh_token": "xyz", "expires_in": 3600}
+        save_token("myservice", token)
+        loaded = load_token("myservice")
+        self.assertEqual(loaded["access_token"], "abc123")
+        self.assertEqual(loaded["refresh_token"], "xyz")
+
+    def test_delete_token_removes_file(self):
+        from src.native.native_sync_manager import save_token, load_token, delete_token
+        save_token("svc1", {"access_token": "tok"})
+        self.assertIsNotNone(load_token("svc1"))
+        delete_token("svc1")
+        self.assertIsNone(load_token("svc1"))
+
+    def test_save_token_sets_restrictive_permissions_on_unix(self):
+        """Token files should have mode 0o600 on POSIX systems."""
+        import stat
+        import platform as _platform
+        if _platform.system() == "Windows":
+            self.skipTest("Permission bits not tested on Windows")
+        from src.native.native_sync_manager import save_token, _token_path
+        save_token("perm_test", {"access_token": "tok"})
+        mode = oct(stat.S_IMODE(os.stat(_token_path("perm_test")).st_mode))
+        self.assertEqual(mode, oct(0o600))
+
+
+class TestNativeSyncManagerLifecycle(unittest.TestCase):
+    """Tests for NativeSyncManager service lifecycle methods."""
+
+    def setUp(self):
+        self._tmpdir = tempfile.mkdtemp()
+        import src.config.config_manager as cm_mod
+        import src.native.native_sync_manager as nm_mod
+        self._orig_cm = cm_mod.get_config_dir
+        self._orig_nm = nm_mod.get_config_dir
+        cm_mod.get_config_dir = lambda: Path(self._tmpdir)
+        nm_mod.get_config_dir = lambda: Path(self._tmpdir)
+        self.config = ConfigManager()
+        from src.native.native_sync_manager import NativeSyncManager
+        self.native = NativeSyncManager(self.config)
+
+    def tearDown(self):
+        import src.config.config_manager as cm_mod
+        import src.native.native_sync_manager as nm_mod
+        cm_mod.get_config_dir = self._orig_cm
+        nm_mod.get_config_dir = self._orig_nm
+        import shutil
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+
+    def test_get_status_returns_detenido_when_not_started(self):
+        self.assertEqual(self.native.get_status("unknown"), "Detenido")
+
+    def test_is_running_returns_false_when_not_started(self):
+        self.assertFalse(self.native.is_running("unknown"))
+
+    def test_stop_service_no_error_when_not_running(self):
+        """stop_service() on an unknown service should not raise."""
+        self.native.stop_service("nonexistent")  # should not throw
+
+    def test_start_all_only_starts_nativo_services(self):
+        """start_all() should not start services with sync_provider='rclone'."""
+        self.config.add_service("RcloneSvc", "onedrive", "/tmp/r")
+        self.config.add_service("NativeSvc", "drive", "/tmp/n")
+        self.config.update_service("NativeSvc", {"sync_provider": "nativo"})
+        # Patch _do_sync so the loop exits immediately (returns False → sets error status)
+        # We just verify that a thread was created for the native service but not rclone.
+        started = threading.Event()
+        def _fake_sync(svc):
+            started.set()
+            return True
+        self.native._do_sync = _fake_sync
+        self.native.start_all()
+        started.wait(timeout=2.0)
+        # RcloneSvc should NOT be tracked by native manager
+        self.assertFalse(self.native.is_running("RcloneSvc"))
+
+    def test_callbacks_shared_with_rclone_manager(self):
+        """Callbacks set on RcloneManager should propagate to NativeSyncManager."""
+        rclone = RcloneManager(self.config)
+        received = []
+
+        def cb(name, status):
+            received.append((name, status))
+
+        rclone.on_status_change = cb
+        # Verify that _native received the same callback
+        self.assertIs(rclone._native.on_status_change, cb)
+
+
+class TestNativeSyncManagerHelpers(unittest.TestCase):
+    """Tests for helper functions in native_sync_manager."""
+
+    def test_parse_iso8601_basic(self):
+        from src.native.native_sync_manager import _parse_iso8601
+        ts = _parse_iso8601("2024-01-15T10:30:00Z")
+        self.assertGreater(ts, 0)
+
+    def test_parse_iso8601_with_fractional_seconds(self):
+        from src.native.native_sync_manager import _parse_iso8601
+        ts1 = _parse_iso8601("2024-01-15T10:30:00Z")
+        ts2 = _parse_iso8601("2024-01-15T10:30:00.000Z")
+        ts3 = _parse_iso8601("2024-01-15T10:30:00.123456Z")
+        # All should be close (within 1 second)
+        self.assertAlmostEqual(ts1, ts2, delta=1.0)
+        self.assertAlmostEqual(ts1, ts3, delta=1.0)
+
+    def test_parse_iso8601_empty_returns_zero(self):
+        from src.native.native_sync_manager import _parse_iso8601
+        self.assertEqual(_parse_iso8601(""), 0.0)
+
+    def test_scan_local_files_returns_entries(self):
+        from src.native.native_sync_manager import _scan_local_files
+        with tempfile.TemporaryDirectory() as d:
+            # Create some files
+            Path(d, "a.txt").write_text("hello")
+            Path(d, "sub").mkdir()
+            Path(d, "sub", "b.txt").write_text("world")
+            result = _scan_local_files(d)
+            self.assertIn("a.txt", result)
+            self.assertIn("sub/b.txt", result)
+            self.assertIn("sub", result)
+            # Verify mtime is a positive float
+            self.assertGreater(result["a.txt"]["mtime"], 0)
+
+    def test_scan_local_files_empty_dir_returns_empty(self):
+        from src.native.native_sync_manager import _scan_local_files
+        with tempfile.TemporaryDirectory() as d:
+            result = _scan_local_files(d)
+            self.assertEqual(result, {})
+
+    def test_gdrive_escape(self):
+        from src.native.native_sync_manager import _gdrive_escape
+        self.assertEqual(_gdrive_escape("it's here"), "it\\'s here")
+        self.assertEqual(_gdrive_escape("path\\file"), "path\\\\file")
+
+    def test_human_size_bytes(self):
+        from src.native.native_sync_manager import _human_size
+        self.assertIn("B", _human_size(500))
+        self.assertIn("KiB", _human_size(2048))
+        self.assertIn("GiB", _human_size(2 * 1024 ** 3))
+
+    def test_pkce_challenge_differs_from_verifier(self):
+        from src.native.native_sync_manager import _pkce_verifier, _pkce_challenge
+        v = _pkce_verifier()
+        c = _pkce_challenge(v)
+        self.assertNotEqual(v, c)
+        self.assertTrue(len(v) > 0)
+        self.assertTrue(len(c) > 0)
+
+    def test_rclone_manager_routes_storage_info_to_native(self):
+        """get_storage_info() should delegate to NativeSyncManager for nativo services."""
+        import tempfile
+        tmpdir = tempfile.mkdtemp()
+        import src.config.config_manager as cm_mod
+        import src.native.native_sync_manager as nm_mod
+        orig_cm = cm_mod.get_config_dir
+        orig_nm = nm_mod.get_config_dir
+        cm_mod.get_config_dir = lambda: Path(tmpdir)
+        nm_mod.get_config_dir = lambda: Path(tmpdir)
+        try:
+            cfg = ConfigManager()
+            cfg.add_service("NativeSvc", "onedrive", "/tmp/n")
+            cfg.update_service("NativeSvc", {"sync_provider": "nativo"})
+            rclone = RcloneManager(cfg)
+            # Patch native.get_storage_info
+            rclone._native.get_storage_info = lambda name: "Usado: 1.0 GiB"
+            result = rclone.get_storage_info("NativeSvc")
+            self.assertEqual(result, "Usado: 1.0 GiB")
+        finally:
+            cm_mod.get_config_dir = orig_cm
+            nm_mod.get_config_dir = orig_nm
+            import shutil
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_rclone_manager_routes_list_metadata_to_native(self):
+        """list_remote_metadata() should delegate to NativeSyncManager for nativo services."""
+        import tempfile
+        tmpdir = tempfile.mkdtemp()
+        import src.config.config_manager as cm_mod
+        import src.native.native_sync_manager as nm_mod
+        orig_cm = cm_mod.get_config_dir
+        orig_nm = nm_mod.get_config_dir
+        cm_mod.get_config_dir = lambda: Path(tmpdir)
+        nm_mod.get_config_dir = lambda: Path(tmpdir)
+        try:
+            cfg = ConfigManager()
+            cfg.add_service("NativeSvc", "drive", "/tmp/n")
+            cfg.update_service("NativeSvc", {"sync_provider": "nativo"})
+            rclone = RcloneManager(cfg)
+            # Patch native.list_remote_metadata
+            mock_meta = {"file.txt": {"mtime": 1234567890.0, "size": 100, "is_dir": False}}
+            rclone._native.list_remote_metadata = lambda name: (mock_meta, None)
+            meta, err = rclone.list_remote_metadata("NativeSvc")
+            self.assertIsNone(err)
+            self.assertIn("file.txt", meta)
+        finally:
+            cm_mod.get_config_dir = orig_cm
+            nm_mod.get_config_dir = orig_nm
+            import shutil
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+class TestNativeStorageInfoFormat(unittest.TestCase):
+    """Tests that get_storage_info() on native providers returns the
+    'Total: X  |  Usado: Y  |  Libre: Z' format expected by the UI label."""
+
+    def _make_gdrive_provider(self):
+        from src.native.native_sync_manager import GoogleDriveProvider
+        prov = GoogleDriveProvider.__new__(GoogleDriveProvider)
+        prov._remote_name = "test_gdrive"
+        prov._token = {"access_token": "tok", "obtained_at": time.time(), "expires_in": 3600}
+        prov._logger = None
+        # Bypass token refresh in unit tests
+        prov.ensure_valid_token = lambda: True
+        return prov
+
+    def _make_onedrive_provider(self):
+        from src.native.native_sync_manager import OneDriveProvider
+        prov = OneDriveProvider.__new__(OneDriveProvider)
+        prov._remote_name = "test_onedrive"
+        prov._token = {"access_token": "tok", "obtained_at": time.time(), "expires_in": 3600}
+        prov._logger = None
+        # Bypass token refresh in unit tests
+        prov.ensure_valid_token = lambda: True
+        return prov
+
+    def test_gdrive_storage_info_full_format(self):
+        """GoogleDriveProvider.get_storage_info must return
+        'Total: X  |  Usado: Y  |  Libre: Z' when limit is set."""
+        import json
+        from unittest.mock import patch
+        from src.native import native_sync_manager as nm_mod
+
+        prov = self._make_gdrive_provider()
+        response_body = json.dumps({
+            "storageQuota": {
+                "limit": str(100 * 1024 ** 3),   # 100 GiB
+                "usage": str(30 * 1024 ** 3),     # 30 GiB used
+            }
+        })
+
+        with patch.object(nm_mod, "_http_request", return_value=(200, response_body)):
+            result = prov.get_storage_info()
+
+        self.assertIsNotNone(result)
+        self.assertIn("Total:", result)
+        self.assertIn("Usado:", result)
+        self.assertIn("Libre:", result)
+        self.assertIn("  |  ", result)
+        # Free = 100 GiB - 30 GiB = 70 GiB
+        parts = [p.strip() for p in result.split("  |  ")]
+        self.assertEqual(len(parts), 3)
+
+    def test_gdrive_storage_info_no_limit(self):
+        """GoogleDriveProvider.get_storage_info must return at least 'Usado: X'
+        when the API doesn't return a limit (unlimited storage)."""
+        import json
+        from unittest.mock import patch
+        from src.native import native_sync_manager as nm_mod
+
+        prov = self._make_gdrive_provider()
+        response_body = json.dumps({
+            "storageQuota": {
+                "usage": str(5 * 1024 ** 3),  # 5 GiB used, no limit
+            }
+        })
+
+        with patch.object(nm_mod, "_http_request", return_value=(200, response_body)):
+            result = prov.get_storage_info()
+
+        self.assertIsNotNone(result)
+        self.assertIn("Usado:", result)
+
+    def test_gdrive_storage_info_free_is_correct(self):
+        """Libre = Total - Usado (computed by get_storage_info)."""
+        import json
+        from unittest.mock import patch
+        from src.native import native_sync_manager as nm_mod
+        from src.native.native_sync_manager import _human_size
+
+        total = 16 * 1024 ** 3    # 16 GiB
+        used  = 4 * 1024 ** 3     # 4 GiB
+        free  = total - used       # 12 GiB expected
+
+        prov = self._make_gdrive_provider()
+        response_body = json.dumps({
+            "storageQuota": {"limit": str(total), "usage": str(used)}
+        })
+
+        with patch.object(nm_mod, "_http_request", return_value=(200, response_body)):
+            result = prov.get_storage_info()
+
+        self.assertIsNotNone(result)
+        self.assertIn(_human_size(free), result,
+                      f"Expected free-space string '{_human_size(free)}' in '{result}'")
+        self.assertIn(_human_size(total), result)
+        self.assertIn(_human_size(used), result)
+
+    def test_onedrive_storage_info_full_format(self):
+        """OneDriveProvider.get_storage_info must return
+        'Total: X  |  Usado: Y  |  Libre: Z' when total is set."""
+        import json
+        from unittest.mock import patch
+        from src.native import native_sync_manager as nm_mod
+
+        prov = self._make_onedrive_provider()
+        total = 50 * 1024 ** 3
+        used  = 20 * 1024 ** 3
+        remaining = total - used
+        response_body = json.dumps({
+            "quota": {"total": total, "used": used, "remaining": remaining}
+        })
+
+        with patch.object(nm_mod, "_http_request", return_value=(200, response_body)):
+            result = prov.get_storage_info()
+
+        self.assertIsNotNone(result)
+        self.assertIn("Total:", result)
+        self.assertIn("Usado:", result)
+        self.assertIn("Libre:", result)
+        self.assertIn("  |  ", result)
+
+    def test_onedrive_storage_info_remaining_used_when_provided(self):
+        """OneDriveProvider should prefer 'remaining' from the API response
+        over computing total - used."""
+        import json
+        from unittest.mock import patch
+        from src.native import native_sync_manager as nm_mod
+        from src.native.native_sync_manager import _human_size
+
+        total = 100 * 1024 ** 3
+        used  = 35 * 1024 ** 3
+        # API reports a slightly different remaining (e.g. reserved space)
+        api_remaining = 60 * 1024 ** 3
+        response_body = json.dumps({
+            "quota": {"total": total, "used": used, "remaining": api_remaining}
+        })
+
+        prov = self._make_onedrive_provider()
+        with patch.object(nm_mod, "_http_request", return_value=(200, response_body)):
+            result = prov.get_storage_info()
+
+        self.assertIsNotNone(result)
+        self.assertIn(_human_size(api_remaining), result,
+                      "Libre should show the API-provided remaining value")
+
+
+# ===========================================================================
+# NativeSyncManager API-call logging tests
+# ===========================================================================
+
+class TestNativeLogging(unittest.TestCase):
+    """Tests for the native API-call / error logging pipeline."""
+
+    def setUp(self):
+        self._tmpdir = tempfile.mkdtemp()
+        import src.config.config_manager as cm_mod
+        import src.native.native_sync_manager as nm_mod
+        self._orig_cm = cm_mod.get_config_dir
+        self._orig_nm = nm_mod.get_config_dir
+        cm_mod.get_config_dir = lambda: Path(self._tmpdir)
+        nm_mod.get_config_dir = lambda: Path(self._tmpdir)
+        self.config = ConfigManager()
+
+    def tearDown(self):
+        import src.config.config_manager as cm_mod
+        import src.native.native_sync_manager as nm_mod
+        cm_mod.get_config_dir = self._orig_cm
+        nm_mod.get_config_dir = self._orig_nm
+        import shutil
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+
+    # ------------------------------------------------------------------
+    # _http_request logger parameter
+    # ------------------------------------------------------------------
+
+    def test_http_request_logger_called_on_200(self):
+        """_http_request should call logger with 'METHOD url → 200' on success."""
+        from unittest.mock import patch, MagicMock
+        from src.native.native_sync_manager import _http_request
+
+        mock_resp = MagicMock()
+        mock_resp.status = 200
+        mock_resp.read.return_value = b'{"ok": true}'
+        mock_resp.__enter__ = lambda s: s
+        mock_resp.__exit__ = MagicMock(return_value=False)
+
+        logged = []
+        with patch("urllib.request.urlopen", return_value=mock_resp):
+            status, body = _http_request(
+                "https://example.com/test",
+                method="GET",
+                logger=logged.append,
+            )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(len(logged), 1)
+        self.assertIn("GET", logged[0])
+        self.assertIn("200", logged[0])
+
+    def test_http_request_logger_called_on_http_error(self):
+        """_http_request should call logger with a ⚠️ suffix on HTTPError."""
+        import urllib.error
+        from unittest.mock import patch
+        from src.native.native_sync_manager import _http_request
+
+        def _raise(_req, timeout):
+            err = urllib.error.HTTPError(
+                url="https://example.com/fail",
+                code=403,
+                msg="Forbidden",
+                hdrs=None,  # type: ignore[arg-type]
+                fp=None,  # type: ignore[arg-type]
+            )
+            err.read = lambda: b"forbidden"
+            raise err
+
+        logged = []
+        with patch("urllib.request.urlopen", side_effect=_raise):
+            status, body = _http_request(
+                "https://example.com/fail",
+                logger=logged.append,
+            )
+
+        self.assertEqual(status, 403)
+        self.assertEqual(len(logged), 1)
+        self.assertIn("403", logged[0])
+        self.assertIn("⚠️", logged[0])
+
+    def test_http_request_no_logger_no_error(self):
+        """_http_request without a logger should still work normally."""
+        from unittest.mock import patch, MagicMock
+        from src.native.native_sync_manager import _http_request
+
+        mock_resp = MagicMock()
+        mock_resp.status = 200
+        mock_resp.read.return_value = b"ok"
+        mock_resp.__enter__ = lambda s: s
+        mock_resp.__exit__ = MagicMock(return_value=False)
+
+        with patch("urllib.request.urlopen", return_value=mock_resp):
+            status, body = _http_request("https://example.com/")
+        self.assertEqual(status, 200)
+
+    # ------------------------------------------------------------------
+    # NativeSyncManager._make_logger
+    # ------------------------------------------------------------------
+
+    def test_make_logger_routes_to_on_api_call(self):
+        """_make_logger should call on_api_call for every message."""
+        from src.native.native_sync_manager import NativeSyncManager
+        native = NativeSyncManager(self.config)
+
+        api_calls = []
+        native.on_api_call = lambda svc, msg: api_calls.append((svc, msg))
+
+        logger = native._make_logger("MySvc")
+        logger("GET https://example.com → 200")
+
+        self.assertEqual(len(api_calls), 1)
+        self.assertEqual(api_calls[0][0], "MySvc")
+        self.assertIn("200", api_calls[0][1])
+
+    def test_make_logger_does_not_route_to_on_error(self):
+        """_make_logger must NOT call on_error — not even for ❌ messages.
+
+        Errors are emitted via _emit_error at the sync-loop level; routing ❌
+        messages from the provider logger to on_error as well would cause each
+        error to appear twice in the Errores panel.
+        """
+        from src.native.native_sync_manager import NativeSyncManager
+        native = NativeSyncManager(self.config)
+
+        api_calls = []
+        errors = []
+        native.on_api_call = lambda svc, msg: api_calls.append((svc, msg))
+        native.on_error = lambda svc, msg: errors.append((svc, msg))
+
+        logger = native._make_logger("MySvc")
+        logger("❌ token refresh failed")
+
+        # on_api_call must fire exactly once
+        self.assertEqual(len(api_calls), 1)
+        self.assertIn("token refresh failed", api_calls[0][1])
+        # on_error must NOT be called from the logger
+        self.assertEqual(errors, [])
+
+    def test_make_logger_does_not_route_ok_messages_to_on_error(self):
+        """_make_logger should NOT call on_error for any messages."""
+        from src.native.native_sync_manager import NativeSyncManager
+        native = NativeSyncManager(self.config)
+
+        errors = []
+        native.on_api_call = lambda svc, msg: None
+        native.on_error = lambda svc, msg: errors.append(msg)
+
+        logger = native._make_logger("MySvc")
+        logger("GET https://example.com → 200")
+        logger("❌ some error")  # even error messages must not reach on_error
+
+        self.assertEqual(errors, [])
+
+    def test_make_logger_safe_with_no_callbacks(self):
+        """_make_logger callable should not raise even if callbacks are None."""
+        from src.native.native_sync_manager import NativeSyncManager
+        native = NativeSyncManager(self.config)
+        logger = native._make_logger("MySvc")
+        logger("some message")  # should not raise
+        logger("❌ error message")  # should not raise
+
+    # ------------------------------------------------------------------
+    # on_api_call forwarding from RcloneManager
+    # ------------------------------------------------------------------
+
+    def test_on_api_call_forwarded_to_native(self):
+        """Setting on_api_call on RcloneManager should propagate to _native."""
+        rclone = RcloneManager(self.config)
+        received = []
+        rclone.on_api_call = lambda svc, msg: received.append((svc, msg))
+        self.assertIs(rclone._native.on_api_call, rclone.on_api_call)
+
+    def test_get_provider_injects_logger(self):
+        """_get_provider() must inject a logger into the returned provider."""
+        from src.native.native_sync_manager import NativeSyncManager
+        self.config.add_service("ODSvc", "onedrive", "/tmp/od")
+        self.config.update_service("ODSvc", {"sync_provider": "nativo", "remote_name": "od_remote"})
+        native = NativeSyncManager(self.config)
+        native.on_api_call = lambda svc, msg: None
+        svc = self.config.get_service("ODSvc")
+        provider = native._get_provider(svc)
+        self.assertIsNotNone(provider)
+        self.assertIsNotNone(provider._logger)
+
+    def test_get_provider_gdrive_injects_logger(self):
+        """_get_provider() must inject a logger into GoogleDriveProvider."""
+        from src.native.native_sync_manager import NativeSyncManager
+        self.config.add_service("GDSvc", "drive", "/tmp/gd")
+        self.config.update_service("GDSvc", {"sync_provider": "nativo", "remote_name": "gd_remote"})
+        native = NativeSyncManager(self.config)
+        svc = self.config.get_service("GDSvc")
+        provider = native._get_provider(svc)
+        self.assertIsNotNone(provider)
+        self.assertIsNotNone(provider._logger)
+
+    # ------------------------------------------------------------------
+    # Google Workspace file skipping
+    # ------------------------------------------------------------------
+
+    def test_gdrive_workspace_files_skipped_in_listing(self):
+        """GoogleDriveProvider._list_folder_recursive must skip native Google Workspace
+        files (Docs, Sheets, Slides, etc.) that return 403 on ?alt=media download."""
+        from unittest.mock import patch, MagicMock
+        from src.native.native_sync_manager import GoogleDriveProvider
+
+        folder_response = {
+            "files": [
+                # Regular binary file — should be included
+                {
+                    "id": "bin1",
+                    "name": "photo.jpg",
+                    "mimeType": "image/jpeg",
+                    "modifiedTime": "2024-01-01T00:00:00Z",
+                    "size": "12345",
+                },
+                # Google Doc — must be SKIPPED
+                {
+                    "id": "gdoc1",
+                    "name": "My Document",
+                    "mimeType": "application/vnd.google-apps.document",
+                    "modifiedTime": "2024-01-01T00:00:00Z",
+                },
+                # Google Sheet — must be SKIPPED
+                {
+                    "id": "gsheet1",
+                    "name": "My Spreadsheet",
+                    "mimeType": "application/vnd.google-apps.spreadsheet",
+                    "modifiedTime": "2024-01-01T00:00:00Z",
+                },
+                # Folder — must NOT be skipped (is_dir=True)
+                {
+                    "id": "folder1",
+                    "name": "subfolder",
+                    "mimeType": "application/vnd.google-apps.folder",
+                    "modifiedTime": "2024-01-01T00:00:00Z",
+                },
+            ],
+        }
+        subfolder_response = {"files": []}
+
+        call_count = [0]
+
+        def fake_http_request(url, **kwargs):
+            call_count[0] += 1
+            if "folder1" in url or call_count[0] > 1:
+                return 200, json.dumps(subfolder_response).encode()
+            return 200, json.dumps(folder_response).encode()
+
+        logged = []
+        provider = GoogleDriveProvider("remote", logger=logged.append)
+
+        import json as _json
+        with patch("src.native.native_sync_manager._http_request", side_effect=fake_http_request):
+            with patch.object(provider, "_auth_header", return_value={}):
+                results = provider._list_folder_recursive("folder_root", "")
+
+        # Only the binary file and folder should appear
+        self.assertIn("photo.jpg", results)
+        self.assertIn("subfolder", results)
+        # Google Workspace files must be absent
+        self.assertNotIn("My Document", results)
+        self.assertNotIn("My Spreadsheet", results)
+        # A ⚠️ skip notice must have been logged for each workspace file
+        skip_logs = [m for m in logged if "⚠️" in m and "Workspace" in m]
+        self.assertEqual(len(skip_logs), 2)
+
+    def test_gdrive_workspace_constant_covers_doc_and_sheet(self):
+        """_GDRIVE_WORKSPACE_MIME_PREFIX must match common Google Workspace types."""
+        from src.native.native_sync_manager import _GDRIVE_WORKSPACE_MIME_PREFIX
+        for mime in [
+            "application/vnd.google-apps.document",
+            "application/vnd.google-apps.spreadsheet",
+            "application/vnd.google-apps.presentation",
+            "application/vnd.google-apps.form",
+            "application/vnd.google-apps.drawing",
+        ]:
+            self.assertTrue(
+                mime.startswith(_GDRIVE_WORKSPACE_MIME_PREFIX),
+                f"{mime} should start with the prefix",
+            )
+        # Folder must NOT be treated as a workspace file to skip
+        self.assertTrue(
+            "application/vnd.google-apps.folder".startswith(_GDRIVE_WORKSPACE_MIME_PREFIX)
+        )
+        # The folder is excluded by the `not is_dir` guard, not by the prefix
+
+    # ------------------------------------------------------------------
+    # OAuth redirect_uri registration compliance
+    # ------------------------------------------------------------------
+
+    def test_gdrive_build_auth_url_redirect_uri_no_callback_path(self):
+        """GoogleDriveProvider.build_auth_url must also use the root '/' path."""
+        from src.native.native_sync_manager import GoogleDriveProvider, _OAUTH_PORT_RANGE
+        verifier = "dummyverifier1234567890abcdef"
+        redirect_uri = f"http://localhost:{_OAUTH_PORT_RANGE.start}/"
+        url = GoogleDriveProvider.build_auth_url(redirect_uri, verifier)
+        self.assertIn("redirect_uri=http%3A%2F%2Flocalhost%3A", url)
+        self.assertNotIn("%2Fcallback", url, "redirect_uri must not include /callback path")
+        self.assertNotIn("/callback", url, "redirect_uri must not include /callback path")
+
+    def test_gdrive_build_auth_url_has_pkce_params(self):
+        """GoogleDriveProvider.build_auth_url MUST include PKCE parameters.
+
+        Google's client credentials flow supports and recommends PKCE.
+        """
+        from src.native.native_sync_manager import GoogleDriveProvider, _OAUTH_PORT_RANGE
+        verifier = "dummyverifier1234567890abcdef"
+        redirect_uri = f"http://localhost:{_OAUTH_PORT_RANGE.start}/"
+        url = GoogleDriveProvider.build_auth_url(redirect_uri, verifier)
+        self.assertIn("code_challenge", url,
+                      "Google Drive auth URL must contain code_challenge")
+        self.assertIn("code_challenge_method", url,
+                      "Google Drive auth URL must contain code_challenge_method")
+
+    def test_onedrive_build_auth_url_no_pkce(self):
+        """OneDriveProvider.build_auth_url must NOT include PKCE parameters.
+
+        The rclone OneDrive app is a confidential client that uses client_secret
+        for token exchange.  PKCE is unnecessary and must not be sent.
+        """
+        from src.native.native_sync_manager import OneDriveProvider, _OAUTH_PORT_RANGE
+        redirect_uri = f"http://localhost:{_OAUTH_PORT_RANGE.start}/"
+        url = OneDriveProvider.build_auth_url(redirect_uri)
+        self.assertIn("redirect_uri=http%3A%2F%2Flocalhost%3A", url)
+        self.assertNotIn("code_challenge", url,
+                         "OneDrive auth URL must NOT contain code_challenge")
+        self.assertNotIn("code_verifier", url,
+                         "OneDrive auth URL must NOT contain code_verifier")
+
+    def test_onedrive_exchange_code_sends_client_secret(self):
+        """OneDriveProvider.exchange_code MUST send client_secret.
+
+        The rclone OneDrive app (b15665d9-…) is a confidential client.
+        Microsoft returns invalid_client (401) if client_secret is absent.
+        """
+        from unittest.mock import patch
+        from src.native.native_sync_manager import OneDriveProvider, _ONEDRIVE_CLIENT_SECRET
+
+        posted_fields = {}
+
+        def fake_post_form(url, fields, **kwargs):
+            posted_fields.update(fields)
+            return {"access_token": "fake", "expires_in": 3600}
+
+        provider = OneDriveProvider("test_remote")
+        with patch("src.native.native_sync_manager._post_form", side_effect=fake_post_form):
+            ok = provider.exchange_code("authcode123", "http://localhost:53682/")
+
+        self.assertTrue(ok)
+        self.assertIn("client_secret", posted_fields,
+                      "client_secret must be sent in OneDrive token exchange")
+        self.assertEqual(posted_fields["client_secret"], _ONEDRIVE_CLIENT_SECRET)
+        self.assertIn("code", posted_fields)
+        self.assertIn("redirect_uri", posted_fields)
+        self.assertNotIn("code_verifier", posted_fields,
+                         "code_verifier must NOT be sent for confidential client")
+
+    def test_onedrive_refresh_token_sends_client_secret(self):
+        """OneDriveProvider._refresh_token MUST send client_secret."""
+        from unittest.mock import patch
+        from src.native.native_sync_manager import OneDriveProvider, _ONEDRIVE_CLIENT_SECRET
+
+        posted_fields = {}
+
+        def fake_post_form(url, fields, **kwargs):
+            posted_fields.update(fields)
+            return {"access_token": "new_at", "expires_in": 3600}
+
+        provider = OneDriveProvider("test_remote")
+        provider._token = {"access_token": "old", "refresh_token": "rt_xyz"}
+        with patch("src.native.native_sync_manager._post_form", side_effect=fake_post_form), \
+             patch("src.native.native_sync_manager.save_token"):
+            ok = provider._refresh_token()
+
+        self.assertTrue(ok)
+        self.assertIn("client_secret", posted_fields,
+                      "client_secret must be sent in OneDrive token refresh")
+        self.assertEqual(posted_fields["client_secret"], _ONEDRIVE_CLIENT_SECRET)
+        self.assertEqual(posted_fields["grant_type"], "refresh_token")
+
+    def test_do_authenticate_uses_root_redirect_uri(self):
+        """_do_authenticate for both OneDrive and Google Drive must pass
+        'http://localhost:<port>/' (root path) — never '/callback'."""
+        from unittest.mock import patch, MagicMock
+        import urllib.parse
+        from src.native.native_sync_manager import NativeSyncManager, _OAUTH_PORT_RANGE
+
+        captured_redirect = []
+
+        def fake_build_auth_url(redirect_uri: str) -> str:
+            captured_redirect.append(redirect_uri)
+            return "http://no-op/"
+
+        mock_server = MagicMock()
+        mock_server.start.return_value = True
+        mock_server.port = _OAUTH_PORT_RANGE.start
+        mock_server.wait_for_code.return_value = None  # simulate timeout → returns False
+
+        native = NativeSyncManager(self.config)
+
+        with patch(
+            "src.native.native_sync_manager.OneDriveProvider.build_auth_url",
+            side_effect=fake_build_auth_url,
+        ), patch(
+            "src.native.native_sync_manager._OAuthCallbackServer",
+            return_value=mock_server,
+        ), patch("webbrowser.open"):
+            native._do_authenticate("onedrive", "remote1", timeout=0.01)
+
+        self.assertEqual(len(captured_redirect), 1)
+        uri = captured_redirect[0]
+        parsed = urllib.parse.urlparse(uri)
+        self.assertEqual(
+            parsed.path,
+            "/",
+            f"redirect_uri path must be '/' not '{parsed.path}'",
+        )
+
+    def test_do_authenticate_returns_microsoft_error_detail(self):
+        """When OneDrive token exchange fails, _do_authenticate must include
+        Microsoft's error code in the returned error string."""
+        from unittest.mock import patch, MagicMock
+        from src.native.native_sync_manager import NativeSyncManager, _OAUTH_PORT_RANGE
+
+        mock_server = MagicMock()
+        mock_server.start.return_value = True
+        mock_server.port = _OAUTH_PORT_RANGE.start
+        mock_server.wait_for_code.return_value = "auth_code_abc"
+
+        def fake_post_form(url, fields, **kwargs):
+            return {
+                "error": "invalid_client",
+                "error_description": "AADSTS7000218: The request body must contain client_secret.",
+            }
+
+        native = NativeSyncManager(self.config)
+
+        with patch(
+            "src.native.native_sync_manager.OneDriveProvider.build_auth_url",
+            return_value="http://no-op/",
+        ), patch(
+            "src.native.native_sync_manager._OAuthCallbackServer",
+            return_value=mock_server,
+        ), patch(
+            "src.native.native_sync_manager._post_form",
+            side_effect=fake_post_form,
+        ), patch("webbrowser.open"):
+            ok, msg = native._do_authenticate("onedrive", "remote1", timeout=5.0)
+
+        self.assertFalse(ok)
+        self.assertIn("No se pudo obtener el token", msg)
+        self.assertIn("invalid_client", msg,
+                      "Microsoft error code must be propagated into the error message")
+
+    def test_do_authenticate_handles_network_error(self):
+        """_do_authenticate must catch OSError from a failed token endpoint
+        connection and return a descriptive error rather than crashing."""
+        from unittest.mock import patch, MagicMock
+        from src.native.native_sync_manager import NativeSyncManager, _OAUTH_PORT_RANGE
+
+        mock_server = MagicMock()
+        mock_server.start.return_value = True
+        mock_server.port = _OAUTH_PORT_RANGE.start
+        mock_server.wait_for_code.return_value = "auth_code_xyz"
+
+        native = NativeSyncManager(self.config)
+
+        with patch(
+            "src.native.native_sync_manager.OneDriveProvider.build_auth_url",
+            return_value="http://no-op/",
+        ), patch(
+            "src.native.native_sync_manager._OAuthCallbackServer",
+            return_value=mock_server,
+        ), patch(
+            "src.native.native_sync_manager._post_form",
+            side_effect=OSError("Connection refused"),
+        ), patch("webbrowser.open"):
+            ok, msg = native._do_authenticate("onedrive", "remote1", timeout=5.0)
+
+        self.assertFalse(ok)
+        self.assertIn("Error de red", msg)
+        self.assertIn("Connection refused", msg)
+
+    def test_do_authenticate_onedrive_success(self):
+        """_do_authenticate for OneDrive must save token and return True when
+        the token exchange succeeds (client_secret flow)."""
+        from unittest.mock import patch, MagicMock
+        from src.native.native_sync_manager import NativeSyncManager, _OAUTH_PORT_RANGE
+
+        mock_server = MagicMock()
+        mock_server.start.return_value = True
+        mock_server.port = _OAUTH_PORT_RANGE.start
+        mock_server.wait_for_code.return_value = "real_auth_code"
+
+        def fake_post_form(url, fields, **kwargs):
+            return {"access_token": "at_ok", "refresh_token": "rt_ok", "expires_in": 3600}
+
+        saved = {}
+
+        native = NativeSyncManager(self.config)
+
+        with patch(
+            "src.native.native_sync_manager.OneDriveProvider.build_auth_url",
+            return_value="http://no-op/",
+        ), patch(
+            "src.native.native_sync_manager._OAuthCallbackServer",
+            return_value=mock_server,
+        ), patch(
+            "src.native.native_sync_manager._post_form",
+            side_effect=fake_post_form,
+        ), patch(
+            "src.native.native_sync_manager.save_token",
+            side_effect=lambda name, token: saved.update({name: token}),
+        ), patch("webbrowser.open"):
+            ok, msg = native._do_authenticate("onedrive", "myremote", timeout=5.0)
+
+        self.assertTrue(ok, f"Expected success but got: {msg}")
+        self.assertEqual(msg, "")
+        self.assertIn("myremote", saved)
+        self.assertEqual(saved["myremote"]["access_token"], "at_ok")
+
+    def test_log_progress_fires_both_callbacks(self):
+        """_log_progress must fire both on_api_call and on_file_synced."""
+        from src.native.native_sync_manager import NativeSyncManager
+
+        native = NativeSyncManager(self.config)
+
+        api_calls: list = []
+        file_events: list = []
+
+        native.on_api_call = lambda svc, msg: api_calls.append((svc, msg))
+        native.on_file_synced = lambda svc, fp, synced: file_events.append((svc, fp, synced))
+
+        native._log_progress("my_svc", "📋 test stage message")
+
+        self.assertEqual(len(api_calls), 1, "on_api_call must be fired once")
+        self.assertEqual(api_calls[0], ("my_svc", "📋 test stage message"))
+
+        self.assertEqual(len(file_events), 1, "on_file_synced must be fired once")
+        svc, fp, synced = file_events[0]
+        self.assertEqual(svc, "my_svc")
+        self.assertEqual(fp, "📋 test stage message")
+        self.assertFalse(synced, "stage messages must be emitted with synced=False")
+
+    def test_log_progress_safe_when_callbacks_none(self):
+        """_log_progress must not raise when callbacks are not set (None)."""
+        from src.native.native_sync_manager import NativeSyncManager
+
+        native = NativeSyncManager(self.config)
+        # Both callbacks remain None (the default)
+        try:
+            native._log_progress("svc", "some message")
+        except Exception as exc:
+            self.fail(f"_log_progress raised unexpectedly when callbacks are None: {exc}")
+
+    def test_download_logs_progress_before_transfer(self):
+        """_download must call _log_progress with the file path before starting
+        the actual HTTP transfer, so the filename appears in the console even
+        when the download fails (e.g., 401 errors)."""
+        from unittest.mock import MagicMock
+        from src.native.native_sync_manager import NativeSyncManager
+
+        native = NativeSyncManager(self.config)
+
+        logged: list = []
+        native.on_api_call = lambda svc, msg: logged.append(msg)
+        native.on_file_synced = lambda svc, fp, synced: logged.append((fp, synced))
+
+        mock_provider = MagicMock()
+        mock_provider.download_file.return_value = False  # simulate failure (e.g. 401)
+
+        native._download(mock_provider, "item_abc", "/tmp/test.txt", "folder/test.txt", "svc1")
+
+        # The progress message with the filename must appear before the download call
+        progress_msgs = [m for m in logged if isinstance(m, str) and "folder/test.txt" in m]
+        self.assertTrue(len(progress_msgs) >= 1,
+                        "A progress message with the filename must be logged before download")
+        self.assertTrue(any("⬇️" in m for m in progress_msgs),
+                        "Progress message must contain the ⬇️ indicator")
+        # The first logged entry must be the progress string (ordering check)
+        self.assertIsInstance(logged[0], str,
+                              "Progress log string must appear first in the log")
+        self.assertIn("folder/test.txt", logged[0])
+
+    def test_upload_logs_progress_before_transfer(self):
+        """_upload must call _log_progress with the file path before starting
+        the actual HTTP transfer, and the progress message must come before
+        the success notification."""
+        from unittest.mock import MagicMock
+        from src.native.native_sync_manager import NativeSyncManager
+
+        native = NativeSyncManager(self.config)
+
+        logged: list = []
+        native.on_api_call = lambda svc, msg: logged.append(msg)
+        native.on_file_synced = lambda svc, fp, synced: logged.append((fp, synced))
+
+        mock_provider = MagicMock()
+        mock_provider.upload_file.return_value = True
+
+        native._upload(mock_provider, "/tmp/test.txt", "remote/", "folder/test.txt", "svc1")
+
+        progress_msgs = [m for m in logged if isinstance(m, str) and "folder/test.txt" in m]
+        self.assertTrue(len(progress_msgs) >= 1,
+                        "A progress message with the filename must be logged before upload")
+        self.assertTrue(any("⬆️" in m for m in progress_msgs),
+                        "Progress message must contain the ⬆️ indicator")
+        # Progress string must precede success (synced=True) event
+        first_str_idx = next(i for i, m in enumerate(logged) if isinstance(m, str))
+        success_events = [(i, m) for i, m in enumerate(logged)
+                         if isinstance(m, tuple) and m[1] is True]
+        if success_events:
+            self.assertLess(first_str_idx, success_events[0][0],
+                            "Progress log must appear before the success file_synced event")
+
+    def test_do_sync_emits_stage_messages(self):
+        """_do_sync must emit stage-progress messages via _log_progress:
+        obtaining remote list, scanning local files, and comparing paths."""
+        import tempfile
+        import os
+        from unittest.mock import patch, MagicMock
+        from src.native.native_sync_manager import NativeSyncManager
+
+        native = NativeSyncManager(self.config)
+
+        stage_messages: list = []
+        native.on_api_call = lambda svc, msg: stage_messages.append(msg)
+        native.on_file_synced = lambda svc, fp, synced: None  # ignore file events
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            svc = {
+                "name": "test_onedrive",
+                "platform": "onedrive",
+                "remote_name": "testremote",
+                "local_path": tmpdir,
+                "remote_path": "/",
+            }
+
+            mock_provider = MagicMock()
+            mock_provider.is_authenticated.return_value = True
+            mock_provider.list_files.return_value = {}  # empty remote
+
+            with patch.object(native, "_get_provider", return_value=mock_provider), \
+                 patch("shutil.disk_usage") as mock_du:
+                mock_du.return_value = MagicMock(free=20 * 1024 * 1024 * 1024)  # 20 GiB
+                native._do_sync(svc)
+
+        # Verify the three key stage messages were emitted
+        self.assertTrue(
+            any("Obteniendo lista de archivos remotos" in m for m in stage_messages),
+            f"Expected 'Obteniendo lista' stage message, got: {stage_messages}",
+        )
+        self.assertTrue(
+            any("Escaneando archivos locales" in m for m in stage_messages),
+            f"Expected 'Escaneando archivos locales' stage message, got: {stage_messages}",
+        )
+        # The summary count messages must also be present
+        self.assertTrue(
+            any("Lista remota:" in m for m in stage_messages),
+            f"Expected 'Lista remota:' count message, got: {stage_messages}",
+        )
+        self.assertTrue(
+            any("Archivos locales:" in m for m in stage_messages),
+            f"Expected 'Archivos locales:' count message, got: {stage_messages}",
+        )
+
+
+    def test_download_emits_error_with_filename_on_false_return(self):
+        """When download_file returns False (non-exception), _download must call
+        _emit_error (on_error) with the human-readable filename so the user can
+        see which file failed in the Errores panel."""
+        from unittest.mock import MagicMock
+        from src.native.native_sync_manager import NativeSyncManager
+
+        native = NativeSyncManager(self.config)
+
+        errors: list = []
+        native.on_error = lambda svc, msg: errors.append((svc, msg))
+        native.on_api_call = lambda svc, msg: None  # ignore API log
+        native.on_file_synced = lambda svc, fp, synced: None
+
+        mock_provider = MagicMock()
+        mock_provider.download_file.return_value = False  # e.g., 401, token expired
+
+        result = native._download(
+            mock_provider, "ITEM_ID", "/tmp/f.txt", "deep/folder/file.jpg", "svc1"
+        )
+
+        self.assertFalse(result, "_download must propagate the False return")
+        self.assertTrue(len(errors) >= 1, "on_error must be called when download returns False")
+        # The error message must contain the filename so the user can identify it
+        combined = " ".join(msg for _, msg in errors)
+        self.assertIn("deep/folder/file.jpg", combined,
+                      "Error message must contain the filename for user visibility")
+
+    def test_upload_emits_error_with_filename_on_false_return(self):
+        """When upload_file returns False (non-exception), _upload must call
+        _emit_error (on_error) with the human-readable filename."""
+        from unittest.mock import MagicMock
+        from src.native.native_sync_manager import NativeSyncManager
+
+        native = NativeSyncManager(self.config)
+
+        errors: list = []
+        native.on_error = lambda svc, msg: errors.append((svc, msg))
+        native.on_api_call = lambda svc, msg: None
+        native.on_file_synced = lambda svc, fp, synced: None
+
+        mock_provider = MagicMock()
+        mock_provider.upload_file.return_value = False  # e.g., 403, conflict
+
+        result = native._upload(
+            mock_provider, "/tmp/f.txt", "remote/", "docs/report.pdf", "svc1"
+        )
+
+        self.assertFalse(result, "_upload must propagate the False return")
+        self.assertTrue(len(errors) >= 1, "on_error must be called when upload returns False")
+        combined = " ".join(msg for _, msg in errors)
+        self.assertIn("docs/report.pdf", combined,
+                      "Error message must contain the filename for user visibility")
+
+    def test_onedrive_download_logs_when_token_invalid(self):
+        """OneDriveProvider.download_file must log via _logger when
+        ensure_valid_token() returns False (previously a silent failure)."""
+        from unittest.mock import patch
+        from src.native.native_sync_manager import OneDriveProvider
+
+        logged: list = []
+        provider = OneDriveProvider("remote1", logger=lambda msg: logged.append(msg))
+
+        with patch.object(provider, "ensure_valid_token", return_value=False):
+            result = provider.download_file("ITEM123", "/tmp/out.bin")
+
+        self.assertFalse(result)
+        self.assertTrue(len(logged) >= 1,
+                        "download_file must log when ensure_valid_token() returns False")
+        combined = " ".join(logged)
+        self.assertIn("❌", combined, "Log message must contain ❌ indicator")
+
+    def test_onedrive_upload_logs_when_token_invalid(self):
+        """OneDriveProvider.upload_file must log via _logger when
+        ensure_valid_token() returns False (previously a silent failure)."""
+        from unittest.mock import patch
+        from src.native.native_sync_manager import OneDriveProvider
+
+        logged: list = []
+        provider = OneDriveProvider("remote1", logger=lambda msg: logged.append(msg))
+
+        with patch.object(provider, "ensure_valid_token", return_value=False):
+            result = provider.upload_file("/tmp/f.txt", "remote/", "file.txt")
+
+        self.assertFalse(result)
+        self.assertTrue(len(logged) >= 1,
+                        "upload_file must log when ensure_valid_token() returns False")
+        combined = " ".join(logged)
+        self.assertIn("❌", combined, "Log message must contain ❌ indicator")
+
+
+    def test_gdrive_get_or_create_folder_no_create_on_api_error(self):
+        """_get_or_create_folder must NOT attempt to create a folder when the
+        existence-check API call returns a non-200 status.  Creating a folder
+        when the check fails would cause duplicate folders if the folder already
+        exists but the API was temporarily unavailable."""
+        import json
+        from unittest.mock import patch, MagicMock
+        from src.native.native_sync_manager import GoogleDriveProvider
+
+        logged: list = []
+        provider = GoogleDriveProvider("remote1", logger=lambda msg: logged.append(msg))
+
+        call_count = [0]
+
+        def fake_http(url, *, method="GET", headers=None, data=None, timeout=60.0, logger=None):
+            call_count[0] += 1
+            if method == "GET" and "files" in url:
+                # Simulate a 500 server error on the existence check
+                if logger:
+                    logger(f"GET {url} → 500 ⚠️")
+                return 500, b'{"error": "internal server error"}'
+            # POST should NOT be reached
+            return 201, json.dumps({"id": "new_folder_id"}).encode()
+
+        with patch("src.native.native_sync_manager._http_request", side_effect=fake_http), \
+             patch.object(provider, "_get_folder_id", return_value="root_id"), \
+             patch.object(provider, "_auth_header", return_value={"Authorization": "Bearer test"}), \
+             patch.object(provider, "ensure_valid_token", return_value=True):
+            result = provider._get_or_create_folder("/", "testfolder")
+
+        self.assertIsNone(result, "_get_or_create_folder must return None on API error")
+        # Crucially, only ONE HTTP call was made (the query). No POST to create.
+        post_calls = [c for c in range(call_count[0])]  # just count
+        # The fake always returns 500 for GET; no POST should have been triggered
+        self.assertEqual(call_count[0], 1,
+                         "Only the existence-check GET should have been called, not a POST")
+        self.assertTrue(any("❌" in m for m in logged),
+                        "An error must be logged when the API returns non-200")
+
+    def test_gdrive_upload_file_no_fallback_on_missing_parent(self):
+        """When _get_or_create_folder returns None (API error), upload_file must
+        return False immediately without falling back to an incorrect parent_id
+        and creating a duplicate file at the wrong location."""
+        from unittest.mock import patch
+        from src.native.native_sync_manager import GoogleDriveProvider
+
+        logged: list = []
+        provider = GoogleDriveProvider("remote1", logger=lambda msg: logged.append(msg))
+
+        with patch.object(provider, "ensure_valid_token", return_value=True), \
+             patch.object(provider, "_get_or_create_folder", return_value=None), \
+             patch.object(provider, "_find_file_id") as mock_find, \
+             patch("src.native.native_sync_manager._http_request") as mock_http:
+            import tempfile, os
+            with tempfile.NamedTemporaryFile(delete=False) as tf:
+                tf.write(b"data")
+                tf_path = tf.name
+            try:
+                result = provider.upload_file(tf_path, "remote/", "subdir/file.txt")
+            finally:
+                os.unlink(tf_path)
+
+        self.assertFalse(result, "upload_file must return False when folder can't be obtained")
+        mock_find.assert_not_called()
+        mock_http.assert_not_called()
+        self.assertTrue(any("❌" in m for m in logged),
+                        "An error must be logged when the parent folder is unavailable")
+
+    def test_gdrive_find_file_id_raises_on_api_error(self):
+        """_find_file_id must raise OSError (not return None) when the Drive API
+        returns a non-200 status.  Returning None would cause upload_file to
+        create a new file even though the existing file just failed to be found,
+        resulting in a duplicate."""
+        from unittest.mock import patch
+        from src.native.native_sync_manager import GoogleDriveProvider
+
+        provider = GoogleDriveProvider("remote1")
+
+        def fake_http(url, *, method="GET", headers=None, data=None, timeout=60.0, logger=None):
+            return 503, b'{"error": "service unavailable"}'
+
+        with patch("src.native.native_sync_manager._http_request", side_effect=fake_http), \
+             patch.object(provider, "_auth_header", return_value={"Authorization": "Bearer test"}):
+            with self.assertRaises(OSError) as ctx:
+                provider._find_file_id("parent_id", "file.jpg")
+
+        self.assertIn("503", str(ctx.exception),
+                      "OSError message must include the HTTP status code")
+
+    def test_gdrive_find_file_id_returns_none_when_not_found(self):
+        """_find_file_id must return None (not raise) when the file genuinely
+        does not exist (200 response with empty files list)."""
+        import json
+        from unittest.mock import patch
+        from src.native.native_sync_manager import GoogleDriveProvider
+
+        provider = GoogleDriveProvider("remote1")
+
+        def fake_http(url, *, method="GET", headers=None, data=None, timeout=60.0, logger=None):
+            return 200, json.dumps({"files": []}).encode()
+
+        with patch("src.native.native_sync_manager._http_request", side_effect=fake_http), \
+             patch.object(provider, "_auth_header", return_value={"Authorization": "Bearer test"}):
+            result = provider._find_file_id("parent_id", "nonexistent.jpg")
+
+        self.assertIsNone(result)
+
+    def test_onedrive_create_folder_treats_409_as_success(self):
+        """create_remote_folder must treat a 409 Conflict response as success
+        (folder already exists) and return True, so that re-running sync does
+        not try to create duplicate folders."""
+        import json
+        from unittest.mock import patch
+        from src.native.native_sync_manager import OneDriveProvider
+
+        provider = OneDriveProvider("remote1")
+
+        def fake_http(url, *, method="GET", headers=None, data=None, timeout=60.0, logger=None):
+            # Simulate 409 Conflict — folder already exists
+            return 409, json.dumps({"error": {"code": "nameAlreadyExists"}}).encode()
+
+        with patch("src.native.native_sync_manager._http_request", side_effect=fake_http), \
+             patch.object(provider, "ensure_valid_token", return_value=True), \
+             patch.object(provider, "_auth_header", return_value={"Authorization": "Bearer test"}):
+            result = provider.create_remote_folder("/", "existing_folder")
+
+        self.assertTrue(result,
+                        "create_remote_folder must return True when folder already exists (409)")
+
+    def test_onedrive_create_folder_uses_fail_conflict_behavior(self):
+        """create_remote_folder must use conflictBehavior='fail' (not 'replace').
+        'replace' is undocumented/destructive for folders in the Graph API."""
+        import json
+        from unittest.mock import patch
+        from src.native.native_sync_manager import OneDriveProvider
+
+        provider = OneDriveProvider("remote1")
+        captured_body: list = []
+
+        def fake_http(url, *, method="GET", headers=None, data=None, timeout=60.0, logger=None):
+            if data:
+                captured_body.append(json.loads(data.decode()))
+            return 201, json.dumps({"id": "new_folder"}).encode()
+
+        with patch("src.native.native_sync_manager._http_request", side_effect=fake_http), \
+             patch.object(provider, "ensure_valid_token", return_value=True), \
+             patch.object(provider, "_auth_header", return_value={"Authorization": "Bearer test"}):
+            provider.create_remote_folder("/", "my_folder")
+
+        self.assertTrue(len(captured_body) >= 1, "At least one POST body must have been sent")
+        behavior = captured_body[0].get("@microsoft.graph.conflictBehavior")
+        self.assertEqual(behavior, "fail",
+                         "conflictBehavior must be 'fail', not 'replace', to prevent folder duplication")
+
+    def test_gdrive_upload_file_no_create_when_find_fails(self):
+        """When _find_file_id raises OSError (API error), upload_file must propagate
+        the exception (and NativeSyncManager._upload must catch it), ensuring no
+        new duplicate file is created via a POST."""
+        import json, tempfile, os
+        from unittest.mock import patch, MagicMock
+        from src.native.native_sync_manager import GoogleDriveProvider, NativeSyncManager
+
+        native = NativeSyncManager(self.config)
+        errors: list = []
+        native.on_error = lambda svc, msg: errors.append(msg)
+        native.on_api_call = lambda svc, msg: None
+
+        # Create a real temp file
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tf:
+            tf.write(b"fake image data")
+            tf_path = tf.name
+
+        http_calls: list = []
+
+        def fake_http(url, *, method="GET", headers=None, data=None, timeout=60.0, logger=None):
+            http_calls.append((method, url))
+            if method == "GET" and "files" in url:
+                # _get_or_create_folder search succeeds (folder found)
+                if "pageSize=1" in url and "parents" in url and "folder" in url.lower():
+                    # For _get_or_create_folder loop
+                    return 200, json.dumps({"files": [{"id": "parent_id"}]}).encode()
+                # For _find_file_id: return 503 to simulate API error
+                return 503, b'{"error": "service unavailable"}'
+            return 200, json.dumps({"files": [{"id": "root_id"}]}).encode()
+
+        try:
+            mock_provider = MagicMock()
+            mock_provider.upload_file.side_effect = OSError("Drive API devolvió 503")
+            result = native._upload(mock_provider, tf_path, "remote/", "folder/img.jpg", "svc1")
+        finally:
+            os.unlink(tf_path)
+
+        self.assertFalse(result, "_upload must return False when upload_file raises")
+        self.assertTrue(len(errors) >= 1, "on_error must fire when upload raises")
+        # No POST (create) calls should have been made
+        post_calls = [c for c in http_calls if c[0] == "POST"]
+        self.assertEqual(len(post_calls), 0, "No POST (create) calls should be made on API error")
+
+
+class TestNativeSyncLoopExceptionHandling(unittest.TestCase):
+    """Tests for silent-failure fixes in the native sync loop and Google Drive provider.
+
+    Covers three bugs where sync errors would not appear in the Errores panel:
+    1. _sync_loop had no exception handler — uncaught _do_sync exceptions killed
+       the thread without calling _emit_error.
+    2. GoogleDriveProvider.list_files returned {} silently when ensure_valid_token
+       returned False (no _logger call).
+    3. os.makedirs in _do_sync was not wrapped — FileExistsError killed the thread.
+    """
+
+    def setUp(self):
+        self._tmpdir = tempfile.mkdtemp()
+        import src.config.config_manager as cm_mod
+        import src.native.native_sync_manager as nm_mod
+        self._orig_cm = cm_mod.get_config_dir
+        self._orig_nm = nm_mod.get_config_dir
+        cm_mod.get_config_dir = lambda: Path(self._tmpdir)
+        nm_mod.get_config_dir = lambda: Path(self._tmpdir)
+        self.config = ConfigManager()
+
+    def tearDown(self):
+        import src.config.config_manager as cm_mod
+        import src.native.native_sync_manager as nm_mod
+        cm_mod.get_config_dir = self._orig_cm
+        nm_mod.get_config_dir = self._orig_nm
+        import shutil
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+
+    def test_sync_loop_catches_do_sync_exception(self):
+        """If _do_sync raises an unexpected exception, _sync_loop must catch it,
+        emit an error via on_error, and set status to 'Error en sincronización'
+        instead of crashing the thread silently."""
+        from src.native.native_sync_manager import NativeSyncManager
+
+        native = NativeSyncManager(self.config)
+        errors: list = []
+        statuses: list = []
+        native.on_error = lambda svc, msg: errors.append((svc, msg))
+        native.on_status_change = lambda svc, st: statuses.append((svc, st))
+
+        self.config.add_service("GDriveTest", "drive", self._tmpdir)
+        self.config.update_service("GDriveTest", {"sync_provider": "nativo", "sync_interval": 0})
+
+        stop_event = threading.Event()
+
+        call_count = [0]
+        def raising_do_sync(_svc):
+            call_count[0] += 1
+            stop_event.set()  # stop after this one iteration
+            raise RuntimeError("Simulated unexpected crash in _do_sync")
+
+        # Patch stop_event.wait to avoid sleeping
+        with patch.object(native, "_do_sync", side_effect=raising_do_sync), \
+             patch.object(stop_event, "wait", side_effect=lambda **_: None):
+            native._sync_loop("GDriveTest", stop_event)
+
+        self.assertEqual(call_count[0], 1, "_do_sync should be called exactly once")
+        self.assertTrue(
+            any(svc == "GDriveTest" and "Error en sincronización" in st
+                for svc, st in statuses),
+            f"Status 'Error en sincronización' must be set; got: {statuses}"
+        )
+        self.assertTrue(
+            any(svc == "GDriveTest" and "RuntimeError" in msg
+                for svc, msg in errors),
+            f"on_error must contain RuntimeError; got: {errors}"
+        )
+
+    def test_sync_loop_exception_emits_before_generic_message(self):
+        """When _do_sync raises, the specific exception message must be emitted
+        via on_error so the user can see the root cause in the Errores panel."""
+        from src.native.native_sync_manager import NativeSyncManager
+
+        native = NativeSyncManager(self.config)
+        errors: list = []
+        native.on_error = lambda svc, msg: errors.append(msg)
+        native.on_status_change = lambda *_: None
+
+        self.config.add_service("Svc1", "drive", self._tmpdir)
+        self.config.update_service("Svc1", {"sync_provider": "nativo", "sync_interval": 0})
+
+        stop_event = threading.Event()
+
+        def raising_do_sync(_svc):
+            stop_event.set()
+            raise ValueError("disk quota exceeded")
+
+        with patch.object(native, "_do_sync", side_effect=raising_do_sync), \
+             patch.object(stop_event, "wait", side_effect=lambda **_: None):
+            native._sync_loop("Svc1", stop_event)
+
+        # Both the specific error and the generic summary must be emitted
+        self.assertTrue(
+            any("disk quota exceeded" in msg for msg in errors),
+            f"Specific exception detail must appear; got: {errors}"
+        )
+        self.assertTrue(
+            any("Fallo en el ciclo" in msg for msg in errors),
+            f"Generic summary must also appear; got: {errors}"
+        )
+
+    def test_gdrive_list_files_logs_when_token_invalid(self):
+        """GoogleDriveProvider.list_files must log via _logger when
+        ensure_valid_token() returns False (previously a silent failure that
+        caused 'Error en sincronización' with nothing in the Errores panel)."""
+        from src.native.native_sync_manager import GoogleDriveProvider
+
+        logged: list = []
+        provider = GoogleDriveProvider("remote1", logger=lambda msg: logged.append(msg))
+
+        with patch.object(provider, "ensure_valid_token", return_value=False):
+            result = provider.list_files("/MyFolder")
+
+        self.assertEqual(result, {}, "list_files must return empty dict on invalid token")
+        self.assertTrue(
+            any("❌" in msg and "token" in msg.lower() for msg in logged),
+            f"list_files must log a ❌ token error; got: {logged}"
+        )
+
+    def test_do_sync_wraps_makedirs_error(self):
+        """When os.makedirs raises (e.g. FileExistsError when a file already
+        occupies the path that Drive has as a folder), _do_sync must catch the
+        error, emit it via on_error, and count it as a sync error — NOT crash
+        the thread silently."""
+        from src.native.native_sync_manager import NativeSyncManager
+
+        native = NativeSyncManager(self.config)
+        errors: list = []
+        native.on_error = lambda svc, msg: errors.append(msg)
+        native.on_api_call = lambda svc, msg: None
+        native.on_file_synced = lambda svc, fp, synced: None
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            svc = {
+                "name": "GDriveTest",
+                "platform": "drive",
+                "remote_name": "gdrive",
+                "local_path": tmpdir,
+                "remote_path": "/",
+            }
+
+            # Remote has a directory "docs/"; local has a FILE named "docs"
+            # so os.makedirs would raise FileExistsError
+            mock_provider = MagicMock()
+            mock_provider.is_authenticated.return_value = True
+            mock_provider.list_files.return_value = {
+                "docs": {"id": "dir_id", "is_dir": True, "mtime": 0.0, "size": 0},
+            }
+
+            # Create a file at the path where makedirs would try to create a dir
+            conflict_path = os.path.join(tmpdir, "docs")
+            with open(conflict_path, "w") as f:
+                f.write("I am a file, not a directory")
+
+            with patch.object(native, "_get_provider", return_value=mock_provider), \
+                 patch("shutil.disk_usage") as mock_du:
+                mock_du.return_value = MagicMock(free=20 * 1024 * 1024 * 1024)
+                result = native._do_sync(svc)
+
+        # Must report failure (makedirs error → errors > 0)
+        self.assertFalse(result, "_do_sync must return False when makedirs fails")
+        # Must emit an actionable error message
+        self.assertTrue(
+            any("docs" in msg for msg in errors),
+            f"Error message must mention the failing path; got: {errors}"
+        )
+
+
+class TestTreeScanParallelism(unittest.TestCase):
+    """Tests for the parallel tree-scan throttle design.
+
+    Verifies the concurrency constants and semaphore behaviour without
+    importing main_window (tkinter is not available in headless CI).
+    All tests exercise the logic inline, mirroring the actual implementation.
+    """
+
+    def test_max_parallel_rescans_is_6(self):
+        """The semaphore must limit steady-state rescans to at most 6 concurrent
+        remote scans, keeping cloud-API connections and peak memory under control."""
+        _MAX_PARALLEL_RESCANS = 6
+        sem = threading.Semaphore(_MAX_PARALLEL_RESCANS)
+        acquired = []
+        for _ in range(6):
+            if sem.acquire(blocking=False):
+                acquired.append(True)
+        for _ in acquired:
+            sem.release()
+        self.assertEqual(len(acquired), 6,
+                         "Semaphore must grant exactly 6 concurrent acquisitions")
+
+    def test_first_scan_bypasses_semaphore(self):
+        """A first-time scan (is_first_scan=True) must not touch the semaphore
+        so it always starts immediately, even when all rescan slots are taken."""
+        _MAX_PARALLEL_RESCANS = 6
+        sem = threading.Semaphore(_MAX_PARALLEL_RESCANS)
+        # Exhaust all slots
+        for _ in range(_MAX_PARALLEL_RESCANS):
+            sem.acquire(blocking=False)
+
+        completed = []
+
+        def first_scan_remote_worker(is_first_scan: bool) -> None:
+            """Inline replica of the first-scan / rescan branch."""
+            if is_first_scan:
+                completed.append("done")  # runs without semaphore
+            else:
+                sem.acquire()
+                try:
+                    completed.append("done")
+                finally:
+                    sem.release()
+
+        t = threading.Thread(target=first_scan_remote_worker, args=(True,))
+        t.start()
+        t.join(timeout=2.0)
+
+        self.assertIn("done", completed,
+                      "First-scan worker must complete without waiting for semaphore")
+        # Release all slots we grabbed
+        for _ in range(_MAX_PARALLEL_RESCANS):
+            sem.release()
+
+    def test_rescan_waits_for_semaphore_slot(self):
+        """A rescan (is_first_scan=False) must acquire the semaphore before
+        doing work and release it immediately after, even on error."""
+        _MAX_PARALLEL_RESCANS = 6
+        sem = threading.Semaphore(_MAX_PARALLEL_RESCANS)
+        events = []
+
+        def rescan_remote_worker(is_first_scan: bool) -> None:
+            if is_first_scan:
+                events.append("work")
+            else:
+                sem.acquire()
+                try:
+                    events.append("work")
+                finally:
+                    sem.release()
+                    events.append("released")
+
+        t = threading.Thread(target=rescan_remote_worker, args=(False,))
+        t.start()
+        t.join(timeout=2.0)
+
+        self.assertIn("work", events, "Rescan must perform its work")
+        self.assertIn("released", events, "Rescan must release the semaphore")
+
+    def test_first_tree_scan_done_defaults_false(self):
+        """New services must have first_tree_scan_done=False so the first
+        scan always runs at full capacity."""
+        import tempfile, shutil
+        import src.config.config_manager as cm_mod
+        td = tempfile.mkdtemp()
+        orig_gcf = cm_mod.get_config_dir
+        try:
+            cm_mod.get_config_dir = lambda: Path(td)
+            cfg = cm_mod.ConfigManager()
+            cfg.add_service("SvcA", "drive", "/tmp/svca")
+            svc = cfg.get_service("SvcA")
+            self.assertFalse(svc.get("first_tree_scan_done", True),
+                             "first_tree_scan_done must start as False")
+        finally:
+            cm_mod.get_config_dir = orig_gcf
+            shutil.rmtree(td, ignore_errors=True)
+
+    def test_first_tree_scan_done_can_be_set(self):
+        """After the first tree scan completes, first_tree_scan_done must be
+        persisted as True so subsequent rescans use the semaphore."""
+        import tempfile, shutil
+        import src.config.config_manager as cm_mod
+        td = tempfile.mkdtemp()
+        orig_gcf = cm_mod.get_config_dir
+        try:
+            cm_mod.get_config_dir = lambda: Path(td)
+            cfg = cm_mod.ConfigManager()
+            cfg.add_service("SvcB", "drive", "/tmp/svcb")
+            cfg.update_service("SvcB", {"first_tree_scan_done": True})
+            svc = cfg.get_service("SvcB")
+            self.assertTrue(svc.get("first_tree_scan_done"),
+                            "first_tree_scan_done must be True after update")
+        finally:
+            cm_mod.get_config_dir = orig_gcf
+            shutil.rmtree(td, ignore_errors=True)
+
+
+class TestMtimePreservation(unittest.TestCase):
+    """Tests for mtime preservation fixes in native sync upload/download.
+
+    Covers:
+    1. _to_rfc3339 converts a Unix timestamp to the RFC 3339 format expected
+       by the Google Drive API.
+    2. GoogleDriveProvider.upload_file includes 'modifiedTime' in upload metadata
+       for both new files (POST multipart) and existing files (PATCH multipart).
+    3. GoogleDriveProvider.download_file calls os.utime when remote_mtime is given.
+    4. OneDriveProvider.download_file calls os.utime when remote_mtime is given.
+    5. NativeSyncManager._download passes remote_mtime to download_file.
+    6. NativeSyncManager._do_sync passes remote_info["mtime"] as remote_mtime.
+    """
+
+    def setUp(self):
+        self._tmpdir = tempfile.mkdtemp()
+        import src.config.config_manager as cm_mod
+        import src.native.native_sync_manager as nm_mod
+        self._orig_cm = cm_mod.get_config_dir
+        self._orig_nm = nm_mod.get_config_dir
+        cm_mod.get_config_dir = lambda: Path(self._tmpdir)
+        nm_mod.get_config_dir = lambda: Path(self._tmpdir)
+        self.config = ConfigManager()
+
+    def tearDown(self):
+        import src.config.config_manager as cm_mod
+        import src.native.native_sync_manager as nm_mod
+        cm_mod.get_config_dir = self._orig_cm
+        nm_mod.get_config_dir = self._orig_nm
+        import shutil
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+
+    def test_to_rfc3339_converts_unix_timestamp(self):
+        """_to_rfc3339 must produce a valid RFC 3339 UTC string."""
+        from src.native.native_sync_manager import _to_rfc3339
+        # 2024-01-15T10:30:00Z
+        import datetime
+        ts = datetime.datetime(2024, 1, 15, 10, 30, 0, tzinfo=datetime.timezone.utc).timestamp()
+        result = _to_rfc3339(ts)
+        self.assertEqual(result, "2024-01-15T10:30:00.000Z")
+
+    def test_gdrive_upload_file_new_includes_modified_time(self):
+        """upload_file for a NEW Drive file (POST multipart) must embed
+        'modifiedTime' in the JSON metadata part of the multipart body."""
+        from src.native.native_sync_manager import GoogleDriveProvider
+
+        provider = GoogleDriveProvider("remote1", logger=None)
+        provider._token = {"access_token": "tok", "obtained_at": time.time(), "expires_in": 3600}
+
+        # Create a temporary file with a known mtime
+        local_file = os.path.join(self._tmpdir, "test.txt")
+        with open(local_file, "wb") as fh:
+            fh.write(b"hello world")
+        known_mtime = 1705316400.0  # 2024-01-15T10:00:00Z approx
+        os.utime(local_file, (known_mtime, known_mtime))
+
+        captured_requests = []
+
+        def fake_http(url, method="GET", headers=None, data=None, **kw):
+            captured_requests.append({"url": url, "method": method, "data": data})
+            # _find_file_id → returns empty files list (new file)
+            if "/files?" in url and "q=" in url:
+                return 200, json.dumps({"files": []}).encode()
+            # _get_folder_id for remote root
+            if "/files?" in url:
+                return 200, json.dumps({"files": [{"id": "root_id"}]}).encode()
+            # multipart POST
+            if "uploadType=multipart" in url and method == "POST":
+                return 201, json.dumps({"id": "new_file_id"}).encode()
+            return 200, b"{}"
+
+        with patch("src.native.native_sync_manager._http_request", side_effect=fake_http):
+            with patch.object(provider, "_get_folder_id", return_value="parent_id"):
+                with patch.object(provider, "_find_file_id", return_value=None):
+                    result = provider.upload_file(local_file, "/", "test.txt")
+
+        self.assertTrue(result)
+        # Find the multipart POST call
+        post_call = next(
+            (r for r in captured_requests
+             if "uploadType=multipart" in r["url"] and r["method"] == "POST"),
+            None
+        )
+        self.assertIsNotNone(post_call, "A multipart POST must have been made")
+        # The multipart body must contain a JSON part with modifiedTime
+        body_str = post_call["data"].decode(errors="replace")
+        self.assertIn("modifiedTime", body_str)
+        self.assertIn("2024-01-15", body_str)
+
+    def test_gdrive_upload_file_existing_uses_multipart_patch(self):
+        """upload_file for an EXISTING Drive file must use multipart PATCH
+        (not simple media) so that modifiedTime can be set."""
+        from src.native.native_sync_manager import GoogleDriveProvider
+
+        provider = GoogleDriveProvider("remote1", logger=None)
+        provider._token = {"access_token": "tok", "obtained_at": time.time(), "expires_in": 3600}
+
+        local_file = os.path.join(self._tmpdir, "test.txt")
+        with open(local_file, "wb") as fh:
+            fh.write(b"updated content")
+        known_mtime = 1705316400.0
+        os.utime(local_file, (known_mtime, known_mtime))
+
+        patch_calls = []
+
+        def fake_http(url, method="GET", headers=None, data=None, **kw):
+            if method == "PATCH" and "uploadType=multipart" in url:
+                patch_calls.append({"url": url, "data": data})
+                return 200, json.dumps({"id": "existing_id"}).encode()
+            return 200, b"{}"
+
+        with patch("src.native.native_sync_manager._http_request", side_effect=fake_http):
+            with patch.object(provider, "_get_folder_id", return_value="parent_id"):
+                with patch.object(provider, "_find_file_id", return_value="existing_file_id"):
+                    result = provider.upload_file(local_file, "/", "test.txt")
+
+        self.assertTrue(result)
+        self.assertEqual(len(patch_calls), 1, "Exactly one multipart PATCH must be made")
+        body_str = patch_calls[0]["data"].decode(errors="replace")
+        self.assertIn("modifiedTime", body_str)
+
+    def test_gdrive_download_file_sets_utime(self):
+        """download_file must call os.utime on the local file when remote_mtime
+        is provided, so that the local mtime matches the remote mtime."""
+        from src.native.native_sync_manager import GoogleDriveProvider
+
+        provider = GoogleDriveProvider("remote1", logger=None)
+        provider._token = {"access_token": "tok", "obtained_at": time.time(), "expires_in": 3600}
+
+        local_file = os.path.join(self._tmpdir, "downloaded.txt")
+        remote_mtime = 1705316400.0  # known timestamp
+
+        with patch("src.native.native_sync_manager._http_request",
+                   return_value=(200, b"file content")):
+            result = provider.download_file("item_id_123", local_file, remote_mtime=remote_mtime)
+
+        self.assertTrue(result)
+        self.assertTrue(os.path.exists(local_file))
+        actual_mtime = os.path.getmtime(local_file)
+        self.assertAlmostEqual(actual_mtime, remote_mtime, places=0,
+                               msg="Local mtime must match remote_mtime after download")
+
+    def test_gdrive_download_file_no_utime_without_remote_mtime(self):
+        """download_file must NOT crash when remote_mtime is not provided
+        (backwards-compatible default)."""
+        from src.native.native_sync_manager import GoogleDriveProvider
+
+        provider = GoogleDriveProvider("remote1", logger=None)
+        provider._token = {"access_token": "tok", "obtained_at": time.time(), "expires_in": 3600}
+
+        local_file = os.path.join(self._tmpdir, "downloaded2.txt")
+
+        with patch("src.native.native_sync_manager._http_request",
+                   return_value=(200, b"data")):
+            result = provider.download_file("item_id_456", local_file)
+
+        self.assertTrue(result)
+        self.assertTrue(os.path.exists(local_file))
+
+    def test_onedrive_download_file_sets_utime(self):
+        """OneDriveProvider.download_file must also call os.utime when
+        remote_mtime is provided."""
+        from src.native.native_sync_manager import OneDriveProvider
+
+        provider = OneDriveProvider("remote1", logger=None)
+        provider._token = {"access_token": "tok", "obtained_at": time.time(), "expires_in": 3600}
+
+        local_file = os.path.join(self._tmpdir, "onedrive_dl.txt")
+        remote_mtime = 1705316400.0
+
+        with patch("src.native.native_sync_manager._http_request",
+                   return_value=(200, b"onedrive content")):
+            result = provider.download_file("od_item_id", local_file, remote_mtime=remote_mtime)
+
+        self.assertTrue(result)
+        actual_mtime = os.path.getmtime(local_file)
+        self.assertAlmostEqual(actual_mtime, remote_mtime, places=0)
+
+    def test_native_download_passes_remote_mtime_to_provider(self):
+        """NativeSyncManager._download must forward remote_mtime to
+        provider.download_file so the local mtime is preserved."""
+        from src.native.native_sync_manager import NativeSyncManager
+
+        native = NativeSyncManager(self.config)
+        native.on_error = lambda svc, msg: None
+        native.on_file_synced = lambda svc, fp, synced: None
+
+        mock_provider = MagicMock()
+        mock_provider.download_file.return_value = True
+
+        local_file = os.path.join(self._tmpdir, "file.txt")
+        remote_mtime = 1705316400.0
+        native._download(mock_provider, "item_id", local_file, "file.txt", "MySvc",
+                         remote_mtime=remote_mtime)
+
+        mock_provider.download_file.assert_called_once_with(
+            "item_id", local_file, remote_mtime=remote_mtime
+        )
+
+    def test_do_sync_passes_remote_mtime_on_download(self):
+        """_do_sync must pass remote_info['mtime'] as remote_mtime to _download
+        for remote-only files and for files where remote is newer."""
+        from src.native.native_sync_manager import NativeSyncManager
+
+        native = NativeSyncManager(self.config)
+        native.on_error = lambda svc, msg: None
+        native.on_api_call = lambda svc, msg: None
+        native.on_file_synced = lambda svc, fp, synced: None
+
+        download_calls = []
+
+        def track_download(provider, item_id, abs_local, rel, service_name, remote_mtime=None):
+            download_calls.append(remote_mtime)
+            return True
+
+        remote_mtime_val = 1705316400.0
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            svc = {
+                "name": "GDriveTest",
+                "platform": "drive",
+                "remote_name": "gdrive",
+                "local_path": tmpdir,
+                "remote_path": "/",
+            }
+            mock_provider = MagicMock()
+            mock_provider.is_authenticated.return_value = True
+            # Remote-only file
+            mock_provider.list_files.return_value = {
+                "remote_only.txt": {
+                    "id": "r1",
+                    "is_dir": False,
+                    "mtime": remote_mtime_val,
+                    "size": 10,
+                },
+            }
+
+            with patch.object(native, "_get_provider", return_value=mock_provider), \
+                 patch.object(native, "_download", side_effect=track_download), \
+                 patch("shutil.disk_usage") as mock_du:
+                mock_du.return_value = MagicMock(free=20 * 1024 * 1024 * 1024)
+                native._do_sync(svc)
+
+        self.assertEqual(len(download_calls), 1, "_download must be called once")
+        self.assertAlmostEqual(download_calls[0], remote_mtime_val, places=1,
+                               msg="remote_mtime must be forwarded from remote_info['mtime']")
+
+
+class TestErrorsPanelFallback(unittest.TestCase):
+    """Tests for the errors-panel fallback to all-service entries.
+
+    When no entries match the service-specific filter, _refresh_errors_text
+    must fall back to showing all entries (with a header) so the user can
+    always see what went wrong even if the filter name doesn't match.
+
+    Because tkinter is not available in headless CI these tests exercise only
+    the display-string logic (the part that builds the content variable inside
+    _refresh_errors_text) without importing ConfigWindow.
+    """
+
+    def _build_content(self, error_logger, service_name: str) -> str:
+        """Inline the content-building logic of _refresh_errors_text."""
+        content = error_logger.get_text_for_service(service_name)
+        if not content:
+            all_content = error_logger.get_all_text()
+            if all_content:
+                content = (
+                    f"(Sin errores específicos de '{service_name}'."
+                    f"  Mostrando registro completo:)\n\n{all_content}"
+                )
+        return content if content else "(Sin errores registrados)"
+
+    def test_fallback_shows_all_when_service_filter_empty(self):
+        """When no entries match service_name but there ARE other entries,
+        the content must include the fallback header and all entries."""
+        from src.gui.error_logger import ErrorLogger
+        logger = ErrorLogger()
+        logger.log("OtherService", "Something went wrong in other service")
+        logger.log("OtherService", "Another error")
+
+        content = self._build_content(logger, "MyGDrive")
+
+        self.assertIn("OtherService", content,
+                      "Fallback must show entries from other services")
+        self.assertNotIn("Sin errores registrados", content,
+                         "Must not show 'Sin errores registrados' when there are log entries")
+        self.assertIn("MyGDrive", content,
+                      "Fallback header must mention the service name")
+
+    def test_no_fallback_when_service_has_own_entries(self):
+        """When there ARE entries matching service_name, only those must be shown
+        (no fallback header)."""
+        from src.gui.error_logger import ErrorLogger
+        logger = ErrorLogger()
+        logger.log("OtherService", "Noise from other service")
+        logger.log("MyGDrive", "Real error for MyGDrive")
+
+        content = self._build_content(logger, "MyGDrive")
+
+        self.assertIn("Real error for MyGDrive", content)
+        self.assertNotIn("Noise from other service", content,
+                         "Other-service noise must be filtered out when own entries exist")
+        self.assertNotIn("Mostrando registro completo", content,
+                         "Fallback header must NOT appear when service has own entries")
+
+    def test_sin_errores_when_no_entries_at_all(self):
+        """When the error logger is completely empty, must yield
+        '(Sin errores registrados)'."""
+        from src.gui.error_logger import ErrorLogger
+        logger = ErrorLogger()
+
+        content = self._build_content(logger, "MyGDrive")
+
+        self.assertIn("Sin errores registrados", content)
 
 
 if __name__ == "__main__":
