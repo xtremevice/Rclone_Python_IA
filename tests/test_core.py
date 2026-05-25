@@ -7184,5 +7184,357 @@ class TestErrorsPanelFallback(unittest.TestCase):
         self.assertIn("Sin errores registrados", content)
 
 
+
+class TestSyncResumeCache(unittest.TestCase):
+    """Tests for the sync work-queue cache (resume / checkpoint feature).
+
+    The cache avoids repeating the expensive remote file-listing API calls
+    when a sync cycle is interrupted mid-way.  It persists to disk so it
+    survives app restarts.
+    """
+
+    def setUp(self):
+        self._tmpdir = tempfile.mkdtemp()
+        import src.config.config_manager as cm_mod
+        import src.native.native_sync_manager as nm_mod
+        self._orig_cm = cm_mod.get_config_dir
+        self._orig_nm = nm_mod.get_config_dir
+        cm_mod.get_config_dir = lambda: Path(self._tmpdir)
+        nm_mod.get_config_dir = lambda: Path(self._tmpdir)
+        self.config = ConfigManager()
+
+    def tearDown(self):
+        import src.config.config_manager as cm_mod
+        import src.native.native_sync_manager as nm_mod
+        cm_mod.get_config_dir = self._orig_cm
+        nm_mod.get_config_dir = self._orig_nm
+        import shutil as _shutil
+        _shutil.rmtree(self._tmpdir, ignore_errors=True)
+
+    # ── helper path ──────────────────────────────────────────────────
+
+    def test_sync_cache_path_uses_config_dir(self):
+        """_sync_cache_path must return a path inside the config directory."""
+        from src.native.native_sync_manager import _sync_cache_path
+        p = _sync_cache_path("myremote")
+        self.assertTrue(str(p).startswith(self._tmpdir))
+        self.assertIn("native_sync_cache_myremote", p.name)
+
+    def test_sync_cache_path_sanitises_separators(self):
+        """Slashes and backslashes in the remote name must be replaced with '_'."""
+        from src.native.native_sync_manager import _sync_cache_path
+        p = _sync_cache_path("a/b\\c")
+        self.assertNotIn("/", p.name)
+        self.assertNotIn("\\", p.name)
+        self.assertIn("a_b_c", p.name)
+
+    # ── save / load round-trip ────────────────────────────────────────
+
+    def test_save_and_load_roundtrip(self):
+        """Saving and loading a cache must return the original data."""
+        from src.native.native_sync_manager import _save_sync_cache, _load_sync_cache
+        data = {
+            "created_at": time.time(),
+            "remote_path": "/",
+            "remote_files": {"a.txt": {"id": "1", "size": 10, "mtime": 1.0, "is_dir": False}},
+            "completed": ["a.txt"],
+        }
+        _save_sync_cache("svc1", data)
+        loaded = _load_sync_cache("svc1", "/")
+        self.assertIsNotNone(loaded)
+        self.assertEqual(loaded["completed"], ["a.txt"])
+        self.assertIn("a.txt", loaded["remote_files"])
+
+    def test_load_returns_none_when_no_file(self):
+        """_load_sync_cache must return None when no cache file exists."""
+        from src.native.native_sync_manager import _load_sync_cache
+        self.assertIsNone(_load_sync_cache("does_not_exist", "/"))
+
+    def test_load_returns_none_when_expired(self):
+        """_load_sync_cache must return None when the cache has exceeded its TTL."""
+        from src.native.native_sync_manager import (
+            _save_sync_cache, _load_sync_cache, _SYNC_CACHE_TTL_SECS,
+        )
+        data = {
+            "created_at": time.time() - _SYNC_CACHE_TTL_SECS - 1,
+            "remote_path": "/",
+            "remote_files": {},
+            "completed": [],
+        }
+        _save_sync_cache("svc_exp", data)
+        self.assertIsNone(_load_sync_cache("svc_exp", "/"))
+
+    def test_load_returns_none_for_wrong_remote_path(self):
+        """_load_sync_cache must return None when remote_path doesn't match."""
+        from src.native.native_sync_manager import _save_sync_cache, _load_sync_cache
+        data = {
+            "created_at": time.time(),
+            "remote_path": "/old_path",
+            "remote_files": {},
+            "completed": [],
+        }
+        _save_sync_cache("svc_path", data)
+        self.assertIsNone(_load_sync_cache("svc_path", "/new_path"))
+
+    def test_load_returns_none_for_corrupt_file(self):
+        """_load_sync_cache must return None (not raise) for a corrupt JSON file."""
+        from src.native.native_sync_manager import _sync_cache_path, _load_sync_cache
+        path = _sync_cache_path("svc_corrupt")
+        path.write_text("{ not valid json }", encoding="utf-8")
+        self.assertIsNone(_load_sync_cache("svc_corrupt", "/"))
+
+    def test_delete_removes_file(self):
+        """_delete_sync_cache must remove the cache file from disk."""
+        from src.native.native_sync_manager import (
+            _save_sync_cache, _delete_sync_cache, _sync_cache_path,
+        )
+        _save_sync_cache("svc_del", {
+            "created_at": time.time(),
+            "remote_path": "/",
+            "remote_files": {},
+            "completed": [],
+        })
+        self.assertTrue(_sync_cache_path("svc_del").exists())
+        _delete_sync_cache("svc_del")
+        self.assertFalse(_sync_cache_path("svc_del").exists())
+
+    def test_delete_is_safe_when_no_file(self):
+        """_delete_sync_cache must not raise when the cache file doesn't exist."""
+        from src.native.native_sync_manager import _delete_sync_cache
+        _delete_sync_cache("never_created")  # Must not raise
+
+    # ── _do_sync integration ──────────────────────────────────────────
+
+    def _make_native(self):
+        from src.native.native_sync_manager import NativeSyncManager
+        native = NativeSyncManager(self.config)
+        native.on_api_call = lambda svc, msg: None
+        native.on_file_synced = lambda svc, fp, synced: None
+        native.on_error = lambda svc, msg: None
+        return native
+
+    def _base_svc(self, local_path):
+        return {
+            "name": "test_svc",
+            "platform": "onedrive",
+            "remote_name": "testremote",
+            "local_path": local_path,
+            "remote_path": "/",
+        }
+
+    def test_do_sync_saves_cache_on_fresh_listing(self):
+        """When no cache exists, _do_sync must call list_files() and persist
+        the result to a new cache file."""
+        from unittest.mock import patch, MagicMock
+        from src.native.native_sync_manager import _sync_cache_path
+
+        native = self._make_native()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            svc = self._base_svc(tmpdir)
+            mock_provider = MagicMock()
+            mock_provider.is_authenticated.return_value = True
+            mock_provider.list_files.return_value = {}
+
+            with patch.object(native, "_get_provider", return_value=mock_provider), \
+                 patch("shutil.disk_usage") as mock_du:
+                mock_du.return_value = MagicMock(free=20 * 1024 * 1024 * 1024)
+                native._do_sync(svc)
+
+        # list_files must have been called exactly once
+        mock_provider.list_files.assert_called_once()
+        # Cache must have been created then deleted (empty = full success)
+        # but the delete happens at the end, so what we care about is that
+        # list_files was called (not a resume).  Cache is deleted on success.
+        cache_path = _sync_cache_path("testremote")
+        # After a successful full sync the cache is cleaned up
+        self.assertFalse(cache_path.exists(), "Cache must be deleted after full success")
+
+    def test_do_sync_uses_cache_skips_list_files(self):
+        """When a valid cache exists, _do_sync must NOT call list_files() and
+        must use the cached remote_files instead."""
+        from unittest.mock import patch, MagicMock
+        from src.native.native_sync_manager import _save_sync_cache
+
+        native = self._make_native()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            svc = self._base_svc(tmpdir)
+            # Pre-seed a cache so the resume path is taken
+            _save_sync_cache("testremote", {
+                "created_at": time.time(),
+                "remote_path": "/",
+                "remote_files": {},
+                "completed": [],
+            })
+            mock_provider = MagicMock()
+            mock_provider.is_authenticated.return_value = True
+
+            with patch.object(native, "_get_provider", return_value=mock_provider), \
+                 patch("shutil.disk_usage") as mock_du:
+                mock_du.return_value = MagicMock(free=20 * 1024 * 1024 * 1024)
+                native._do_sync(svc)
+
+        # list_files must NOT have been called (cache was used)
+        mock_provider.list_files.assert_not_called()
+
+    def test_do_sync_emits_resume_message_when_cache_used(self):
+        """When a cache is used, _do_sync must emit a ♻️ progress message so
+        the user knows a resume is happening."""
+        from unittest.mock import patch, MagicMock
+        from src.native.native_sync_manager import _save_sync_cache
+
+        native = self._make_native()
+        messages = []
+        native.on_api_call = lambda svc, msg: messages.append(msg)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            svc = self._base_svc(tmpdir)
+            _save_sync_cache("testremote", {
+                "created_at": time.time(),
+                "remote_path": "/",
+                "remote_files": {},
+                "completed": [],
+            })
+            mock_provider = MagicMock()
+            mock_provider.is_authenticated.return_value = True
+
+            with patch.object(native, "_get_provider", return_value=mock_provider), \
+                 patch("shutil.disk_usage") as mock_du:
+                mock_du.return_value = MagicMock(free=20 * 1024 * 1024 * 1024)
+                native._do_sync(svc)
+
+        self.assertTrue(any("♻️" in m or "Reanudando" in m for m in messages),
+                        f"Expected a resume message, got: {messages}")
+
+    def test_do_sync_skips_completed_files_from_cache(self):
+        """Files listed as completed in the cache must be skipped: no download
+        or upload attempt must be made for them."""
+        from unittest.mock import patch, MagicMock
+        from src.native.native_sync_manager import _save_sync_cache
+
+        native = self._make_native()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            svc = self._base_svc(tmpdir)
+            # Cache has one remote-only file already marked as completed
+            _save_sync_cache("testremote", {
+                "created_at": time.time(),
+                "remote_path": "/",
+                "remote_files": {
+                    "already_done.txt": {"id": "id1", "size": 10, "mtime": 1.0, "is_dir": False},
+                },
+                "completed": ["already_done.txt"],
+            })
+            mock_provider = MagicMock()
+            mock_provider.is_authenticated.return_value = True
+
+            with patch.object(native, "_get_provider", return_value=mock_provider), \
+                 patch("shutil.disk_usage") as mock_du:
+                mock_du.return_value = MagicMock(free=20 * 1024 * 1024 * 1024)
+                result = native._do_sync(svc)
+
+        self.assertTrue(result)
+        mock_provider.download_file.assert_not_called()
+
+    def test_do_sync_deletes_cache_on_full_success(self):
+        """After a completely successful sync cycle the cache file must be
+        deleted so that the next cycle does a fresh remote listing."""
+        from unittest.mock import patch, MagicMock
+        from src.native.native_sync_manager import _save_sync_cache, _sync_cache_path
+
+        native = self._make_native()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            svc = self._base_svc(tmpdir)
+            _save_sync_cache("testremote", {
+                "created_at": time.time(),
+                "remote_path": "/",
+                "remote_files": {},
+                "completed": [],
+            })
+            mock_provider = MagicMock()
+            mock_provider.is_authenticated.return_value = True
+
+            with patch.object(native, "_get_provider", return_value=mock_provider), \
+                 patch("shutil.disk_usage") as mock_du:
+                mock_du.return_value = MagicMock(free=20 * 1024 * 1024 * 1024)
+                result = native._do_sync(svc)
+
+        self.assertTrue(result)
+        self.assertFalse(_sync_cache_path("testremote").exists(),
+                         "Cache must be removed after a successful full sync")
+
+    def test_do_sync_preserves_cache_on_failure(self):
+        """When a download fails the cache must be kept on disk (with the
+        successful completions so far) so that the next cycle can resume."""
+        from unittest.mock import patch, MagicMock
+        from src.native.native_sync_manager import _save_sync_cache, _sync_cache_path
+
+        native = self._make_native()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            svc = self._base_svc(tmpdir)
+            _save_sync_cache("testremote", {
+                "created_at": time.time(),
+                "remote_path": "/",
+                "remote_files": {
+                    "fail.txt": {"id": "id_fail", "size": 5, "mtime": 1.0, "is_dir": False},
+                },
+                "completed": [],
+            })
+            mock_provider = MagicMock()
+            mock_provider.is_authenticated.return_value = True
+            mock_provider.download_file.return_value = False  # Simulate failure
+
+            with patch.object(native, "_get_provider", return_value=mock_provider), \
+                 patch("shutil.disk_usage") as mock_du:
+                mock_du.return_value = MagicMock(free=20 * 1024 * 1024 * 1024)
+                result = native._do_sync(svc)
+
+        self.assertFalse(result, "Sync must return False when a download fails")
+        self.assertTrue(_sync_cache_path("testremote").exists(),
+                        "Cache must be preserved when errors occur so the next cycle can resume")
+
+    def test_do_sync_records_successful_download_in_cache(self):
+        """A file that is successfully downloaded must appear in the 'completed'
+        list of the on-disk cache so that a subsequent resume skips it."""
+        from unittest.mock import patch, MagicMock
+        from src.native.native_sync_manager import (
+            _save_sync_cache, _sync_cache_path, _load_sync_cache,
+        )
+
+        native = self._make_native()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            svc = self._base_svc(tmpdir)
+            # Two remote-only files; only one will fail
+            _save_sync_cache("testremote", {
+                "created_at": time.time(),
+                "remote_path": "/",
+                "remote_files": {
+                    "ok.txt": {"id": "id_ok", "size": 5, "mtime": 1.0, "is_dir": False},
+                    "fail.txt": {"id": "id_fail", "size": 5, "mtime": 1.0, "is_dir": False},
+                },
+                "completed": [],
+            })
+            mock_provider = MagicMock()
+            mock_provider.is_authenticated.return_value = True
+
+            # ok.txt succeeds, fail.txt fails
+            def fake_download(item_id, local_path, remote_mtime=None):
+                return item_id == "id_ok"
+
+            mock_provider.download_file.side_effect = fake_download
+
+            with patch.object(native, "_get_provider", return_value=mock_provider), \
+                 patch("shutil.disk_usage") as mock_du:
+                mock_du.return_value = MagicMock(free=20 * 1024 * 1024 * 1024)
+                native._do_sync(svc)
+
+        # The cache must still exist (there was a failure)
+        self.assertTrue(_sync_cache_path("testremote").exists())
+        loaded = _load_sync_cache("testremote", "/")
+        self.assertIsNotNone(loaded)
+        self.assertIn("ok.txt", loaded["completed"],
+                      "Successfully downloaded file must be recorded as completed")
+        self.assertNotIn("fail.txt", loaded["completed"],
+                         "Failed file must NOT be recorded as completed")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
